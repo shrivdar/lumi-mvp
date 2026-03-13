@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+WORKDIR /tool
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r mcp && useradd -r -g mcp -d /tool -s /sbin/nologin mcp
+
+RUN pip install --no-cache-dir mcp httpx pydantic
+
+COPY . .
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+
+RUN chown -R mcp:mcp /tool
+USER mcp
+
+EXPOSE 8080
+
+CMD ["python", "server.py"]

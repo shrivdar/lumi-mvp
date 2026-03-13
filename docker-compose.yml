@@ -1,10 +1,9 @@
-version: "3.9"
-
 services:
   api:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      target: dev
     ports:
       - "8000:8000"
     volumes:
@@ -23,6 +22,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      target: dev
     command: celery -A workers.celery_app worker --loglevel=info --concurrency=4
     volumes:
       - ./backend:/app
@@ -40,6 +40,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      target: dev
     ports:
       - "3000:3000"
     volumes:
@@ -82,6 +83,23 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - yohas
+
+  mcp-gateway:
+    build:
+      context: ./infra/mcp
+      dockerfile: Dockerfile.mcp-base
+    ports:
+      - "${MCP_GATEWAY_PORT:-8100}:8080"
+    env_file:
+      - .env
+    environment:
+      MCP_TOOL_NAME: mcp-gateway
+      MCP_TOOL_TIMEOUT: "${MCP_TOOL_TIMEOUT:-30}"
+      MCP_MAX_CONCURRENT_TOOLS: "${MCP_MAX_CONCURRENT_TOOLS:-10}"
+    depends_on:
+      - redis
     networks:
       - yohas
 
