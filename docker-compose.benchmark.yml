@@ -1,0 +1,46 @@
+# Benchmark runner overlay
+# Usage: docker compose -f docker-compose.yml -f docker-compose.benchmark.yml run benchmark
+
+services:
+  benchmark-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: benchmark
+      POSTGRES_PASSWORD: benchmark
+      POSTGRES_DB: yohas_benchmark
+    volumes:
+      - benchmarkdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U benchmark"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - yohas
+
+  benchmark:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: dev
+    command: python -m pytest tests/benchmarks/ -v --tb=short
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://benchmark:benchmark@benchmark-db:5432/yohas_benchmark"
+      BENCHMARK_OUTPUT_DIR: /results
+      ENVIRONMENT: benchmark
+    volumes:
+      - ./backend:/app
+      - benchmark-results:/results
+    depends_on:
+      benchmark-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - yohas
+
+volumes:
+  benchmarkdata:
+  benchmark-results:

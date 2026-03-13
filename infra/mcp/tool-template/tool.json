@@ -1,0 +1,12 @@
+{
+  "name": "example-tool",
+  "version": "0.1.0",
+  "description": "Example MCP tool server — replace with your implementation",
+  "transport": "stdio",
+  "port": 8080,
+  "env": {
+    "MCP_TOOL_NAME": "example-tool",
+    "MCP_TOOL_PORT": "8080"
+  },
+  "tags": ["example"]
+}

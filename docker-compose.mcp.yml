@@ -1,0 +1,55 @@
+# MCP tool server overlay
+# Usage: docker compose -f docker-compose.yml -f docker-compose.mcp.yml up
+#
+# Add new MCP tool servers by copying the mcp-pubmed/mcp-uniprot examples below.
+# Each tool server runs as its own container on the shared yohas network.
+
+services:
+  mcp-pubmed:
+    build:
+      context: ./infra/mcp/tool-template
+      dockerfile: Dockerfile
+    environment:
+      MCP_TOOL_NAME: pubmed
+      MCP_TOOL_PORT: "8080"
+      NCBI_API_KEY: "${NCBI_API_KEY:-}"
+    volumes:
+      - mcp-pubmed-data:/tool/data
+    networks:
+      - yohas
+    depends_on:
+      - mcp-gateway
+
+  mcp-uniprot:
+    build:
+      context: ./infra/mcp/tool-template
+      dockerfile: Dockerfile
+    environment:
+      MCP_TOOL_NAME: uniprot
+      MCP_TOOL_PORT: "8080"
+    volumes:
+      - mcp-uniprot-data:/tool/data
+    networks:
+      - yohas
+    depends_on:
+      - mcp-gateway
+
+  mcp-semantic-scholar:
+    build:
+      context: ./infra/mcp/tool-template
+      dockerfile: Dockerfile
+    environment:
+      MCP_TOOL_NAME: semantic-scholar
+      MCP_TOOL_PORT: "8080"
+      S2_API_KEY: "${S2_API_KEY:-}"
+    volumes:
+      - mcp-s2-data:/tool/data
+    networks:
+      - yohas
+    depends_on:
+      - mcp-gateway
+
+volumes:
+  mcp-pubmed-data:
+  mcp-uniprot-data:
+  mcp-s2-data:
