@@ -8,6 +8,20 @@ const config: Config = {
   ],
   theme: {
     extend: {
+      animation: {
+        shimmer: "shimmer 2s linear infinite",
+        "feed-flash": "feed-flash 1s ease-out",
+      },
+      keyframes: {
+        shimmer: {
+          "0%": { backgroundPosition: "200% 0" },
+          "100%": { backgroundPosition: "-200% 0" },
+        },
+        "feed-flash": {
+          "0%": { backgroundColor: "rgba(59, 130, 246, 0.15)" },
+          "100%": { backgroundColor: "transparent" },
+        },
+      },
       colors: {
         protein: "#4A90D9",
         gene: "#6B5CE7",

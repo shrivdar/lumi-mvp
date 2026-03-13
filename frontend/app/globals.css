@@ -1,3 +1,71 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer base {
+  :root {
+    --color-protein: #4A90D9;
+    --color-gene: #6B5CE7;
+    --color-disease: #E74C3C;
+    --color-pathway: #2ECC71;
+    --color-drug: #F39C12;
+    --color-clinical: #1ABC9C;
+    --color-mechanism: #95A5A6;
+    --color-experiment: #E67E22;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #374151 transparent;
+  }
+}
+
+@layer utilities {
+  .glow-protein { box-shadow: 0 0 12px 2px rgba(74, 144, 217, 0.4); }
+  .glow-gene { box-shadow: 0 0 12px 2px rgba(107, 92, 231, 0.4); }
+  .glow-disease { box-shadow: 0 0 12px 2px rgba(231, 76, 60, 0.4); }
+  .glow-pathway { box-shadow: 0 0 12px 2px rgba(46, 204, 113, 0.4); }
+  .glow-drug { box-shadow: 0 0 12px 2px rgba(243, 156, 18, 0.4); }
+  .glow-clinical { box-shadow: 0 0 12px 2px rgba(26, 188, 156, 0.4); }
+}
+
+/* Confidence heatmap edge glow for Cytoscape canvas overlay */
+@keyframes edge-flow {
+  0% { stroke-dashoffset: 20; }
+  100% { stroke-dashoffset: 0; }
+}
+
+@keyframes pulse-glow {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+@keyframes crack {
+  0% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.2); opacity: 0.5; }
+  100% { transform: scale(0); opacity: 0; }
+}
+
+@keyframes orbit {
+  from { transform: rotate(0deg) translateX(var(--orbit-radius)) rotate(0deg); }
+  to { transform: rotate(360deg) translateX(var(--orbit-radius)) rotate(-360deg); }
+}
+
+@keyframes float-particle {
+  0% { transform: translate(0, 0); opacity: 0; }
+  20% { opacity: 1; }
+  80% { opacity: 1; }
+  100% { transform: translate(var(--dx), var(--dy)); opacity: 0; }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+.animate-orbit {
+  animation: orbit var(--orbit-duration, 8s) linear infinite;
+}
+
+.animate-crack {
+  animation: crack 0.6s ease-out forwards;
+}
