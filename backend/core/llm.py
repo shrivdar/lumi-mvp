@@ -1,0 +1,143 @@
+"""Anthropic SDK wrapper — single LLM entry-point for the entire system."""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from typing import Any
+
+import anthropic
+import structlog
+
+from core.config import settings
+
+logger = structlog.get_logger(__name__)
+
+
+class LLMClient:
+    """Thin wrapper around the Anthropic SDK with KG context injection,
+    token tracking, audit logging, and structured output parsing."""
+
+    def __init__(self) -> None:
+        self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self.total_input_tokens: int = 0
+        self.total_output_tokens: int = 0
+        self.call_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Main query
+    # ------------------------------------------------------------------
+
+    async def query(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str = "",
+        kg_context: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
+        research_id: str = "",
+        agent_id: str = "",
+    ) -> str:
+        """Send a prompt to Claude and return the text response.
+
+        * *kg_context* — optional KG subgraph dict; serialised into the
+          system prompt so the LLM has domain context.
+        * Token usage is tracked per-call and accumulated.
+        """
+        max_tokens = max_tokens or settings.llm_max_tokens
+
+        system = self._build_system_prompt(system_prompt, kg_context)
+
+        log = logger.bind(research_id=research_id, agent_id=agent_id)
+        log.info("llm.call_start", model=settings.llm_model, prompt_len=len(prompt))
+
+        start = time.monotonic()
+        try:
+            response = self._client.messages.create(
+                model=settings.llm_model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except anthropic.APIError as exc:
+            from core.exceptions import LLMError
+
+            log.error("llm.call_error", error=str(exc))
+            raise LLMError(
+                str(exc),
+                error_code="LLM_API_ERROR",
+                details={"model": settings.llm_model},
+            ) from exc
+
+        duration_ms = int((time.monotonic() - start) * 1000)
+
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.call_count += 1
+
+        text = response.content[0].text if response.content else ""
+
+        log.info(
+            "llm.call_end",
+            duration_ms=duration_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+        return text
+
+    # ------------------------------------------------------------------
+    # Structured output parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def parse_json(text: str) -> Any:
+        """Extract the first JSON object or array from *text*.
+
+        Handles common patterns: ```json ... ```, bare JSON, etc.
+        """
+        # Try fenced code block first
+        match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1).strip())
+
+        # Fallback: find first { or [
+        for i, ch in enumerate(text):
+            if ch in ("{", "["):
+                try:
+                    return json.loads(text[i:])
+                except json.JSONDecodeError:
+                    continue
+
+        raise ValueError("No valid JSON found in LLM response")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_system_prompt(
+        self,
+        base_prompt: str,
+        kg_context: dict[str, Any] | None,
+    ) -> str:
+        parts: list[str] = []
+        if base_prompt:
+            parts.append(base_prompt)
+        if kg_context:
+            parts.append(
+                "## Knowledge Graph Context (current state)\n"
+                + json.dumps(kg_context, indent=2, default=str)
+            )
+        return "\n\n".join(parts) if parts else "You are a helpful biomedical research assistant."
+
+    @property
+    def token_summary(self) -> dict[str, int]:
+        return {
+            "calls": self.call_count,
+            "input_tokens": self.total_input_tokens,
+            "output_tokens": self.total_output_tokens,
+            "total_tokens": self.total_input_tokens + self.total_output_tokens,
+        }
