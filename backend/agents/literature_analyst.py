@@ -21,6 +21,7 @@ class LiteratureAnalystAgent(BaseAgentImpl):
         return await self._multi_turn_investigate(
             task,
             kg_context,
+            max_turns=8,
             investigation_focus=(
                 "Search PubMed and Semantic Scholar for papers relevant to the research question. "
                 "Extract biological entities (genes, proteins, diseases, pathways, drugs, biomarkers) "

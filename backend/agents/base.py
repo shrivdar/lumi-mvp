@@ -314,6 +314,7 @@ class BaseAgentImpl:
         *,
         kg_context: dict[str, Any] | None = None,
         system_prompt: str | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """Wraps LLM call with system prompt, KG injection, know-how, audit, and token tracking."""
         sys_prompt = system_prompt or self.template.system_prompt
@@ -333,6 +334,7 @@ class BaseAgentImpl:
                 system_prompt=sys_prompt,
                 kg_context=kg_context,
                 agent_id=self.agent_id,
+                **({"max_tokens": max_tokens} if max_tokens else {}),
             )
 
         self._llm_calls += 1
@@ -606,20 +608,35 @@ class BaseAgentImpl:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_tag(text: str, tag: str) -> str | None:
-        """Extract content from an XML tag in an LLM response."""
+    def _extract_tag(text: str, tag: str, *, allow_truncated: bool = False) -> str | None:
+        """Extract content from an XML tag in an LLM response.
+
+        If *allow_truncated* is True and the opening tag is found but the
+        closing tag is missing (e.g. due to max_tokens truncation), return
+        everything after the opening tag.
+        """
         pattern = rf"<{tag}>(.*?)</{tag}>"
         match = re.search(pattern, text, re.DOTALL)
-        return match.group(1).strip() if match else None
+        if match:
+            return match.group(1).strip()
+        if allow_truncated:
+            open_tag = f"<{tag}>"
+            idx = text.find(open_tag)
+            if idx != -1:
+                return text[idx + len(open_tag):].strip()
+        return None
 
     def _parse_agent_response(self, response: str) -> tuple[str, str, str | None]:
         """Parse LLM response for action tags.
 
         Returns ``(action_type, content, think_content)``.
         Priority: answer > tool > execute > think.
+
+        For ``<answer>`` tags we also accept truncated responses (opening tag
+        present but closing tag missing due to max-token cutoff).
         """
         think = self._extract_tag(response, "think")
-        answer = self._extract_tag(response, "answer")
+        answer = self._extract_tag(response, "answer", allow_truncated=True)
         if answer:
             return ("answer", answer, think)
         tool = self._extract_tag(response, "tool")
@@ -812,6 +829,20 @@ class BaseAgentImpl:
         for turn_num in range(1, max_turns + 1):
             obs_text = "\n\n".join(observations[-10:])
 
+            # Determine if we should nudge the agent toward answering
+            remaining = max_turns - turn_num
+            urgency = ""
+            if remaining <= 2:
+                urgency = (
+                    "\n\n⚠️ You are running low on turns. "
+                    "Provide your <answer> NOW with whatever information you have gathered."
+                )
+            elif remaining <= 5:
+                urgency = (
+                    "\n\nNote: You have only a few turns left. "
+                    "Start synthesizing your findings and prepare to answer soon."
+                )
+
             turn_prompt = (
                 f"Research task: {task.instruction}\n\n"
                 f"Turn {turn_num}/{max_turns}\n\n"
@@ -821,26 +852,31 @@ class BaseAgentImpl:
                 "To reason: <think>your reasoning</think>\n"
                 "To call a tool: <tool>tool_name:{\"arg\": \"value\"}</tool>\n"
                 "To execute code: <execute>python_code</execute>\n"
-                "To provide final answer:\n"
+                "To provide final answer (KEEP CONCISE — max 5-8 entities, 5-8 relationships, "
+                "short descriptions):\n"
                 "<answer>{\"entities\": [{\"name\": \"...\", "
                 "\"type\": \"GENE|PROTEIN|DISEASE|...\", "
-                "\"description\": \"...\", \"confidence\": 0.8, "
-                "\"external_ids\": {}, \"properties\": {}, "
-                "\"evidence_source\": \"PUBMED|...\", "
-                "\"evidence_id\": \"...\"}], "
+                "\"description\": \"brief\", \"confidence\": 0.8, "
+                "\"evidence_source\": \"PUBMED\", "
+                "\"evidence_id\": \"PMID:...\"}], "
                 "\"relationships\": [{\"source\": \"name\", "
                 "\"target\": \"name\", "
                 "\"relation\": \"ASSOCIATED_WITH|...\", "
-                "\"confidence\": 0.8, \"claim\": \"...\", "
-                "\"evidence_source\": \"PUBMED|...\", "
-                "\"evidence_id\": \"...\"}], "
-                "\"summary\": \"...\", "
-                "\"reasoning_trace\": \"...\"}</answer>\n\n"
+                "\"confidence\": 0.8, \"claim\": \"brief claim\", "
+                "\"evidence_source\": \"PUBMED\", "
+                "\"evidence_id\": \"PMID:...\"}], "
+                "\"summary\": \"2-3 sentence summary\", "
+                "\"reasoning_trace\": \"brief trace\"}</answer>\n\n"
                 "If you have gathered enough information, provide your <answer>."
+                + urgency
             )
 
             start_ms = int(time.monotonic() * 1000)
-            response = await self.query_llm(turn_prompt, kg_context=kg_context)
+            # Use higher token limit for later turns where answer is expected
+            answer_max_tokens = 8192 if remaining <= 5 else None
+            response = await self.query_llm(
+                turn_prompt, kg_context=kg_context, max_tokens=answer_max_tokens,
+            )
             duration = int(time.monotonic() * 1000) - start_ms
 
             action_type, content, think_content = self._parse_agent_response(response)
@@ -911,17 +947,24 @@ class BaseAgentImpl:
         turns: list[AgentTurn],
         observations: list[str],
     ) -> dict[str, Any]:
-        """Parse ``<answer>`` content into the standard investigation result dict."""
+        """Parse ``<answer>`` content into the standard investigation result dict.
+
+        Handles truncated JSON from max-token cutoff by attempting to repair
+        the JSON before parsing.
+        """
         try:
             parsed = self.llm.parse_json(answer_content)
         except Exception:
-            return {
-                "nodes": [],
-                "edges": [],
-                "summary": answer_content[:500],
-                "reasoning_trace": self._summarize_turns(turns),
-                "turns": turns,
-            }
+            # Attempt to repair truncated JSON
+            parsed = self._repair_truncated_json(answer_content)
+            if parsed is None:
+                return {
+                    "nodes": [],
+                    "edges": [],
+                    "summary": answer_content[:500],
+                    "reasoning_trace": self._summarize_turns(turns),
+                    "turns": turns,
+                }
 
         nodes = self._parse_nodes_from_answer(parsed.get("entities", []))
         edges = self._parse_edges_from_answer(parsed.get("relationships", []), nodes)
@@ -936,6 +979,93 @@ class BaseAgentImpl:
             "recommended_next": parsed.get("recommended_next"),
             "turns": turns,
         }
+
+    @staticmethod
+    def _repair_truncated_json(text: str) -> dict[str, Any] | None:
+        """Attempt to repair truncated JSON from max-token cutoff.
+
+        Strategy: find the first ``{``, then try progressively shorter
+        substrings, closing any open braces/brackets.
+        """
+        # Find the start of JSON
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == "{":
+                start = i
+                break
+        if start == -1:
+            return None
+
+        json_text = text[start:]
+
+        # Try parsing as-is first
+        try:
+            return json.loads(json_text)
+        except json.JSONDecodeError:
+            pass
+
+        # Count unclosed braces/brackets and try to close them
+        opens = 0
+        open_brackets = 0
+        in_string = False
+        escape = False
+        for ch in json_text:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                opens += 1
+            elif ch == "}":
+                opens -= 1
+            elif ch == "[":
+                open_brackets += 1
+            elif ch == "]":
+                open_brackets -= 1
+
+        # Try closing with appropriate brackets/braces
+        suffix = "]" * max(0, open_brackets) + "}" * max(0, opens)
+        if suffix:
+            try:
+                return json.loads(json_text + suffix)
+            except json.JSONDecodeError:
+                pass
+
+        # Last resort: try to find the last complete entity/relationship array
+        # and build a minimal valid JSON
+        try:
+            # Find entities array
+            entities_match = re.search(r'"entities"\s*:\s*\[(.*?)\]', json_text, re.DOTALL)
+            relationships_match = re.search(r'"relationships"\s*:\s*\[(.*?)\]', json_text, re.DOTALL)
+            summary_match = re.search(r'"summary"\s*:\s*"([^"]*)"', json_text)
+
+            result: dict[str, Any] = {}
+            if entities_match:
+                try:
+                    result["entities"] = json.loads("[" + entities_match.group(1) + "]")
+                except json.JSONDecodeError:
+                    result["entities"] = []
+            if relationships_match:
+                try:
+                    result["relationships"] = json.loads("[" + relationships_match.group(1) + "]")
+                except json.JSONDecodeError:
+                    result["relationships"] = []
+            if summary_match:
+                result["summary"] = summary_match.group(1)
+
+            if result:
+                return result
+        except Exception:
+            pass
+
+        return None
 
     def _compile_from_observations(
         self,
