@@ -28,6 +28,7 @@ from core.models import (
     KGNode,
     UncertaintyVector,
 )
+from know_how.retriever import KnowHowRetriever
 
 logger = structlog.get_logger(__name__)
 
@@ -61,6 +62,8 @@ class BaseAgentImpl:
         self.yami = yami
         self.tools = tools or {}
         self.audit = audit_logger or AuditLogger("agents")
+        self._know_how_retriever = KnowHowRetriever()
+        self._current_know_how: str = ""
 
         # Tracking state during execution
         self._nodes_added: list[KGNode] = []
@@ -106,6 +109,26 @@ class BaseAgentImpl:
         try:
             # 1. Get KG context
             kg_context = self._build_kg_context(task)
+
+            # 1b. Retrieve domain know-how for injection into LLM calls
+            self._current_know_how = ""
+            try:
+                know_how = await self._know_how_retriever.get_context_for_task(
+                    task_instruction=task.instruction,
+                    agent_type=str(self.agent_type),
+                    context=task.context.get("query", ""),
+                )
+                if know_how:
+                    self._current_know_how = know_how
+                    self.audit.log(
+                        "agent_knowhow_injected",
+                        agent_id=self.agent_id,
+                        task_id=task.task_id,
+                        know_how_len=len(know_how),
+                    )
+            except Exception as exc:
+                # Know-how injection is non-critical — do not fail the agent
+                self.audit.error("agent_knowhow_failed", agent_id=self.agent_id, error=str(exc))
 
             # 2. Investigate (subclass hook)
             investigation = await self._investigate(task, kg_context)
@@ -249,8 +272,11 @@ class BaseAgentImpl:
         kg_context: dict[str, Any] | None = None,
         system_prompt: str | None = None,
     ) -> str:
-        """Wraps LLM call with system prompt, KG injection, audit, and token tracking."""
+        """Wraps LLM call with system prompt, KG injection, know-how, audit, and token tracking."""
         sys_prompt = system_prompt or self.template.system_prompt
+        # Inject domain know-how if retrieved for this execution
+        if self._current_know_how:
+            sys_prompt = sys_prompt + "\n\n" + self._current_know_how
 
         self.audit.log(
             "agent_llm_call",

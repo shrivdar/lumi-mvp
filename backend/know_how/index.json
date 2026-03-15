@@ -1,0 +1,88 @@
+{
+  "documents": [
+    {
+      "id": "gwas_analysis",
+      "path": "protocols/gwas_analysis.md",
+      "title": "GWAS Analysis Protocol",
+      "description": "Genome-wide association study interpretation: LD clumping, fine-mapping, credible sets, variant-to-gene mapping, candidate gene prioritization, and cross-trait analysis.",
+      "tags": ["gwas", "snp", "association", "fine-mapping", "ld", "eqtl", "locus", "allele", "genome-wide", "variant", "genetic-association", "population-genetics"]
+    },
+    {
+      "id": "drug_repurposing",
+      "path": "protocols/drug_repurposing.md",
+      "title": "Drug Repurposing Protocol",
+      "description": "Systematic drug repurposing: target identification, compound search in ChEMBL, binding analysis, ADMET assessment, clinical evidence mining, and repurposing prioritization.",
+      "tags": ["drug", "repurposing", "target", "binding", "admet", "chembl", "compound", "pharmacology", "toxicity", "dosing", "drug-discovery", "ic50"]
+    },
+    {
+      "id": "gene_disease_association",
+      "path": "protocols/gene_disease_association.md",
+      "title": "Gene-Disease Association Protocol",
+      "description": "Gene-disease association evaluation: evidence hierarchy from Mendelian to complex disease, OMIM/ClinGen curation, convergence scoring, and causal inference.",
+      "tags": ["gene", "disease", "association", "mendelian", "complex-disease", "omim", "clingen", "penetrance", "causation", "genetic-evidence", "phenotype"]
+    },
+    {
+      "id": "pathway_analysis",
+      "path": "protocols/pathway_analysis.md",
+      "title": "Pathway Analysis Protocol",
+      "description": "Biological pathway enrichment analysis: ORA, GSEA, network topology metrics, cross-pathway interactions, and therapeutic target identification from pathway networks.",
+      "tags": ["pathway", "enrichment", "gsea", "kegg", "reactome", "network", "topology", "centrality", "signaling", "cross-talk", "gene-set", "go"]
+    },
+    {
+      "id": "protein_function",
+      "path": "protocols/protein_function.md",
+      "title": "Protein Function Analysis Protocol",
+      "description": "Protein functional characterization: domain analysis, conservation scoring, structure prediction (AlphaFold/ESMFold), interaction networks, and variant impact assessment.",
+      "tags": ["protein", "domain", "structure", "conservation", "alphafold", "esm", "uniprot", "pdb", "binding-site", "interaction", "function", "plddt"]
+    },
+    {
+      "id": "clinical_trial_analysis",
+      "path": "protocols/clinical_trial_analysis.md",
+      "title": "Clinical Trial Analysis Protocol",
+      "description": "Clinical trial interpretation: phase classification, endpoint analysis, statistical assessment, safety evaluation, and failure analysis for terminated trials.",
+      "tags": ["clinical-trial", "phase", "endpoint", "efficacy", "safety", "randomization", "hazard-ratio", "nct", "fda", "survival", "adverse-event", "p-value"]
+    },
+    {
+      "id": "variant_interpretation",
+      "path": "protocols/variant_interpretation.md",
+      "title": "Variant Interpretation Protocol",
+      "description": "Clinical variant classification: ACMG/AMP guidelines, pathogenicity scoring with CADD/REVEL/SpliceAI, population frequency assessment, and functional evidence evaluation.",
+      "tags": ["variant", "acmg", "pathogenicity", "clinvar", "gnomad", "cadd", "revel", "missense", "splicing", "classification", "vus", "mutation"]
+    },
+    {
+      "id": "sequence_analysis",
+      "path": "protocols/sequence_analysis.md",
+      "title": "Sequence Analysis Protocol",
+      "description": "Biological sequence analysis: alignment (BLAST, MAFFT), motif discovery, homology search, phylogenetics, primer design, and codon optimization.",
+      "tags": ["sequence", "alignment", "blast", "homology", "motif", "phylogenetics", "primer", "fasta", "msa", "conservation", "orf", "codon"]
+    },
+    {
+      "id": "pandas_bio_recipes",
+      "path": "tools/pandas_bio_recipes.md",
+      "title": "Pandas Bio Data Recipes",
+      "description": "Common pandas patterns for biological data: gene expression matrices, GWAS summary statistics, differential expression, variant frequency tables, clinical survival data.",
+      "tags": ["pandas", "dataframe", "expression", "csv", "tsv", "data-wrangling", "statistics", "survival", "frequency", "merge"]
+    },
+    {
+      "id": "biopython_recipes",
+      "path": "tools/biopython_recipes.md",
+      "title": "BioPython Recipes",
+      "description": "BioPython patterns: sequence manipulation, FASTA/GenBank parsing, BLAST execution, multiple sequence alignment, Entrez database queries, PDB structure retrieval.",
+      "tags": ["biopython", "sequence", "fasta", "genbank", "blast", "entrez", "ncbi", "pdb", "alignment", "parsing"]
+    },
+    {
+      "id": "networkx_recipes",
+      "path": "tools/networkx_recipes.md",
+      "title": "NetworkX Graph Analysis Recipes",
+      "description": "NetworkX patterns for biological networks: protein interaction graphs, centrality analysis, community detection, shortest paths, pathway graph operations, Cytoscape export.",
+      "tags": ["networkx", "graph", "network", "centrality", "community", "shortest-path", "protein-interaction", "cytoscape", "directed", "subgraph"]
+    },
+    {
+      "id": "rdkit_recipes",
+      "path": "tools/rdkit_recipes.md",
+      "title": "RDKit Chemistry Recipes",
+      "description": "RDKit patterns: molecule creation from SMILES, Lipinski properties, fingerprints, Tanimoto similarity, PAINS filtering, scaffold analysis, 3D conformer generation.",
+      "tags": ["rdkit", "chemistry", "smiles", "fingerprint", "similarity", "lipinski", "pains", "scaffold", "drug-likeness", "molecular-properties", "substructure"]
+    }
+  ]
+}
