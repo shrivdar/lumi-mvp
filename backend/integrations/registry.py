@@ -51,6 +51,7 @@ class IntegrationsRegistry:
         from integrations.reactome import ReactomeTool
         from integrations.semantic_scholar import SemanticScholarTool
         from integrations.slack import SlackTool
+        from integrations.python_repl import PythonREPLTool
         from integrations.uniprot import UniProtTool
 
         tool_classes: list[type[BaseTool]] = [
@@ -64,6 +65,7 @@ class IntegrationsRegistry:
             ClinicalTrialsTool,
             ESMTool,
             SlackTool,
+            PythonREPLTool,
         ]
 
         for cls in tool_classes:
