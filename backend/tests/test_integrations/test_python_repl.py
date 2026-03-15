@@ -71,6 +71,25 @@ class TestSessionLifecycle:
         await tool.close()
 
     @pytest.mark.asyncio
+    async def test_create_session_sets_data_lake_env_vars(self) -> None:
+        tool = PythonREPLTool()
+        proc = _make_session_proc()
+
+        captured_env = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            await tool.create_session()
+            assert "YOHAS_DATA_PATH" in captured_env
+            assert "DATA_LAKE_DIR" in captured_env
+            assert captured_env["YOHAS_DATA_PATH"] == captured_env["DATA_LAKE_DIR"]
+            tool._sessions.clear()
+        await tool.close()
+
+    @pytest.mark.asyncio
     async def test_create_session_with_explicit_id(self) -> None:
         tool = PythonREPLTool()
         proc = _make_session_proc()

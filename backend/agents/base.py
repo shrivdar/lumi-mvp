@@ -37,6 +37,7 @@ from core.models import (
     TurnType,
     UncertaintyVector,
 )
+from integrations.data_lake import data_lake_context
 from know_how.retriever import KnowHowRetriever
 
 logger = structlog.get_logger(__name__)
@@ -321,6 +322,10 @@ class BaseAgentImpl:
         # Inject domain know-how if retrieved for this execution
         if self._current_know_how:
             sys_prompt = sys_prompt + "\n\n" + self._current_know_how
+        # Inject data lake context so agents know what local datasets are available
+        dl_ctx = data_lake_context()
+        if dl_ctx:
+            sys_prompt = sys_prompt + "\n\n" + dl_ctx
 
         self.audit.log(
             "agent_llm_call",

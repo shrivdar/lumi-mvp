@@ -172,6 +172,7 @@ class PythonREPLTool(BaseTool):
         data_path = settings.data_lake_path
         if data_path:
             env["YOHAS_DATA_PATH"] = data_path
+            env["DATA_LAKE_DIR"] = data_path
 
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-u", "-c", _WORKER_SCRIPT,
