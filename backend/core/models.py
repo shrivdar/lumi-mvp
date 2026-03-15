@@ -447,6 +447,8 @@ class AgentResult(BaseModel):
     agent_id: str
     agent_type: AgentType
     hypothesis_id: str = ""
+    parent_agent_id: str | None = None
+    depth: int = 0
     nodes_added: list[KGNode] = Field(default_factory=list)
     edges_added: list[KGEdge] = Field(default_factory=list)
     nodes_updated: list[str] = Field(default_factory=list)
@@ -456,6 +458,7 @@ class AgentResult(BaseModel):
     summary: str = ""
     reasoning_trace: str = ""
     recommended_next: str | None = None
+    sub_agent_results: list[AgentResult] = Field(default_factory=list)
     token_usage: dict[str, int] = Field(default_factory=dict)
     duration_ms: int = 0
     llm_calls: int = 0
@@ -464,6 +467,10 @@ class AgentResult(BaseModel):
     turns: list[AgentTurn] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+# Rebuild for self-referential sub_agent_results
+AgentResult.model_rebuild()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

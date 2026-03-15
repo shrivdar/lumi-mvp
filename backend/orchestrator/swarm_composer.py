@@ -3,13 +3,13 @@
 Given a research query and hypothesis, the composer:
 1. Asks the LLM which agent types are most relevant
 2. Always includes scientific_critic (non-negotiable)
-3. Selects tools from the ToolRegistry for each agent
+3. Selects tools from the ToolRegistry for each agent (static or dynamic via ToolRetriever)
 4. Instantiates agents with the correct KG, LLM, tools, and Yami access
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -24,6 +24,9 @@ from core.models import (
     ResearchEvent,
     ToolRegistryEntry,
 )
+
+if TYPE_CHECKING:
+    from agents.tool_retriever import ToolRetriever
 
 logger = structlog.get_logger(__name__)
 
@@ -42,12 +45,14 @@ class SwarmComposer:
         llm: LLMClient,
         tool_registry_entries: list[ToolRegistryEntry] | None = None,
         session_id: str = "",
+        tool_retriever: ToolRetriever | None = None,
     ) -> None:
         self.llm = llm
         self._tool_entries = tool_registry_entries or []
         self.session_id = session_id
         self.audit = AuditLogger("swarm_composer")
         self._events: list[ResearchEvent] = []
+        self._tool_retriever = tool_retriever
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -197,7 +202,7 @@ class SwarmComposer:
         agent_type: AgentType,
         tool_names: list[str],
     ) -> list[ToolRegistryEntry]:
-        """Select ToolRegistryEntry objects matching the agent's declared tool names."""
+        """Select ToolRegistryEntry objects matching the agent's declared tool names (static)."""
         entries_by_name = {e.name: e for e in self._tool_entries}
         selected: list[ToolRegistryEntry] = []
         for name in tool_names:
@@ -205,6 +210,36 @@ class SwarmComposer:
             if entry and entry.enabled:
                 selected.append(entry)
         return selected
+
+    async def select_tools_dynamic(
+        self,
+        task_instruction: str,
+        hypothesis: str = "",
+        agent_type: AgentType | None = None,
+        top_k: int = 4,
+    ) -> list[str]:
+        """Dynamically select tools using the ToolRetriever (LLM-based).
+
+        Falls back to static template-based selection if no ToolRetriever is configured.
+
+        Returns:
+            List of tool name strings.
+        """
+        if self._tool_retriever is not None:
+            return await self._tool_retriever.select_tools(
+                task=task_instruction,
+                hypothesis=hypothesis,
+                top_k=top_k,
+                agent_type=str(agent_type) if agent_type else "",
+            )
+
+        # Fallback: use static template tools
+        if agent_type is not None:
+            from agents.templates import get_template
+            template = get_template(agent_type)
+            return list(template.tools)
+
+        return []
 
     # ------------------------------------------------------------------
     # Prompt builders

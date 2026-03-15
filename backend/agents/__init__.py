@@ -1,4 +1,4 @@
-"""YOHAS agents — BaseAgent + 8 specialized research agents."""
+"""YOHAS agents — BaseAgent + 8 specialized research agents + ToolRetriever."""
 
 from agents.base import BaseAgentImpl
 from agents.clinical_analyst import ClinicalAnalystAgent
@@ -10,6 +10,7 @@ from agents.pathway_analyst import PathwayAnalystAgent
 from agents.protein_engineer import ProteinEngineerAgent
 from agents.scientific_critic import ScientificCriticAgent
 from agents.templates import AGENT_TEMPLATES, get_template
+from agents.tool_retriever import ToolRetriever
 
 __all__ = [
     "BaseAgentImpl",
@@ -23,4 +24,5 @@ __all__ = [
     "ScientificCriticAgent",
     "AGENT_TEMPLATES",
     "get_template",
+    "ToolRetriever",
 ]
