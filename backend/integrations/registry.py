@@ -42,16 +42,26 @@ class IntegrationsRegistry:
 
     async def bootstrap(self, **overrides: Any) -> None:
         """Instantiate all native tools and register them."""
+        from integrations.biogrid import BioGRIDTool
+        from integrations.cellxgene import CellxGeneTool
         from integrations.chembl import ChEMBLTool
         from integrations.clinicaltrials import ClinicalTrialsTool
+        from integrations.clinvar import ClinVarTool
+        from integrations.depmap import DepMapTool
         from integrations.esm import ESMTool
+        from integrations.gnomad import GnomADTool
+        from integrations.gtex import GTExTool
+        from integrations.hpo import HPOTool
         from integrations.kegg import KEGGTool
         from integrations.mygene import MyGeneTool
+        from integrations.omim import OMIMTool
+        from integrations.opentargets import OpenTargetsTool
         from integrations.pubmed import PubMedTool
+        from integrations.python_repl import PythonREPLTool
         from integrations.reactome import ReactomeTool
         from integrations.semantic_scholar import SemanticScholarTool
         from integrations.slack import SlackTool
-        from integrations.python_repl import PythonREPLTool
+        from integrations.string_db import StringDBTool
         from integrations.uniprot import UniProtTool
 
         tool_classes: list[type[BaseTool]] = [
@@ -66,6 +76,17 @@ class IntegrationsRegistry:
             ESMTool,
             SlackTool,
             PythonREPLTool,
+            # --- New tools (tool expansion) ---
+            OpenTargetsTool,
+            ClinVarTool,
+            GTExTool,
+            GnomADTool,
+            HPOTool,
+            OMIMTool,
+            BioGRIDTool,
+            DepMapTool,
+            CellxGeneTool,
+            StringDBTool,
         ]
 
         for cls in tool_classes:
