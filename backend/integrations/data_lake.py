@@ -221,22 +221,18 @@ def data_lake_context() -> str:
         parquet_path = data_dir / meta["file"]
         manifest_entry = manifest.get(name, {})
 
-        # Use manifest for row/col counts if available, otherwise check file existence
+        # Only advertise datasets whose parquet file actually exists on disk
+        if not parquet_path.exists():
+            continue
+
+        # Use manifest for row/col counts if available
         rows = manifest_entry.get("rows", 0)
         cols = manifest_entry.get("cols", 0)
-        has_error = manifest_entry.get("error") is not None
-
-        if has_error and not parquet_path.exists():
-            continue  # skip datasets that failed to download and don't exist
-
-        exists = parquet_path.exists()
-        if not exists and not manifest_entry:
-            continue  # skip datasets with no manifest entry and no file
 
         available_count += 1
 
         row_info = f"{rows:,} rows × {cols} cols" if rows else "size unknown"
-        status = "" if exists else " [NOT YET DOWNLOADED]"
+        status = ""
 
         lines.append(f"### {name}{status}")
         lines.append(f"**{meta['description']}**")

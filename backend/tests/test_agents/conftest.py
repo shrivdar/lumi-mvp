@@ -35,6 +35,7 @@ class MockLLMClient:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.call_count = 0
+        self._token_summary: dict[str, int] | None = None  # override for tests
 
     async def query(
         self,
@@ -74,6 +75,8 @@ class MockLLMClient:
 
     @property
     def token_summary(self) -> dict[str, int]:
+        if self._token_summary is not None:
+            return self._token_summary
         return {
             "calls": self.call_count,
             "input_tokens": self.total_input_tokens,

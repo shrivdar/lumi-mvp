@@ -90,6 +90,19 @@ class TestDataLakeContext:
         assert "dbsnp" not in ctx
         assert "omim" not in ctx
 
+    def test_excludes_manifest_only_datasets(self, tmp_path: Path) -> None:
+        """Datasets with manifest entries but no parquet file should be excluded."""
+        # Write manifest with entry for clinvar but don't create the file
+        manifest = {
+            "clinvar": {"rows": 100000, "cols": 10, "error": None},
+        }
+        (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+
+        with patch("integrations.data_lake._resolve_data_dir", return_value=tmp_path):
+            ctx = data_lake_context()
+
+        assert "clinvar" not in ctx
+
     def test_includes_example_queries(self, fake_data_dir: Path) -> None:
         with patch("integrations.data_lake._resolve_data_dir", return_value=fake_data_dir):
             ctx = data_lake_context()
