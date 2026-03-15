@@ -619,6 +619,7 @@ class ToolRegistryEntry(BaseModel):
     description: str = ""
     source_type: ToolSourceType
     category: str = ""  # e.g. "literature", "protein", "pathway"
+    capabilities: list[str] = Field(default_factory=list)
     mcp_server: str | None = None
     mcp_manifest: MCPToolManifest | None = None
     container_config: ContainerToolConfig | None = None

@@ -58,6 +58,7 @@ class ResearchOrchestrator:
         yami: YamiInterface | None = None,
         agent_factory: Any = None,  # callable(agent_type, llm, kg, yami, tools) -> BaseAgentImpl
         tool_entries: list[ToolRegistryEntry] | None = None,
+        tool_instances: dict[str, Any] | None = None,  # name → BaseTool for dynamic assignment
         slack_tool: Any = None,  # SlackTool instance for HITL
     ) -> None:
         self.llm = llm
@@ -65,6 +66,7 @@ class ResearchOrchestrator:
         self.yami = yami
         self.agent_factory = agent_factory
         self.tool_entries = tool_entries or []
+        self._tool_instances = tool_instances or {}
         self.slack_tool = slack_tool
         self.audit = AuditLogger("orchestrator")
 

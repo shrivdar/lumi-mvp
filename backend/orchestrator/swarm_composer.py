@@ -194,8 +194,120 @@ class SwarmComposer:
         return tasks
 
     # ------------------------------------------------------------------
-    # Tool selection
+    # Tool selection (LLM-driven, dynamic per task)
     # ------------------------------------------------------------------
+
+    async def select_tools_for_task(
+        self,
+        agent_type: AgentType,
+        task: AgentTask,
+        *,
+        max_tools: int = 8,
+    ) -> list[str]:
+        """Dynamically select tools for a specific agent task via LLM.
+
+        Uses the full tool catalog to pick the most relevant tools for
+        the agent's assignment, rather than hardcoded tool lists.
+
+        Returns:
+            List of tool names from the catalog.
+        """
+        from agents.templates import AGENT_TEMPLATES
+
+        template = AGENT_TEMPLATES.get(agent_type)
+        default_tools = template.tools if template else []
+
+        # Build compact catalog for LLM
+        catalog_lines = []
+        for entry in self._tool_entries:
+            if not entry.enabled:
+                continue
+            caps = ", ".join(entry.capabilities[:4]) if entry.capabilities else ""
+            catalog_lines.append(
+                f"  - {entry.name} [{entry.category}]: {entry.description[:100]}  capabilities: [{caps}]"
+            )
+
+        prompt = (
+            f"Agent type: {agent_type.value}\n"
+            f"Task instruction: {task.instruction}\n"
+            f"Hypothesis: {task.context.get('hypothesis', '')}\n"
+            f"Research query: {task.context.get('query', '')}\n\n"
+            f"Default tools for this agent type: {default_tools}\n\n"
+            f"Available tools ({len(self._tool_entries)} total):\n"
+            + "\n".join(catalog_lines[:80])  # cap prompt size
+            + "\n\n"
+            f"Select the {max_tools} most relevant tools for this specific task. "
+            f"Always include the agent's default tools unless clearly irrelevant. "
+            f"Add additional tools from the catalog that would help investigate the hypothesis. "
+            f"Return a JSON array of tool name strings."
+        )
+
+        try:
+            response = await self.llm.query(
+                prompt,
+                system_prompt=(
+                    "You are a tool selector for a biomedical research platform. "
+                    "Select the most relevant tools from the catalog for the given "
+                    "agent task. Prefer tools that directly address the hypothesis. "
+                    "Return ONLY a JSON array of tool name strings, nothing else."
+                ),
+                research_id=self.session_id,
+            )
+            parsed = LLMClient.parse_json(response)
+            if isinstance(parsed, list):
+                # Validate names against catalog
+                valid_names = {e.name for e in self._tool_entries if e.enabled}
+                selected = [str(n) for n in parsed if str(n) in valid_names]
+                if selected:
+                    self.audit.log(
+                        "tools_selected",
+                        agent_type=str(agent_type),
+                        task_id=task.task_id,
+                        tools=selected,
+                        method="llm",
+                    )
+                    return selected[:max_tools]
+        except Exception as exc:
+            logger.warning("tool_selection_llm_failed", error=str(exc), agent_type=str(agent_type))
+
+        # Fallback: use template defaults + category-matched tools
+        return self._fallback_tool_selection(agent_type, default_tools)
+
+    def _fallback_tool_selection(
+        self,
+        agent_type: AgentType,
+        default_tools: list[str],
+    ) -> list[str]:
+        """Heuristic fallback: template defaults + top tools from matching categories."""
+        from agents.templates import AGENT_TEMPLATES
+
+        result = list(default_tools)
+        template = AGENT_TEMPLATES.get(agent_type)
+
+        # Map agent types to relevant categories
+        agent_category_map: dict[AgentType, list[str]] = {
+            AgentType.LITERATURE_ANALYST: ["literature_search", "web_search"],
+            AgentType.PROTEIN_ENGINEER: ["protein_analysis", "structural_biology"],
+            AgentType.GENOMICS_MAPPER: ["genomics", "variant_analysis", "gene_expression"],
+            AgentType.PATHWAY_ANALYST: ["pathway_analysis", "ontology_annotation", "network_analysis"],
+            AgentType.DRUG_HUNTER: ["drug_discovery", "chemistry", "safety_toxicology"],
+            AgentType.CLINICAL_ANALYST: ["clinical_data", "regulatory_data"],
+            AgentType.SCIENTIFIC_CRITIC: ["literature_search", "web_search"],
+            AgentType.EXPERIMENT_DESIGNER: [],
+        }
+
+        categories = agent_category_map.get(agent_type, [])
+        for entry in self._tool_entries:
+            if entry.name in result:
+                continue
+            if not entry.enabled:
+                continue
+            if entry.category in categories and entry.source_type.value == "NATIVE":
+                result.append(entry.name)
+            if len(result) >= 6:
+                break
+
+        return result
 
     def select_tools_for_agent(
         self,
