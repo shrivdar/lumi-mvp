@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections import defaultdict
 from typing import Any
 
 import anthropic
@@ -24,6 +25,9 @@ class LLMClient:
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
         self.call_count: int = 0
+        self._per_model_usage: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+        )
 
     # ------------------------------------------------------------------
     # Main query
@@ -36,26 +40,29 @@ class LLMClient:
         system_prompt: str = "",
         kg_context: dict[str, Any] | None = None,
         max_tokens: int | None = None,
+        model: str | None = None,
         research_id: str = "",
         agent_id: str = "",
     ) -> str:
         """Send a prompt to Claude and return the text response.
 
+        * *model* — optional model override; defaults to ``settings.llm_model``.
         * *kg_context* — optional KG subgraph dict; serialised into the
           system prompt so the LLM has domain context.
-        * Token usage is tracked per-call and accumulated.
+        * Token usage is tracked per-call, accumulated, and broken down per model.
         """
+        resolved_model = model or settings.llm_model
         max_tokens = max_tokens or settings.llm_max_tokens
 
         system = self._build_system_prompt(system_prompt, kg_context)
 
         log = logger.bind(research_id=research_id, agent_id=agent_id)
-        log.info("llm.call_start", model=settings.llm_model, prompt_len=len(prompt))
+        log.info("llm.call_start", model=resolved_model, prompt_len=len(prompt))
 
         start = time.monotonic()
         try:
             response = self._client.messages.create(
-                model=settings.llm_model,
+                model=resolved_model,
                 max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
@@ -67,7 +74,7 @@ class LLMClient:
             raise LLMError(
                 str(exc),
                 error_code="LLM_API_ERROR",
-                details={"model": settings.llm_model},
+                details={"model": resolved_model},
             ) from exc
 
         duration_ms = int((time.monotonic() - start) * 1000)
@@ -78,10 +85,16 @@ class LLMClient:
         self.total_output_tokens += output_tokens
         self.call_count += 1
 
+        model_stats = self._per_model_usage[resolved_model]
+        model_stats["input_tokens"] += input_tokens
+        model_stats["output_tokens"] += output_tokens
+        model_stats["calls"] += 1
+
         text = response.content[0].text if response.content else ""
 
         log.info(
             "llm.call_end",
+            model=resolved_model,
             duration_ms=duration_ms,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -134,10 +147,11 @@ class LLMClient:
         return "\n\n".join(parts) if parts else "You are a helpful biomedical research assistant."
 
     @property
-    def token_summary(self) -> dict[str, int]:
+    def token_summary(self) -> dict[str, Any]:
         return {
             "calls": self.call_count,
             "input_tokens": self.total_input_tokens,
             "output_tokens": self.total_output_tokens,
             "total_tokens": self.total_input_tokens + self.total_output_tokens,
+            "per_model": dict(self._per_model_usage),
         }

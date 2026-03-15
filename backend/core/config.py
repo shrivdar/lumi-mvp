@@ -11,7 +11,9 @@ from core.models import MCPServerConfig
 class Settings(BaseSettings):
     # ── LLM ──────────────────────────────────────────
     anthropic_api_key: str = ""
-    llm_model: str = "claude-sonnet-4-20250514"
+    llm_model: str = "claude-opus-4-20250805"
+    llm_fast_model: str = "claude-sonnet-4-20250514"
+    llm_cheap_model: str = "claude-haiku-4-5-20251001"
     llm_max_tokens: int = 4096
 
     # ── Database ─────────────────────────────────────
