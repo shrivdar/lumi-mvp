@@ -16,10 +16,10 @@ class TestIntegrationsRegistry:
         await reg.bootstrap()
 
         instances = reg.list_instances()
-        assert len(instances) == 10
+        assert len(instances) == 11  # 10 API tools + PythonREPLTool
 
         # All tools should be in the core registry
-        assert tool_reg.tool_count == 10
+        assert tool_reg.tool_count == 11
 
         # Spot-check names
         names = {t.name for t in instances}

@@ -9,6 +9,7 @@ Provides:
 """
 
 from integrations.base_tool import BaseTool
+from integrations.python_repl import PythonREPLTool
 from integrations.registry import IntegrationsRegistry
 
-__all__ = ["BaseTool", "IntegrationsRegistry"]
+__all__ = ["BaseTool", "IntegrationsRegistry", "PythonREPLTool"]

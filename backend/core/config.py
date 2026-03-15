@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     container_network_mode: str = "none"
     container_timeout_seconds: int = 120
 
+    # ── Python REPL ──────────────────────────────────
+    repl_image: str = "yohas-repl:latest"
+    repl_memory_limit: str = "1g"
+    repl_cpu_limit: str = "2.0"
+    repl_timeout_seconds: int = 120
+    repl_max_output_chars: int = 10_000
+    data_lake_path: str = "/data"  # host path mounted read-only into REPL containers
+
     # ── App ──────────────────────────────────────────
     api_key: str = "dev-api-key-change-me"
     log_level: str = "INFO"
