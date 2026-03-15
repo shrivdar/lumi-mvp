@@ -1,0 +1,53 @@
+{
+  "sft": {
+    "base_model": "meta-llama/Llama-3.1-8B-Instruct",
+    "output_dir": "checkpoints/sft-8b",
+    "dataset_path": "data/trajectories/sft",
+    "num_epochs": 3,
+    "per_device_batch_size": 4,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 2e-5,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.03,
+    "lr_scheduler_type": "cosine",
+    "max_seq_length": 8192,
+    "bf16": true,
+    "gradient_checkpointing": true,
+    "lora": {
+      "r": 64,
+      "lora_alpha": 128,
+      "lora_dropout": 0.05,
+      "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+      "task_type": "CAUSAL_LM"
+    },
+    "seed": 42,
+    "dry_run": false
+  },
+  "rl": {
+    "base_model": "meta-llama/Llama-3.1-8B-Instruct",
+    "output_dir": "checkpoints/rl-8b",
+    "trajectory_path": "data/trajectories/rl",
+    "algorithm": "grpo",
+    "grpo": {
+      "num_generations": 4,
+      "temperature": 0.7,
+      "kl_coeff": 0.1,
+      "clip_range": 0.2,
+      "reward_baseline": "moving_average",
+      "baseline_ema_decay": 0.99
+    },
+    "num_episodes": 500,
+    "per_device_batch_size": 2,
+    "gradient_accumulation_steps": 4,
+    "learning_rate": 5e-6,
+    "max_seq_length": 8192,
+    "bf16": true,
+    "seed": 42,
+    "dry_run": false
+  },
+  "eval": {
+    "base_model": "meta-llama/Llama-3.1-8B-Instruct",
+    "output_dir": "eval_results/8b",
+    "dry_run": false
+  }
+}

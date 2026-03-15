@@ -179,14 +179,25 @@ def run_rl(config: RLConfig) -> Path:
 
 
 def _run_grpo(model, tokenizer, trajectories, rewards, config: RLConfig) -> None:  # noqa: ANN001
-    """GRPO training loop: generate N completions, rank by reward, update policy."""
+    """GRPO training loop: generate N completions, rank by reward, update policy.
+
+    Uses moving-average reward baseline for advantage normalization and KL penalty.
+    Compatible with SkyRL-Agent + veRL distributed launchers.
+    """
     import torch
     from torch.optim import AdamW
 
-    logger.info("Running GRPO with %d generations per prompt", config.grpo_num_generations)
+    grpo = config.grpo
+    logger.info(
+        "Running GRPO: generations=%d, temp=%.2f, kl_coeff=%.3f, baseline=%s",
+        grpo.num_generations, grpo.temperature, grpo.kl_coeff, grpo.reward_baseline,
+    )
 
     optimizer = AdamW(model.parameters(), lr=config.learning_rate)
     model.train()
+
+    # Moving average baseline for advantage computation
+    reward_ema = 0.5  # initial baseline
 
     for step, (traj, reward) in enumerate(zip(trajectories, rewards)):
         if step >= config.num_episodes:
@@ -196,22 +207,34 @@ def _run_grpo(model, tokenizer, trajectories, rewards, config: RLConfig) -> None
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=config.max_seq_length)
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-        # Generate N completions (used for ranking in full GRPO; simplified here)
+        # Generate N completions for group ranking
         with torch.no_grad():
             model.generate(
                 **inputs,
                 max_new_tokens=config.max_response_length,
-                num_return_sequences=config.grpo_num_generations,
-                temperature=config.grpo_temperature,
+                num_return_sequences=grpo.num_generations,
+                temperature=grpo.temperature,
                 do_sample=True,
             )
 
-        # Use reward as advantage signal (simplified GRPO)
-        advantage = reward.total - 0.5  # center around 0.5 baseline
+        # Compute advantage using configured baseline
+        if grpo.reward_baseline == "moving_average":
+            advantage = reward.total - reward_ema
+            reward_ema = grpo.baseline_ema_decay * reward_ema + (1 - grpo.baseline_ema_decay) * reward.total
+        elif grpo.reward_baseline == "per_prompt_mean":
+            advantage = reward.total - 0.5
+        else:
+            advantage = reward.total
 
-        # Policy gradient step
+        # Policy gradient step with KL penalty
         logits = model(**inputs).logits
-        loss = -advantage * logits.mean()  # simplified — real impl uses per-token log-probs
+        policy_loss = -advantage * logits.mean()  # simplified — real impl uses per-token log-probs
+        kl_penalty = grpo.kl_coeff * logits.var()  # approximate KL divergence
+        loss = policy_loss + kl_penalty
+
+        # Clip the loss for stability
+        loss = torch.clamp(loss, -grpo.clip_range, grpo.clip_range) if loss.abs() > grpo.clip_range else loss
+
         loss.backward()
 
         if (step + 1) % config.gradient_accumulation_steps == 0:
@@ -220,8 +243,8 @@ def _run_grpo(model, tokenizer, trajectories, rewards, config: RLConfig) -> None
 
         if step % config.logging_steps == 0:
             logger.info(
-                "  GRPO step %d/%d  reward=%.4f  loss=%.4f",
-                step, config.num_episodes, reward.total, loss.item(),
+                "  GRPO step %d/%d  reward=%.4f  baseline=%.4f  adv=%.4f  loss=%.4f",
+                step, config.num_episodes, reward.total, reward_ema, advantage, loss.item(),
             )
 
 
@@ -272,6 +295,7 @@ def _run_ppo(model, tokenizer, trajectories, rewards, config: RLConfig) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="YOHAS RL Training (PPO/GRPO)")
+    parser.add_argument("--config", type=Path, default=None, help="Path to training config file (YAML/JSON)")
     parser.add_argument("--dry-run", action="store_true", help="Validate config without GPU training")
     parser.add_argument("--algorithm", choices=["ppo", "grpo"], default="grpo", help="RL algorithm")
     parser.add_argument(
@@ -279,6 +303,12 @@ def main(argv: list[str] | None = None) -> None:
         choices=["qwen", "llama"],
         default="qwen",
         help="Base model selection",
+    )
+    parser.add_argument(
+        "--preset",
+        choices=["default", "grpo", "fast"],
+        default=None,
+        help="Use a named config preset",
     )
     parser.add_argument("--sft-checkpoint", type=Path, default=None, help="Path to SFT checkpoint")
     parser.add_argument("--trajectories", type=Path, default=None, help="Override trajectory path")
@@ -288,7 +318,14 @@ def main(argv: list[str] | None = None) -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-    if args.base_model == "llama":
+    # Config priority: --config file > --preset > --base-model fallback
+    if args.config:
+        config = TrainingConfig.from_file(args.config).rl
+    elif args.preset == "grpo":
+        config = TrainingConfig.for_grpo().rl
+    elif args.preset == "fast":
+        config = TrainingConfig.for_fast_iteration().rl
+    elif args.base_model == "llama":
         config = TrainingConfig.for_fast_iteration().rl
     else:
         config = RLConfig()

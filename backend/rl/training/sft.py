@@ -166,12 +166,19 @@ def run_sft(config: SFTConfig) -> Path:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="YOHAS SFT Training")
+    parser.add_argument("--config", type=Path, default=None, help="Path to training config file (YAML/JSON)")
     parser.add_argument("--dry-run", action="store_true", help="Validate config without GPU training")
     parser.add_argument(
         "--base-model",
         choices=["qwen", "llama"],
         default="qwen",
         help="Base model selection (default: qwen)",
+    )
+    parser.add_argument(
+        "--preset",
+        choices=["default", "sft-8b", "sft-32b-qlora", "fast"],
+        default=None,
+        help="Use a named config preset",
     )
     parser.add_argument("--dataset", type=Path, default=None, help="Override dataset path")
     parser.add_argument("--output-dir", type=Path, default=None, help="Override output directory")
@@ -180,7 +187,16 @@ def main(argv: list[str] | None = None) -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-    if args.base_model == "llama":
+    # Config priority: --config file > --preset > --base-model fallback
+    if args.config:
+        config = TrainingConfig.from_file(args.config).sft
+    elif args.preset == "sft-8b":
+        config = TrainingConfig.for_sft_8b().sft
+    elif args.preset == "sft-32b-qlora":
+        config = TrainingConfig.for_sft_32b_qlora().sft
+    elif args.preset == "fast":
+        config = TrainingConfig.for_fast_iteration().sft
+    elif args.base_model == "llama":
         config = TrainingConfig.for_fast_iteration().sft
     else:
         config = SFTConfig()
