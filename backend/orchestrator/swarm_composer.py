@@ -57,77 +57,7 @@ class SwarmComposer:
         self._tool_retriever = tool_retriever
 
     # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
-
-    async def compose_swarm(
-        self,
-        query: str,
-        hypothesis: HypothesisNode,
-        config: ResearchConfig,
-    ) -> list[AgentType]:
-        """Select agent types for exploring a hypothesis.
-
-        Always includes SCIENTIFIC_CRITIC. Uses the LLM to determine
-        which other agent types are most relevant.
-
-        Returns:
-            List of AgentType values for the swarm.
-        """
-        available_types = config.agent_types or list(AgentType)
-        max_agents = config.max_agents_per_swarm
-
-        # Ask LLM which agents to include
-        prompt = self._build_composition_prompt(query, hypothesis, available_types)
-
-        try:
-            response = await self.llm.query(
-                prompt,
-                system_prompt=(
-                    "You are a research orchestrator selecting which specialist agents "
-                    "to deploy for a hypothesis investigation. Respond with ONLY a JSON "
-                    "array of agent type strings. Be selective — choose only the agents "
-                    "whose tools are directly relevant to the hypothesis."
-                ),
-                research_id=self.session_id,
-            )
-            parsed = LLMClient.parse_json(response)
-            if not isinstance(parsed, list):
-                parsed = parsed.get("agents", []) if isinstance(parsed, dict) else []
-            selected = self._parse_agent_types(parsed, available_types)
-        except Exception as exc:
-            logger.warning("swarm_composition_llm_failed", error=str(exc))
-            selected = self._fallback_selection(query, hypothesis, available_types)
-
-        # Enforce mandatory agents
-        for mandatory in MANDATORY_AGENTS:
-            agent_type = AgentType(mandatory)
-            if agent_type not in selected:
-                selected.append(agent_type)
-
-        # Cap at max
-        selected = selected[:max_agents]
-
-        self.audit.log(
-            "swarm_composed",
-            session_id=self.session_id,
-            hypothesis_id=hypothesis.id,
-            agents=[str(a) for a in selected],
-            count=len(selected),
-        )
-
-        self._emit(
-            "swarm_composed",
-            hypothesis_id=hypothesis.id,
-            hypothesis=hypothesis.hypothesis,
-            agents=[str(a) for a in selected],
-            count=len(selected),
-        )
-
-        return selected
-
-    # ------------------------------------------------------------------
-    # Dynamic AgentSpec generation
+    # Main entry point — dynamic AgentSpec generation
     # ------------------------------------------------------------------
 
     async def compose_swarm_specs(
@@ -199,13 +129,19 @@ class SwarmComposer:
 
         except Exception as exc:
             logger.warning("spec_composition_llm_failed", error=str(exc))
-            # Fallback: generate specs from the static compose_swarm path
-            agent_types = await self.compose_swarm(query, hypothesis, config)
+            # Fallback: generate specs from heuristic agent selection
+            agent_types = self._fallback_selection(query, hypothesis, available_types)
+            # Enforce mandatory agents
+            for mandatory in MANDATORY_AGENTS:
+                at = AgentType(mandatory)
+                if at not in agent_types:
+                    agent_types.append(at)
             for i, at in enumerate(agent_types):
                 constraint = (
                     agent_constraints[i] if agent_constraints and i < len(agent_constraints)
                     else AgentConstraints(token_budget=config.agent_token_budget)
                 )
+                template_guidance = self._get_template_guidance(at)
                 specs.append(AgentSpec(
                     role=f"{at.value} for hypothesis investigation",
                     instructions=self._default_instruction(query, hypothesis, at),
@@ -213,6 +149,10 @@ class SwarmComposer:
                     constraints=constraint,
                     hypothesis_branch=hypothesis.id,
                     agent_type_hint=at,
+                    system_prompt=template_guidance.get("system_prompt", ""),
+                    kg_write_permissions=template_guidance.get("kg_write_permissions", []),
+                    kg_edge_permissions=template_guidance.get("kg_edge_permissions", []),
+                    falsification_protocol=template_guidance.get("falsification_protocol", ""),
                 ))
 
         # Enforce mandatory agent: scientific_critic
@@ -268,26 +208,29 @@ class SwarmComposer:
         tool_catalog: list[str],
         config: ResearchConfig,
     ) -> str:
-        type_descriptions = {
-            AgentType.LITERATURE_ANALYST: "Searches PubMed/Semantic Scholar for publications",
-            AgentType.PROTEIN_ENGINEER: "Fetches protein data from UniProt, predicts structure via ESM",
-            AgentType.GENOMICS_MAPPER: "Maps genes to pathways via MyGene and KEGG",
-            AgentType.PATHWAY_ANALYST: "Deep pathway analysis via KEGG and Reactome",
-            AgentType.DRUG_HUNTER: "Searches ChEMBL for drugs, ClinicalTrials.gov for trials",
-            AgentType.CLINICAL_ANALYST: "Analyzes clinical trial outcomes and designs",
-            AgentType.SCIENTIFIC_CRITIC: "Falsifies KG edges, searches for counter-evidence",
-            AgentType.EXPERIMENT_DESIGNER: "Proposes experiments to resolve uncertainties",
-        }
+        from agents.templates import AGENT_TEMPLATES
 
         lines = [
             f"Research query: {query}",
             f"Hypothesis to explore: {hypothesis.hypothesis}",
             f"Rationale: {hypothesis.rationale}",
             "",
-            "Known specialist types (use as agent_type_hint if applicable):",
+            "Known specialist types with their expertise (use as agent_type_hint if applicable):",
         ]
         for at in available_types:
-            lines.append(f"  - {at.value}: {type_descriptions.get(at, 'Specialist agent')}")
+            template = AGENT_TEMPLATES.get(at)
+            if template:
+                # Include template system prompt as guidance for spec composition
+                prompt_summary = template.system_prompt.split("\n")[0] if template.system_prompt else ""
+                tools_str = ", ".join(template.tools) if template.tools else "none"
+                lines.append(
+                    f"  - {at.value}: {template.description}\n"
+                    f"    Expertise: {prompt_summary}\n"
+                    f"    Default tools: [{tools_str}]\n"
+                    f"    Falsification: {template.falsification_protocol or 'N/A'}"
+                )
+            else:
+                lines.append(f"  - {at.value}: Specialist agent")
 
         lines.extend([
             "",
@@ -299,7 +242,10 @@ class SwarmComposer:
             '  - "instructions": 2-4 sentences of specific investigation instructions',
             '  - "tools": array of tool names from the catalog above',
             '  - "agent_type_hint": one of the specialist types if applicable, or null',
+            '  - "system_prompt": optional custom system prompt (if omitted, template default is used)',
+            '  - "falsification_protocol": how this agent should self-falsify its findings',
             "",
+            "Use the specialist expertise descriptions above to craft precise instructions.",
             "scientific_critic is always included automatically — do not include it.",
             "Return a JSON array of agent spec objects.",
         ])
@@ -311,7 +257,13 @@ class SwarmComposer:
         hypothesis: HypothesisNode,
         constraint_override: AgentConstraints | None = None,
     ) -> AgentSpec | None:
-        """Parse a raw dict from LLM response into an AgentSpec."""
+        """Parse a raw dict from LLM response into an AgentSpec.
+
+        Injects template guidance (system_prompt, KG permissions, falsification
+        protocol) from the template library when the LLM response doesn't
+        provide them. This ensures spec-composed agents retain the domain
+        expertise encoded in templates.
+        """
         role = raw.get("role", "")
         instructions = raw.get("instructions", "")
         if not role or not instructions:
@@ -333,6 +285,15 @@ class SwarmComposer:
 
         constraints = constraint_override or AgentConstraints()
 
+        # Inject template guidance if agent_type_hint maps to a known template
+        template_guidance = self._get_template_guidance(agent_type_hint)
+        system_prompt = raw.get("system_prompt", "") or template_guidance.get("system_prompt", "")
+        falsification_protocol = (
+            raw.get("falsification_protocol", "") or template_guidance.get("falsification_protocol", "")
+        )
+        kg_write_permissions = template_guidance.get("kg_write_permissions", [])
+        kg_edge_permissions = template_guidance.get("kg_edge_permissions", [])
+
         return AgentSpec(
             role=role,
             instructions=instructions,
@@ -340,8 +301,10 @@ class SwarmComposer:
             constraints=constraints,
             hypothesis_branch=hypothesis.id,
             agent_type_hint=agent_type_hint,
-            system_prompt=raw.get("system_prompt", ""),
-            falsification_protocol=raw.get("falsification_protocol", ""),
+            system_prompt=system_prompt,
+            kg_write_permissions=kg_write_permissions,
+            kg_edge_permissions=kg_edge_permissions,
+            falsification_protocol=falsification_protocol,
         )
 
     # ------------------------------------------------------------------
@@ -574,41 +537,6 @@ class SwarmComposer:
     # Prompt builders
     # ------------------------------------------------------------------
 
-    def _build_composition_prompt(
-        self,
-        query: str,
-        hypothesis: HypothesisNode,
-        available_types: list[AgentType],
-    ) -> str:
-        type_descriptions = {
-            AgentType.LITERATURE_ANALYST: "Searches PubMed/Semantic Scholar for publications",
-            AgentType.PROTEIN_ENGINEER: "Fetches protein data from UniProt, predicts structure via ESM",
-            AgentType.GENOMICS_MAPPER: "Maps genes to pathways via MyGene and KEGG",
-            AgentType.PATHWAY_ANALYST: "Deep pathway analysis via KEGG and Reactome",
-            AgentType.DRUG_HUNTER: "Searches ChEMBL for drugs, ClinicalTrials.gov for trials",
-            AgentType.CLINICAL_ANALYST: "Analyzes clinical trial outcomes and designs",
-            AgentType.SCIENTIFIC_CRITIC: "Falsifies KG edges, searches for counter-evidence (ALWAYS INCLUDED)",
-            AgentType.EXPERIMENT_DESIGNER: "Proposes experiments to resolve uncertainties",
-        }
-
-        lines = [
-            f"Research query: {query}",
-            f"Hypothesis to explore: {hypothesis.hypothesis}",
-            f"Rationale: {hypothesis.rationale}",
-            "",
-            "Available agent types:",
-        ]
-        for at in available_types:
-            lines.append(f"  - {at.value}: {type_descriptions.get(at, 'Specialist agent')}")
-
-        lines.extend([
-            "",
-            "Select the 3-5 most relevant agent types for investigating this hypothesis.",
-            "scientific_critic is always included automatically — do not include it.",
-            "Return a JSON array of agent type strings.",
-        ])
-        return "\n".join(lines)
-
     def _build_task_prompt(
         self,
         query: str,
@@ -631,6 +559,31 @@ class SwarmComposer:
             "Each instruction should be 2-4 sentences, specific to what the agent should search/analyze.",
         ])
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Template guidance
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_template_guidance(agent_type: AgentType | None) -> dict[str, Any]:
+        """Extract guidance from the template library for a given agent type.
+
+        Returns system_prompt, KG permissions, and falsification protocol
+        from the canonical template. Used to enrich LLM-composed specs with
+        domain knowledge that was previously hardcoded in templates.
+        """
+        if agent_type is None:
+            return {}
+        from agents.templates import AGENT_TEMPLATES
+        template = AGENT_TEMPLATES.get(agent_type)
+        if template is None:
+            return {}
+        return {
+            "system_prompt": template.system_prompt,
+            "kg_write_permissions": list(template.kg_write_permissions),
+            "kg_edge_permissions": list(template.kg_edge_permissions),
+            "falsification_protocol": template.falsification_protocol,
+        }
 
     # ------------------------------------------------------------------
     # Fallback / parsing helpers

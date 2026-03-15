@@ -318,9 +318,9 @@ class TestScaledOrchestration:
     @pytest.mark.asyncio
     async def test_config_has_scale_fields(self) -> None:
         config = ResearchConfig()
-        assert config.max_concurrent_agents == 50
+        assert config.max_concurrent_agents == 100
         assert config.max_total_agents == 10_000
-        assert config.max_hypothesis_breadth == 30
+        assert config.max_hypothesis_breadth == 50
         assert config.agent_token_budget == 50_000
         assert config.session_token_budget == 10_000_000
 

@@ -516,9 +516,9 @@ class ResearchConfig(BaseModel):
     """Configuration for a specific research session."""
 
     max_hypothesis_depth: int = 5
-    max_mcts_iterations: int = 15
+    max_mcts_iterations: int = 30
     max_agents: int = 8
-    max_agents_per_swarm: int = 5
+    max_agents_per_swarm: int = 15
     confidence_threshold: float = 0.7
     hitl_uncertainty_threshold: float = 0.6
     hitl_timeout_seconds: int = 600
@@ -529,9 +529,9 @@ class ResearchConfig(BaseModel):
     slack_channel_id: str | None = None
 
     # --- Scaled orchestration (per-hypothesis swarms) ---
-    max_concurrent_agents: int = 50  # Global concurrency limit (semaphore)
+    max_concurrent_agents: int = 100  # Global concurrency limit (semaphore)
     max_total_agents: int = 10_000  # Hard cap across entire session
-    max_hypothesis_breadth: int = 30  # Max competing hypotheses per tree level
+    max_hypothesis_breadth: int = 50  # Max competing hypotheses per tree level
     agent_token_budget: int = 50_000  # Per-agent token limit
     session_token_budget: int = 10_000_000  # Total session token limit
     session_timeout_seconds: int = 1800  # Wall-clock timeout (default 30 min)

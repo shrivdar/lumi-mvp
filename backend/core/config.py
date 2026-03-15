@@ -41,7 +41,7 @@ class Settings(BaseSettings):
 
     # ── Research defaults ───────────────────────────
     max_hypothesis_depth: int = 2
-    max_mcts_iterations: int = 15
+    max_mcts_iterations: int = 30
     confidence_threshold: float = 0.7
     hitl_uncertainty_threshold: float = 0.6
     hitl_timeout_seconds: int = 600

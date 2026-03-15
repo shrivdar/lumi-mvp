@@ -395,28 +395,19 @@ class ResearchOrchestrator:
                 else:
                     agent_constraints = None
 
-                # Try dynamic spec composition first, fall back to legacy
-                if self.spec_factory is not None:
-                    specs = await self._composer.compose_swarm_specs(
-                        query, hypothesis, config,
-                        agent_constraints=agent_constraints,
-                    )
-                    # Also generate legacy tasks for backwards-compat tracking
-                    agent_types = [
-                        s.agent_type_hint or AgentType.LITERATURE_ANALYST for s in specs
-                    ]
-                    tasks = await self._composer.generate_tasks(
-                        query, hypothesis, agent_types, session.id,
-                    )
-                    return hypothesis, specs, tasks
-                else:
-                    agent_types = await self._composer.compose_swarm(
-                        query, hypothesis, config,
-                    )
-                    tasks = await self._composer.generate_tasks(
-                        query, hypothesis, agent_types, session.id,
-                    )
-                    return hypothesis, [], tasks
+                # Dynamic spec composition (the only path)
+                specs = await self._composer.compose_swarm_specs(
+                    query, hypothesis, config,
+                    agent_constraints=agent_constraints,
+                )
+                # Generate tasks for tracking
+                agent_types = [
+                    s.agent_type_hint or AgentType.LITERATURE_ANALYST for s in specs
+                ]
+                tasks = await self._composer.generate_tasks(
+                    query, hypothesis, agent_types, session.id,
+                )
+                return hypothesis, specs, tasks
 
             compose_results = await asyncio.gather(
                 *[_compose_for_hypothesis(h) for h in leaves],
@@ -434,41 +425,33 @@ class ResearchOrchestrator:
                 # Cap agent spawns to stay within budget
                 budget_left = config.max_total_agents - self._total_agents_spawned
 
-                if specs and self.spec_factory is not None:
-                    # Dynamic spec-based execution
-                    specs = specs[:budget_left]
-                    if not specs:
-                        continue
-                    # Pair specs with tasks for tracking
-                    paired_tasks = tasks[:len(specs)]
-                    hypothesis_task_map.append((hypothesis, paired_tasks))
-                    all_swarm_coros.append(
-                        self._execute_specs_with_semaphore(
-                            specs, paired_tasks, hypothesis, config, semaphore,
-                        )
+                specs = specs[:budget_left]
+                if not specs:
+                    continue
+                # Pair specs with tasks for tracking
+                paired_tasks = tasks[:len(specs)]
+                hypothesis_task_map.append((hypothesis, paired_tasks))
+                all_swarm_coros.append(
+                    self._execute_specs_with_semaphore(
+                        specs, paired_tasks, hypothesis, config, semaphore,
                     )
-                else:
-                    # Legacy template-based execution
-                    tasks = tasks[:budget_left]
-                    if not tasks:
-                        continue
-                    hypothesis_task_map.append((hypothesis, tasks))
-                    all_swarm_coros.append(
-                        self._execute_agents_with_semaphore(
-                            tasks, hypothesis, config, semaphore,
-                        )
-                    )
+                )
 
             if not all_swarm_coros:
-                # No swarms could be composed — fall back to single select
+                # No swarms could be composed — fall back to single select via specs
                 selected = self._tree.select()
-                agent_types = await self._composer.compose_swarm(query, selected, config)
+                specs = await self._composer.compose_swarm_specs(
+                    query, selected, config,
+                )
+                agent_types = [
+                    s.agent_type_hint or AgentType.LITERATURE_ANALYST for s in specs
+                ]
                 tasks = await self._composer.generate_tasks(
                     query, selected, agent_types, session.id,
                 )
                 swarm_results_list = [
-                    await self._execute_agents_with_semaphore(
-                        tasks, selected, config, semaphore,
+                    await self._execute_specs_with_semaphore(
+                        specs, tasks, selected, config, semaphore,
                     )
                 ]
                 hypothesis_task_map = [(selected, tasks)]
@@ -734,8 +717,7 @@ class ResearchOrchestrator:
             async with semaphore:
                 self._total_agents_spawned += 1
                 try:
-                    if self.spec_factory is None:
-                        raise OrchestrationError("No spec_factory configured")
+                    from agents.factory import create_agent_from_spec
 
                     # Resolve tools from spec's tool list
                     agent_tools: dict[str, Any] = {}
@@ -748,13 +730,23 @@ class ResearchOrchestrator:
                     if "python_repl" in self._tool_instances and "python_repl" not in agent_tools:
                         agent_tools["python_repl"] = self._tool_instances["python_repl"]
 
-                    agent = self.spec_factory(
-                        spec=spec,
-                        llm=self.llm,
-                        kg=self.kg,
-                        yami=self.yami,
-                        tools=agent_tools,
-                    )
+                    # Use spec_factory if provided (backward compat), else use factory directly
+                    if self.spec_factory is not None:
+                        agent = self.spec_factory(
+                            spec=spec,
+                            llm=self.llm,
+                            kg=self.kg,
+                            yami=self.yami,
+                            tools=agent_tools,
+                        )
+                    else:
+                        agent = create_agent_from_spec(
+                            spec=spec,
+                            llm=self.llm,
+                            kg=self.kg,
+                            yami=self.yami,
+                            tools=agent_tools,
+                        )
 
                     self._emit(
                         "agent_started",
@@ -1282,30 +1274,19 @@ class ResearchOrchestrator:
             else:
                 agent_constraints = None
 
-            if self.spec_factory is not None:
-                specs = await self._composer.compose_swarm_specs(
-                    question, target_hypothesis, config,
-                    agent_constraints=agent_constraints,
-                )
-                agent_types = [
-                    s.agent_type_hint or AgentType.LITERATURE_ANALYST for s in specs
-                ]
-                tasks = await self._composer.generate_tasks(
-                    question, target_hypothesis, agent_types, session.id,
-                )
-                results = await self._execute_specs_with_semaphore(
-                    specs, tasks, target_hypothesis, config, semaphore,
-                )
-            else:
-                agent_types = await self._composer.compose_swarm(
-                    question, target_hypothesis, config,
-                )
-                tasks = await self._composer.generate_tasks(
-                    question, target_hypothesis, agent_types, session.id,
-                )
-                results = await self._execute_agents_with_semaphore(
-                    tasks, target_hypothesis, config, semaphore,
-                )
+            specs = await self._composer.compose_swarm_specs(
+                question, target_hypothesis, config,
+                agent_constraints=agent_constraints,
+            )
+            agent_types = [
+                s.agent_type_hint or AgentType.LITERATURE_ANALYST for s in specs
+            ]
+            tasks = await self._composer.generate_tasks(
+                question, target_hypothesis, agent_types, session.id,
+            )
+            results = await self._execute_specs_with_semaphore(
+                specs, tasks, target_hypothesis, config, semaphore,
+            )
 
             self._all_results.extend(results)
 

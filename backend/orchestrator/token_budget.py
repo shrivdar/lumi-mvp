@@ -197,6 +197,28 @@ class TokenBudgetManager:
         used = self._agent_used.get(agent_id, 0)
         return used <= budget
 
+    def enforce_agent_budget(self, agent_id: str, budget: int) -> None:
+        """Hard-kill enforcement: raise TokenBudgetExceededError if over budget.
+
+        Called before each LLM call to prevent agents from exceeding their
+        allocated token budget.
+        """
+        from core.exceptions import TokenBudgetExceededError
+
+        used = self._agent_used.get(agent_id, 0)
+        if used > budget:
+            logger.warning(
+                "agent_token_budget_hard_kill",
+                agent_id=agent_id,
+                tokens_used=used,
+                budget=budget,
+            )
+            raise TokenBudgetExceededError(
+                f"Agent {agent_id} exceeded token budget: {used}/{budget}",
+                error_code="TOKEN_BUDGET_HARD_KILL",
+                details={"agent_id": agent_id, "tokens_used": used, "budget": budget},
+            )
+
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
