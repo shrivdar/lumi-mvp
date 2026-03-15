@@ -354,7 +354,7 @@ class AgentTemplate(BaseModel):
 class AgentConstraints(BaseModel):
     """Resource constraints for a dynamically-spawned agent."""
 
-    max_turns: int = 20
+    max_turns: int = 200
     token_budget: int = 50_000
     timeout_seconds: int = 300
     max_llm_calls: int = 20

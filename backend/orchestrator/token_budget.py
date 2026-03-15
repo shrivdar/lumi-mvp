@@ -143,7 +143,7 @@ class TokenBudgetManager:
         for _ in range(agent_count):
             constraints_list.append(
                 AgentConstraints(
-                    max_turns=config.max_llm_calls_per_agent * 2,
+                    max_turns=200,
                     token_budget=per_agent,
                     timeout_seconds=300,
                     max_llm_calls=config.max_llm_calls_per_agent,

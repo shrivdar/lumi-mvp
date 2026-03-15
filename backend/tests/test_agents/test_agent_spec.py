@@ -94,7 +94,7 @@ def sample_task() -> AgentTask:
 class TestAgentSpecModel:
     def test_default_constraints(self):
         spec = AgentSpec(role="test", instructions="test")
-        assert spec.constraints.max_turns == 20
+        assert spec.constraints.max_turns == 200
         assert spec.constraints.token_budget == 50_000
         assert spec.constraints.timeout_seconds == 300
         assert spec.constraints.max_llm_calls == 20

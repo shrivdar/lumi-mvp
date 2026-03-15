@@ -60,8 +60,8 @@ class HypothesisTree:
         *,
         tree_id: str | None = None,
         exploration_constant: float = DEFAULT_UCB_EXPLORATION_CONSTANT,
-        max_depth: int = 3,
-        max_breadth: int = 10,
+        max_depth: int = 5,
+        max_breadth: int = 30,
         session_id: str = "",
     ) -> None:
         self.tree_id = tree_id or _uuid()
