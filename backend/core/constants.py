@@ -41,6 +41,16 @@ CACHE_TTL_CLINICALTRIALS = 3_600  # 1 h — trials update frequently
 CACHE_TTL_MYGENE = 86_400
 CACHE_TTL_ESM = 604_800           # embeddings/structures don't change
 CACHE_TTL_LLM = 3_600             # 1 h (optional prompt-hash cache)
+CACHE_TTL_OPENTARGETS = 86_400    # 24 h
+CACHE_TTL_CLINVAR = 86_400        # 24 h
+CACHE_TTL_GTEX = 604_800          # 7 d — expression data stable
+CACHE_TTL_GNOMAD = 604_800        # 7 d — allele freqs stable
+CACHE_TTL_HPO = 604_800           # 7 d — ontology stable
+CACHE_TTL_OMIM = 86_400           # 24 h
+CACHE_TTL_BIOGRID = 86_400        # 24 h
+CACHE_TTL_DEPMAP = 604_800        # 7 d — release-based
+CACHE_TTL_CELLXGENE = 604_800     # 7 d — census snapshots
+CACHE_TTL_STRING_DB = 604_800     # 7 d — interactions stable
 CACHE_TTL_DEFAULT = 86_400
 
 # ---------------------------------------------------------------------------
@@ -55,6 +65,16 @@ RATE_LIMIT_CHEMBL = 5.0
 RATE_LIMIT_CLINICALTRIALS = 5.0
 RATE_LIMIT_MYGENE = 10.0
 RATE_LIMIT_ESM = 1.0
+RATE_LIMIT_OPENTARGETS = 10.0     # Open Targets Platform — generous
+RATE_LIMIT_CLINVAR = 3.0          # NCBI E-utils default
+RATE_LIMIT_GTEX = 5.0
+RATE_LIMIT_GNOMAD = 5.0           # GraphQL API
+RATE_LIMIT_HPO = 10.0             # JAX HPO API — generous
+RATE_LIMIT_OMIM = 3.0             # API key required, conservative
+RATE_LIMIT_BIOGRID = 5.0
+RATE_LIMIT_DEPMAP = 5.0
+RATE_LIMIT_CELLXGENE = 5.0
+RATE_LIMIT_STRING_DB = 5.0
 RATE_LIMIT_DEFAULT = 10.0
 
 # ---------------------------------------------------------------------------

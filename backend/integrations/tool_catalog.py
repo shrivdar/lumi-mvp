@@ -102,6 +102,17 @@ def _native_tools() -> list[ToolRegistryEntry]:
         _e("chembl", "Search ChEMBL for bioactive compounds, targets, assays, mechanisms of action, and drug indications.", CATEGORY_DRUG, ToolSourceType.NATIVE, capabilities=["search", "compound_details", "target_details", "assay_data", "mechanism_of_action"]),
         _e("clinicaltrials", "Search ClinicalTrials.gov for clinical trials by condition, intervention, sponsor, phase, and status.", CATEGORY_CLINICAL, ToolSourceType.NATIVE, capabilities=["search", "trial_details", "enrollment", "outcomes", "eligibility"]),
         _e("slack", "Send messages and files to Slack channels for human-in-the-loop communication during research.", CATEGORY_COMMUNICATION, ToolSourceType.NATIVE, capabilities=["send_message", "upload_file", "create_thread"]),
+        # --- New native tools (tool expansion) ---
+        _e("opentargets", "Query Open Targets for target-disease associations, evidence, and prioritization scores.", CATEGORY_DRUG, ToolSourceType.NATIVE, capabilities=["target_disease", "evidence_search", "drug_mechanism", "tractability"]),
+        _e("clinvar", "Search ClinVar for clinical significance of human genomic variants.", CATEGORY_VARIANT, ToolSourceType.NATIVE, capabilities=["variant_search", "clinical_significance", "condition_links", "submission_data"]),
+        _e("gtex", "Query GTEx for gene expression across human tissues with eQTL data.", CATEGORY_EXPRESSION, ToolSourceType.NATIVE, capabilities=["tissue_expression", "eqtl", "splicing", "sample_info"]),
+        _e("gnomad", "Query gnomAD for population allele frequencies and variant constraint metrics.", CATEGORY_VARIANT, ToolSourceType.NATIVE, capabilities=["variant_lookup", "allele_frequency", "constraint_metrics", "structural_variants"]),
+        _e("hpo", "Search Human Phenotype Ontology for standardized phenotype terms and gene-phenotype links.", CATEGORY_ONTOLOGY, ToolSourceType.NATIVE, capabilities=["term_search", "gene_to_phenotype", "disease_to_phenotype"]),
+        _e("omim", "Search Online Mendelian Inheritance in Man for gene-disease relationships and phenotype descriptions.", CATEGORY_GENOMICS, ToolSourceType.NATIVE, capabilities=["search", "gene_phenotype", "allelic_variants"]),
+        _e("biogrid", "Search BioGRID for curated protein-protein, genetic, and chemical interactions.", CATEGORY_NETWORK, ToolSourceType.NATIVE, capabilities=["search", "interactions", "chemical_associations"]),
+        _e("depmap", "Query DepMap for cancer dependency data — gene essentiality across cancer cell lines.", CATEGORY_EXPRESSION, ToolSourceType.NATIVE, capabilities=["gene_dependency", "cell_line_info", "crispr_data", "drug_sensitivity"]),
+        _e("cellxgene", "Search CZ CELLxGENE for single-cell RNA-seq datasets and cell type annotations.", CATEGORY_EXPRESSION, ToolSourceType.NATIVE, capabilities=["study_search", "cell_types", "gene_expression", "cluster_data"]),
+        _e("string_db", "Query STRING for known and predicted protein-protein interactions with confidence scores.", CATEGORY_NETWORK, ToolSourceType.NATIVE, capabilities=["interaction_partners", "network", "enrichment", "confidence_scores"]),
     ]
 
 
@@ -132,8 +143,8 @@ def _mcp_protein_tools() -> list[ToolRegistryEntry]:
         _e("alphafold_db", "Retrieve AlphaFold predicted structures from the EBI AlphaFold Protein Structure Database.", CATEGORY_STRUCTURE, capabilities=["fetch_prediction", "plddt_scores", "pae_matrix"]),
         _e("interpro", "Classify proteins into families, predict domains and functional sites via InterPro.", CATEGORY_PROTEIN, capabilities=["search", "domain_annotation", "family_classification", "go_annotation"]),
         _e("pfam", "Search Pfam for protein family HMM profiles, domain architectures, and clan memberships.", CATEGORY_PROTEIN, capabilities=["search", "domain_search", "clan_info", "alignment"]),
-        _e("string_db", "Query STRING for known and predicted protein-protein interactions with confidence scores.", CATEGORY_NETWORK, capabilities=["interaction_partners", "network", "enrichment", "confidence_scores"]),
-        _e("biogrid", "Search BioGRID for curated protein-protein, genetic, and chemical interactions.", CATEGORY_NETWORK, capabilities=["search", "interactions", "chemical_associations"]),
+        # string_db → now NATIVE (see _native_tools)
+        # biogrid → now NATIVE (see _native_tools)
         _e("intact", "Query IntAct for molecular interaction data with full experimental evidence details.", CATEGORY_NETWORK, capabilities=["search", "interactions", "evidence_details"]),
         _e("disprot", "Search DisProt for intrinsically disordered protein regions and their functional annotations.", CATEGORY_PROTEIN, capabilities=["search", "disorder_regions", "function_annotation"]),
         _e("proteomes_uniprot", "Search UniProt Proteomes for complete proteome data of organisms.", CATEGORY_PROTEOMICS, capabilities=["proteome_search", "organism_proteome", "reference_proteome"]),
@@ -150,7 +161,7 @@ def _mcp_genomics_tools() -> list[ToolRegistryEntry]:
         _e("hgnc", "Search HUGO Gene Nomenclature Committee for official gene symbols and nomenclature.", CATEGORY_GENOMICS, capabilities=["symbol_lookup", "search", "previous_symbols"]),
         _e("ncbi_blast", "Run BLAST sequence similarity searches against NCBI nucleotide and protein databases.", CATEGORY_GENOMICS, capabilities=["blastn", "blastp", "blastx", "tblastn"]),
         _e("decipher", "Query DECIPHER for genomic variants associated with developmental disorders.", CATEGORY_VARIANT, capabilities=["variant_search", "patient_data", "syndrome_search"]),
-        _e("omim", "Search Online Mendelian Inheritance in Man for gene-disease relationships and phenotype descriptions.", CATEGORY_GENOMICS, capabilities=["search", "gene_phenotype", "allelic_variants"]),
+        # omim → now NATIVE (see _native_tools)
     ]
 
 
@@ -174,7 +185,7 @@ def _mcp_drug_tools() -> list[ToolRegistryEntry]:
         _e("zinc", "Search ZINC database for commercially available compounds for virtual screening.", CATEGORY_DRUG, capabilities=["compound_search", "vendor_info", "property_filter"]),
         _e("bindingdb", "Search BindingDB for measured binding affinities between proteins and drug-like molecules.", CATEGORY_DRUG, capabilities=["search", "binding_data", "target_search", "ki_kd_ic50"]),
         _e("dgidb", "Query DGIdb for drug-gene interactions from multiple curated sources.", CATEGORY_DRUG, capabilities=["interaction_search", "gene_search", "drug_search", "interaction_types"]),
-        _e("opentargets", "Query Open Targets for target-disease associations, evidence, and prioritization scores.", CATEGORY_DRUG, capabilities=["target_disease", "evidence_search", "drug_mechanism", "tractability"]),
+        # opentargets → now NATIVE (see _native_tools)
         _e("pharmgkb", "Search PharmGKB for pharmacogenomics data — drug-gene associations and clinical annotations.", CATEGORY_DRUG, capabilities=["search", "drug_label", "clinical_annotation", "variant_annotation"]),
         _e("ttd", "Search Therapeutic Target Database for drug targets, diseases, and pathway information.", CATEGORY_DRUG, capabilities=["target_search", "drug_search", "disease_search"]),
         _e("stitch", "Query STITCH for known and predicted chemical-protein interactions with confidence scores.", CATEGORY_DRUG, capabilities=["interaction_search", "network", "confidence_scores"]),
@@ -211,19 +222,20 @@ def _mcp_expression_tools() -> list[ToolRegistryEntry]:
         _e("geo", "Search NCBI GEO for gene expression datasets, series, samples, and platforms.", CATEGORY_EXPRESSION, capabilities=["search", "dataset_details", "sample_data", "platform_info"]),
         _e("expression_atlas", "Query Expression Atlas (EMBL-EBI) for baseline and differential gene expression.", CATEGORY_EXPRESSION, capabilities=["search", "baseline_expression", "differential_expression", "experiment_details"]),
         _e("human_protein_atlas", "Search Human Protein Atlas for protein expression in tissues, cells, and subcellular locations.", CATEGORY_EXPRESSION, capabilities=["tissue_expression", "cell_expression", "subcellular", "pathology"]),
-        _e("gtex", "Query GTEx for gene expression across human tissues with eQTL data.", CATEGORY_EXPRESSION, capabilities=["tissue_expression", "eqtl", "splicing", "sample_info"]),
-        _e("depmap", "Query DepMap for cancer dependency data — gene essentiality across cancer cell lines.", CATEGORY_EXPRESSION, capabilities=["gene_dependency", "cell_line_info", "crispr_data", "drug_sensitivity"]),
+        # gtex → now NATIVE (see _native_tools)
+        # depmap → now NATIVE (see _native_tools)
         _e("ccle", "Search Cancer Cell Line Encyclopedia for genomic/transcriptomic data across 1000+ cell lines.", CATEGORY_EXPRESSION, capabilities=["expression_data", "mutation_data", "drug_response", "cell_line_info"]),
         _e("tcga", "Query TCGA for multi-omics cancer genomics data — mutations, expression, methylation, CNV.", CATEGORY_EXPRESSION, capabilities=["mutation_data", "expression_data", "methylation", "cnv", "clinical_data"]),
         _e("single_cell_portal", "Search Broad Single Cell Portal for scRNA-seq datasets and cell type annotations.", CATEGORY_EXPRESSION, capabilities=["study_search", "cell_types", "gene_expression", "cluster_data"]),
+        # cellxgene → now NATIVE (see _native_tools)
     ]
 
 
 def _mcp_variant_tools() -> list[ToolRegistryEntry]:
     return [
-        _e("clinvar", "Search ClinVar for clinical significance of human genomic variants.", CATEGORY_VARIANT, capabilities=["variant_search", "clinical_significance", "condition_links", "submission_data"]),
+        # clinvar → now NATIVE (see _native_tools)
         _e("dbsnp", "Look up dbSNP for reference SNP clusters, allele frequencies, and variant annotations.", CATEGORY_VARIANT, capabilities=["rs_lookup", "allele_frequency", "functional_annotation"]),
-        _e("gnomad", "Query gnomAD for population allele frequencies and variant constraint metrics.", CATEGORY_VARIANT, capabilities=["variant_lookup", "allele_frequency", "constraint_metrics", "structural_variants"]),
+        # gnomad → now NATIVE (see _native_tools)
         _e("cosmic", "Search COSMIC for somatic mutations in cancer — mutation frequency, gene census, and signatures.", CATEGORY_VARIANT, capabilities=["mutation_search", "gene_census", "mutation_signatures", "cancer_type"]),
         _e("cbioportal", "Query cBioPortal for cancer genomics data — mutations, CNA, expression across studies.", CATEGORY_VARIANT, capabilities=["study_search", "mutation_data", "cna_data", "clinical_data"]),
         _e("lovd", "Search LOVD (Leiden Open Variation Database) for gene-specific variant databases.", CATEGORY_VARIANT, capabilities=["variant_search", "gene_database", "phenotype_data"]),
@@ -236,7 +248,7 @@ def _mcp_variant_tools() -> list[ToolRegistryEntry]:
 def _mcp_ontology_tools() -> list[ToolRegistryEntry]:
     return [
         _e("gene_ontology", "Search Gene Ontology for biological process, molecular function, and cellular component terms.", CATEGORY_ONTOLOGY, capabilities=["term_search", "annotation_search", "enrichment", "slim"]),
-        _e("hpo", "Search Human Phenotype Ontology for standardized phenotype terms and gene-phenotype links.", CATEGORY_ONTOLOGY, capabilities=["term_search", "gene_to_phenotype", "disease_to_phenotype"]),
+        # hpo → now NATIVE (see _native_tools)
         _e("mondo", "Search Mondo Disease Ontology for harmonized disease terms across databases.", CATEGORY_ONTOLOGY, capabilities=["disease_search", "hierarchy", "mappings", "gene_associations"]),
         _e("ols", "Search EBI Ontology Lookup Service for terms across 200+ biomedical ontologies.", CATEGORY_ONTOLOGY, capabilities=["search", "term_details", "hierarchy", "mappings"]),
         _e("bioportal", "Search BioPortal for ontology terms, mappings, and annotations across 900+ ontologies.", CATEGORY_ONTOLOGY, capabilities=["search", "class_details", "mappings", "recommender"]),
