@@ -61,11 +61,13 @@ class HypothesisTree:
         tree_id: str | None = None,
         exploration_constant: float = DEFAULT_UCB_EXPLORATION_CONSTANT,
         max_depth: int = 3,
+        max_breadth: int = 10,
         session_id: str = "",
     ) -> None:
         self.tree_id = tree_id or _uuid()
         self.exploration_constant = exploration_constant
         self.max_depth = max_depth
+        self.max_breadth = max_breadth
         self.session_id = session_id
 
         self._nodes: dict[str, HypothesisNode] = {}
@@ -184,6 +186,57 @@ class HypothesisTree:
         )
         return current
 
+    def select_leaves(self, max_leaves: int = 5) -> list[HypothesisNode]:
+        """Select multiple promising leaf nodes for parallel exploration.
+
+        Returns up to *max_leaves* distinct unexplored/explored leaves,
+        ranked by UCB1. Each selected leaf is marked EXPLORING.
+        """
+        if self._root_id is None:
+            raise OrchestrationError("Cannot select: tree has no root")
+
+        # Gather all candidate leaves
+        candidates: list[HypothesisNode] = []
+        for node in self._nodes.values():
+            if node.status in (HypothesisStatus.PRUNED, HypothesisStatus.REFUTED):
+                continue
+            if node.id == self._root_id:
+                continue
+            # A leaf is a node with no expandable children
+            expandable_children = [
+                cid for cid in node.children
+                if cid in self._nodes
+                and self._nodes[cid].status not in (
+                    HypothesisStatus.PRUNED, HypothesisStatus.REFUTED,
+                )
+            ]
+            if not expandable_children:
+                candidates.append(node)
+
+        if not candidates:
+            # Fall back to regular select
+            return [self.select()]
+
+        # Score by UCB1 using root visit count as parent proxy
+        parent_visits = max(self._total_visits, 1)
+        candidates.sort(key=lambda c: self._ucb1(c, parent_visits), reverse=True)
+
+        selected = candidates[:max_leaves]
+        for node in selected:
+            node.status = HypothesisStatus.EXPLORING
+            node.updated_at = datetime.now(UTC)
+            self._emit(
+                "hypothesis_selected",
+                node_id=node.id,
+                hypothesis=node.hypothesis,
+                depth=node.depth,
+                ucb_score=self._ucb1(node, parent_visits),
+                visit_count=node.visit_count,
+                batch_size=len(selected),
+            )
+
+        return selected
+
     # ------------------------------------------------------------------
     # Expansion
     # ------------------------------------------------------------------
@@ -212,6 +265,19 @@ class HypothesisTree:
         if parent.depth >= self.max_depth:
             logger.info("expansion_skipped_max_depth", node_id=parent_id, depth=parent.depth)
             return []
+
+        # Enforce breadth limit — cap children per node
+        existing_children = len(parent.children)
+        slots = max(0, self.max_breadth - existing_children)
+        if slots == 0:
+            logger.info(
+                "expansion_skipped_max_breadth",
+                node_id=parent_id,
+                existing=existing_children,
+                max_breadth=self.max_breadth,
+            )
+            return []
+        child_hypotheses = child_hypotheses[:slots]
 
         children: list[HypothesisNode] = []
         for h in child_hypotheses:
