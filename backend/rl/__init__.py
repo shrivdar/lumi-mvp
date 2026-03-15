@@ -1,4 +1,4 @@
-"""RL trajectory collection and SFT data pipeline."""
+"""RL trajectory collection, SFT data pipeline, and training infrastructure."""
 
 from rl.sft_pipeline import SFTPipeline
 from rl.trajectory_collector import TrajectoryCollector
