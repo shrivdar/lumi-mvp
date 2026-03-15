@@ -163,6 +163,20 @@ TOOL_CAPABILITIES: dict[str, dict[str, Any]] = {
         ],
         "category": "communication",
     },
+    "python_repl": {
+        "description": "Sandboxed Python REPL for code execution, data analysis, and tool testing.",
+        "capabilities": [
+            "execute Python code in a sandboxed Docker container",
+            "persistent namespace across code blocks",
+            "data analysis and transformation",
+        ],
+        "example_tasks": [
+            "Parse and analyze API response data",
+            "Test a generated tool wrapper function",
+            "Run data validation checks",
+        ],
+        "category": "compute",
+    },
 }
 
 # Default number of tools to select
@@ -326,6 +340,7 @@ class ToolRetriever:
             "chembl": ["drug", "compound", "inhibitor", "ic50", "bioactivity", "chembl", "molecule"],
             "clinicaltrials": ["clinical", "trial", "phase", "patient", "efficacy", "nct"],
             "slack": ["notify", "human", "expert", "hitl", "review"],
+            "python_repl": ["code", "execute", "repl", "test", "analyze", "compute", "script"],
         }
 
         for tool_name, keywords in keyword_map.items():

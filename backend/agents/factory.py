@@ -21,6 +21,7 @@ from agents.pathway_analyst import PathwayAnalystAgent
 from agents.protein_engineer import ProteinEngineerAgent
 from agents.scientific_critic import ScientificCriticAgent
 from agents.templates import AGENT_TEMPLATES
+from agents.tool_creator import ToolCreatorAgent
 from core.exceptions import AgentError
 from core.models import AgentType
 
@@ -41,6 +42,7 @@ _AGENT_CLASS_MAP: dict[AgentType, type[BaseAgentImpl]] = {
     AgentType.CLINICAL_ANALYST: ClinicalAnalystAgent,
     AgentType.SCIENTIFIC_CRITIC: ScientificCriticAgent,
     AgentType.EXPERIMENT_DESIGNER: ExperimentDesignerAgent,
+    AgentType.TOOL_CREATOR: ToolCreatorAgent,
 }
 
 
