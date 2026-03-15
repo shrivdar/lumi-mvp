@@ -21,6 +21,7 @@ from core.interfaces import KnowledgeGraph, YamiInterface
 from core.llm import LLMClient
 from core.models import (
     AgentResult,
+    AgentSpec,
     AgentTask,
     AgentType,
     HypothesisNode,
@@ -39,6 +40,7 @@ from integrations.biosecurity import BiosecurityScreener
 from integrations.living_document import LivingDocument
 from orchestrator.hypothesis_tree import HypothesisTree
 from orchestrator.swarm_composer import SwarmComposer
+from orchestrator.token_budget import TokenBudgetManager
 from orchestrator.uncertainty import UncertaintyAggregator
 from rl.trajectory_collector import TrajectoryCollector
 
@@ -59,6 +61,7 @@ class ResearchOrchestrator:
         kg: KnowledgeGraph,
         yami: YamiInterface | None = None,
         agent_factory: Any = None,  # callable(agent_type, llm, kg, yami, tools) -> BaseAgentImpl
+        spec_factory: Any = None,  # callable(spec, llm, kg, yami, tools) -> BaseAgentImpl
         tool_entries: list[ToolRegistryEntry] | None = None,
         tool_instances: dict[str, Any] | None = None,  # name → BaseTool for dynamic assignment
         slack_tool: Any = None,  # SlackTool instance for HITL
@@ -67,6 +70,7 @@ class ResearchOrchestrator:
         self.kg = kg
         self.yami = yami
         self.agent_factory = agent_factory
+        self.spec_factory = spec_factory
         self.tool_entries = tool_entries or []
         self._tool_instances = tool_instances or {}
         self.slack_tool = slack_tool
@@ -75,6 +79,7 @@ class ResearchOrchestrator:
         # Integration components
         self._living_doc: LivingDocument | None = None
         self._trajectory_collector: TrajectoryCollector | None = None
+        self._token_budget: TokenBudgetManager | None = None
 
         self._session: ResearchSession | None = None
         self._tree: HypothesisTree | None = None
@@ -199,6 +204,10 @@ class ResearchOrchestrator:
             session_id=session_id,
         )
         self._uncertainty = UncertaintyAggregator(session_id=session_id)
+        self._token_budget = TokenBudgetManager(
+            session_budget=config.session_token_budget,
+            session_id=session_id,
+        )
 
         # Generate initial hypotheses via LLM
         hypotheses_raw = await self._generate_hypotheses(query, config)
@@ -353,15 +362,45 @@ class ResearchOrchestrator:
             max_swarms = max(1, remaining_agent_slots // max(config.max_agents_per_swarm, 1))
             leaves = self._tree.select_leaves(max_leaves=max_swarms)
 
-            # 2. COMPOSE + GENERATE per-hypothesis swarms concurrently
+            # 2. COMPOSE per-hypothesis swarms concurrently (dynamic specs)
             async def _compose_for_hypothesis(
                 hypothesis: HypothesisNode,
-            ) -> tuple[HypothesisNode, list[AgentTask]]:
-                agent_types = await self._composer.compose_swarm(query, hypothesis, config)
-                tasks = await self._composer.generate_tasks(
-                    query, hypothesis, agent_types, session.id,
-                )
-                return hypothesis, tasks
+            ) -> tuple[HypothesisNode, list[AgentSpec], list[AgentTask]]:
+                # Allocate token budget for this hypothesis
+                if self._token_budget:
+                    active_count = len(leaves)
+                    remaining_iters = max(1, config.max_mcts_iterations - iteration)
+                    self._token_budget.allocate_hypothesis_budget(
+                        hypothesis.id, active_count, remaining_iters,
+                    )
+                    agent_constraints = self._token_budget.allocate_for_swarm(
+                        hypothesis.id, config.max_agents_per_swarm, config,
+                    )
+                else:
+                    agent_constraints = None
+
+                # Try dynamic spec composition first, fall back to legacy
+                if self.spec_factory is not None:
+                    specs = await self._composer.compose_swarm_specs(
+                        query, hypothesis, config,
+                        agent_constraints=agent_constraints,
+                    )
+                    # Also generate legacy tasks for backwards-compat tracking
+                    agent_types = [
+                        s.agent_type_hint or AgentType.LITERATURE_ANALYST for s in specs
+                    ]
+                    tasks = await self._composer.generate_tasks(
+                        query, hypothesis, agent_types, session.id,
+                    )
+                    return hypothesis, specs, tasks
+                else:
+                    agent_types = await self._composer.compose_swarm(
+                        query, hypothesis, config,
+                    )
+                    tasks = await self._composer.generate_tasks(
+                        query, hypothesis, agent_types, session.id,
+                    )
+                    return hypothesis, [], tasks
 
             compose_results = await asyncio.gather(
                 *[_compose_for_hypothesis(h) for h in leaves],
@@ -375,18 +414,34 @@ class ResearchOrchestrator:
                 if isinstance(result, Exception):
                     logger.warning("swarm_composition_failed", error=str(result))
                     continue
-                hypothesis, tasks = result
+                hypothesis, specs, tasks = result
                 # Cap agent spawns to stay within budget
                 budget_left = config.max_total_agents - self._total_agents_spawned
-                tasks = tasks[:budget_left]
-                if not tasks:
-                    continue
-                hypothesis_task_map.append((hypothesis, tasks))
-                all_swarm_coros.append(
-                    self._execute_agents_with_semaphore(
-                        tasks, hypothesis, config, semaphore,
+
+                if specs and self.spec_factory is not None:
+                    # Dynamic spec-based execution
+                    specs = specs[:budget_left]
+                    if not specs:
+                        continue
+                    # Pair specs with tasks for tracking
+                    paired_tasks = tasks[:len(specs)]
+                    hypothesis_task_map.append((hypothesis, paired_tasks))
+                    all_swarm_coros.append(
+                        self._execute_specs_with_semaphore(
+                            specs, paired_tasks, hypothesis, config, semaphore,
+                        )
                     )
-                )
+                else:
+                    # Legacy template-based execution
+                    tasks = tasks[:budget_left]
+                    if not tasks:
+                        continue
+                    hypothesis_task_map.append((hypothesis, tasks))
+                    all_swarm_coros.append(
+                        self._execute_agents_with_semaphore(
+                            tasks, hypothesis, config, semaphore,
+                        )
+                    )
 
             if not all_swarm_coros:
                 # No swarms could be composed — fall back to single select
@@ -413,9 +468,15 @@ class ResearchOrchestrator:
             ):
                 self._all_results.extend(results)
 
-                # Track token usage
+                # Track token usage (both local and via budget manager)
                 for r in results:
                     self._session_tokens_used += r.llm_tokens_used
+                    if self._token_budget:
+                        self._token_budget.record_usage(
+                            hypothesis.id,
+                            r.agent_id,
+                            r.llm_tokens_used,
+                        )
 
                 info_gain = self._evaluate_iteration(results, hypothesis)
                 iteration_info_gains.append(info_gain)
@@ -633,6 +694,115 @@ class ResearchOrchestrator:
         """Execute agent tasks without external semaphore (backwards compat)."""
         sem = asyncio.Semaphore(config.max_concurrent_agents)
         return await self._execute_agents_with_semaphore(tasks, hypothesis, config, sem)
+
+    async def _execute_specs_with_semaphore(
+        self,
+        specs: list[AgentSpec],
+        tasks: list[AgentTask],
+        hypothesis: HypothesisNode,
+        config: ResearchConfig,
+        semaphore: asyncio.Semaphore,
+    ) -> list[AgentResult]:
+        """Execute dynamically-generated AgentSpec agents behind a shared semaphore."""
+
+        async def _run_spec(spec: AgentSpec, task: AgentTask) -> AgentResult | None:
+            async with semaphore:
+                self._total_agents_spawned += 1
+                try:
+                    if self.spec_factory is None:
+                        raise OrchestrationError("No spec_factory configured")
+
+                    # Resolve tools from spec's tool list
+                    agent_tools: dict[str, Any] = {}
+                    if spec.tools and self._tool_instances:
+                        agent_tools = {
+                            n: t for n, t in self._tool_instances.items()
+                            if n in spec.tools
+                        }
+                    # Always include python_repl if available
+                    if "python_repl" in self._tool_instances and "python_repl" not in agent_tools:
+                        agent_tools["python_repl"] = self._tool_instances["python_repl"]
+
+                    agent = self.spec_factory(
+                        spec=spec,
+                        llm=self.llm,
+                        kg=self.kg,
+                        yami=self.yami,
+                        tools=agent_tools,
+                    )
+
+                    self._emit(
+                        "agent_started",
+                        agent_id=agent.agent_id,
+                        role=spec.role,
+                        agent_type_hint=str(spec.agent_type_hint) if spec.agent_type_hint else None,
+                        hypothesis_id=hypothesis.id,
+                        task_id=task.task_id,
+                        total_agents_spawned=self._total_agents_spawned,
+                        tools=list(agent_tools.keys()),
+                        token_budget=spec.constraints.token_budget,
+                    )
+
+                    task.status = TaskStatus.RUNNING
+                    result = await agent.execute(task)
+
+                    # Collect trajectory
+                    if self._trajectory_collector:
+                        try:
+                            self._trajectory_collector.collect(task, result)
+                        except Exception as tc_exc:
+                            logger.warning("trajectory_collection_failed", error=str(tc_exc))
+
+                    # Check token budget
+                    if result.llm_tokens_used > spec.constraints.token_budget:
+                        logger.warning(
+                            "spec_agent_token_budget_exceeded",
+                            role=spec.role,
+                            tokens_used=result.llm_tokens_used,
+                            budget=spec.constraints.token_budget,
+                        )
+
+                    self._emit(
+                        "agent_completed",
+                        agent_id=agent.agent_id,
+                        role=spec.role,
+                        success=result.success,
+                        nodes_added=len(result.nodes_added),
+                        edges_added=len(result.edges_added),
+                        duration_ms=result.duration_ms,
+                        tokens_used=result.llm_tokens_used,
+                    )
+
+                    return result
+
+                except Exception as exc:
+                    self.audit.error(
+                        "spec_agent_execution_failed",
+                        role=spec.role,
+                        task_id=task.task_id,
+                        error=str(exc),
+                    )
+                    self._emit(
+                        "agent_failed",
+                        role=spec.role,
+                        task_id=task.task_id,
+                        error=str(exc),
+                    )
+                    agent_type = spec.agent_type_hint or AgentType.LITERATURE_ANALYST
+                    return AgentResult(
+                        task_id=task.task_id,
+                        agent_id=task.agent_id or "unknown",
+                        agent_type=agent_type,
+                        hypothesis_id=hypothesis.id,
+                        success=False,
+                        errors=[str(exc)],
+                    )
+
+        # Pair specs with tasks (use task as tracking context)
+        paired = list(zip(specs, tasks))
+        coros = [_run_spec(spec, task) for spec, task in paired]
+        raw_results = await asyncio.gather(*coros)
+        return [r for r in raw_results if r is not None]
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -975,5 +1145,285 @@ class ResearchOrchestrator:
             events.extend(self._composer.drain_events())
         if self._uncertainty:
             events.extend(self._uncertainty.drain_events())
+        if self._token_budget:
+            events.extend(self._token_budget.drain_events())
 
         return events
+
+    # ------------------------------------------------------------------
+    # Benchmark mode
+    # ------------------------------------------------------------------
+
+    async def run_benchmark(
+        self,
+        question: str,
+        *,
+        config: ResearchConfig | None = None,
+        expected_answer: str = "",
+        task_id: str = "",
+        benchmark_name: str = "benchmark",
+    ) -> dict[str, Any]:
+        """Run a single benchmark task through hierarchical task decomposition.
+
+        Instead of the full MCTS loop, benchmark mode:
+        1. Parses the benchmark question
+        2. Generates a single targeted hypothesis
+        3. Spawns a focused swarm to investigate
+        4. Collects and returns a structured answer
+
+        This is designed for benchmarks like Biomni-Eval1, BixBench, and LAB-Bench
+        where each question needs a direct answer rather than open-ended research.
+
+        Args:
+            question: The benchmark question/task to solve.
+            config: Research configuration (defaults to benchmark-friendly settings).
+            expected_answer: Optional expected answer for scoring.
+            task_id: Benchmark task identifier.
+            benchmark_name: Name of the benchmark suite.
+
+        Returns:
+            Dict with answer, reasoning, metadata, and optional score.
+        """
+        # Benchmark-friendly config: tighter budget, fewer iterations
+        config = config or ResearchConfig(
+            max_hypothesis_depth=2,
+            max_mcts_iterations=3,
+            max_agents=5,
+            max_agents_per_swarm=4,
+            max_concurrent_agents=10,
+            max_total_agents=20,
+            session_token_budget=500_000,
+            agent_token_budget=50_000,
+        )
+
+        session = self._create_session(question, config)
+        self._session = session
+        set_request_context(research_id=session.id)
+
+        self.audit.log(
+            "benchmark_started",
+            session_id=session.id,
+            task_id=task_id,
+            benchmark=benchmark_name,
+            question=question[:200],
+        )
+
+        start_ms = int(time.monotonic() * 1000)
+
+        try:
+            session.status = SessionStatus.RUNNING
+
+            # Initialize components
+            self._composer = SwarmComposer(
+                llm=self.llm,
+                tool_registry_entries=self.tool_entries,
+                session_id=session.id,
+            )
+            self._uncertainty = UncertaintyAggregator(session_id=session.id)
+            self._token_budget = TokenBudgetManager(
+                session_budget=config.session_token_budget,
+                session_id=session.id,
+            )
+
+            # Step 1: Decompose the question into a hypothesis
+            hypothesis_data = await self._decompose_benchmark_question(question)
+
+            # Step 2: Build a minimal hypothesis tree
+            tree = HypothesisTree(
+                max_depth=config.max_hypothesis_depth,
+                max_breadth=5,
+                session_id=session.id,
+            )
+            root = tree.set_root(
+                hypothesis=f"Benchmark: {question[:100]}",
+                rationale="Benchmark task root",
+            )
+            children = tree.expand(root.id, [hypothesis_data])
+            self._tree = tree
+
+            if not children:
+                raise OrchestrationError("Failed to create benchmark hypothesis")
+
+            target_hypothesis = children[0]
+
+            # Step 3: Compose and execute a targeted swarm
+            semaphore = asyncio.Semaphore(config.max_concurrent_agents)
+
+            if self._token_budget:
+                self._token_budget.allocate_hypothesis_budget(target_hypothesis.id, 1)
+                agent_constraints = self._token_budget.allocate_for_swarm(
+                    target_hypothesis.id, config.max_agents_per_swarm, config,
+                )
+            else:
+                agent_constraints = None
+
+            if self.spec_factory is not None:
+                specs = await self._composer.compose_swarm_specs(
+                    question, target_hypothesis, config,
+                    agent_constraints=agent_constraints,
+                )
+                agent_types = [
+                    s.agent_type_hint or AgentType.LITERATURE_ANALYST for s in specs
+                ]
+                tasks = await self._composer.generate_tasks(
+                    question, target_hypothesis, agent_types, session.id,
+                )
+                results = await self._execute_specs_with_semaphore(
+                    specs, tasks, target_hypothesis, config, semaphore,
+                )
+            else:
+                agent_types = await self._composer.compose_swarm(
+                    question, target_hypothesis, config,
+                )
+                tasks = await self._composer.generate_tasks(
+                    question, target_hypothesis, agent_types, session.id,
+                )
+                results = await self._execute_agents_with_semaphore(
+                    tasks, target_hypothesis, config, semaphore,
+                )
+
+            self._all_results.extend(results)
+
+            # Track token usage
+            for r in results:
+                self._session_tokens_used += r.llm_tokens_used
+                if self._token_budget:
+                    self._token_budget.record_usage(
+                        target_hypothesis.id, r.agent_id, r.llm_tokens_used,
+                    )
+
+            # Step 4: Synthesize answer from agent results
+            answer = await self._synthesize_benchmark_answer(question, results)
+
+            duration_ms = int(time.monotonic() * 1000) - start_ms
+            session.status = SessionStatus.COMPLETED
+
+            benchmark_result = {
+                "task_id": task_id,
+                "benchmark": benchmark_name,
+                "question": question,
+                "answer": answer,
+                "expected_answer": expected_answer,
+                "session_id": session.id,
+                "agents_used": len(results),
+                "agents_succeeded": sum(1 for r in results if r.success),
+                "total_tokens": self._session_tokens_used,
+                "total_llm_calls": sum(r.llm_calls for r in results),
+                "duration_ms": duration_ms,
+                "edges_added": sum(len(r.edges_added) for r in results),
+                "nodes_added": sum(len(r.nodes_added) for r in results),
+                "falsification_results": sum(
+                    len(r.falsification_results) for r in results
+                ),
+                "agent_summaries": [
+                    {"agent_type": str(r.agent_type), "summary": r.summary[:300]}
+                    for r in results if r.success and r.summary
+                ],
+            }
+
+            self._emit(
+                "benchmark_completed",
+                task_id=task_id,
+                benchmark=benchmark_name,
+                duration_ms=duration_ms,
+                answer_preview=answer[:200],
+            )
+
+            return benchmark_result
+
+        except Exception as exc:
+            session.status = SessionStatus.FAILED
+            self.audit.error(
+                "benchmark_failed",
+                task_id=task_id,
+                benchmark=benchmark_name,
+                error=str(exc),
+            )
+            return {
+                "task_id": task_id,
+                "benchmark": benchmark_name,
+                "question": question,
+                "answer": "",
+                "error": str(exc),
+                "session_id": session.id,
+                "duration_ms": int(time.monotonic() * 1000) - start_ms,
+            }
+
+    async def _decompose_benchmark_question(
+        self,
+        question: str,
+    ) -> dict[str, str]:
+        """Decompose a benchmark question into a testable hypothesis."""
+        prompt = (
+            f"Benchmark question: {question}\n\n"
+            "Convert this into a testable hypothesis for investigation by biomedical "
+            "research agents. The hypothesis should be specific enough to guide tool use "
+            "(literature search, protein analysis, pathway analysis, etc.).\n\n"
+            'Return JSON: {"hypothesis": "...", "rationale": "..."}'
+        )
+
+        try:
+            response = await self.llm.query(
+                prompt,
+                system_prompt=(
+                    "Convert benchmark questions into testable hypotheses. "
+                    "Be specific and actionable. The hypothesis should guide "
+                    "which tools and databases to query."
+                ),
+                research_id=self._session.id if self._session else "",
+            )
+            parsed = LLMClient.parse_json(response)
+            if isinstance(parsed, dict) and parsed.get("hypothesis"):
+                return {
+                    "hypothesis": parsed["hypothesis"],
+                    "rationale": parsed.get("rationale", ""),
+                }
+        except Exception as exc:
+            logger.warning("benchmark_decomposition_failed", error=str(exc))
+
+        # Fallback: use the question directly
+        return {
+            "hypothesis": f"The answer to '{question[:200]}' can be determined through evidence-based investigation",
+            "rationale": "Direct investigation of the benchmark question",
+        }
+
+    async def _synthesize_benchmark_answer(
+        self,
+        question: str,
+        results: list[AgentResult],
+    ) -> str:
+        """Synthesize a final answer from agent investigation results."""
+        # Collect summaries and key findings
+        findings = []
+        for r in results:
+            if r.success and r.summary:
+                findings.append(f"[{r.agent_type}] {r.summary}")
+            for edge in r.edges_added:
+                if edge.confidence.overall >= 0.6 and not edge.falsified:
+                    findings.append(
+                        f"  Edge: {edge.relation} (confidence={edge.confidence.overall:.2f})"
+                    )
+
+        prompt = (
+            f"Question: {question}\n\n"
+            f"Investigation findings:\n" + "\n".join(findings[:30]) + "\n\n"
+            "Based on these findings, provide a concise, direct answer to the question. "
+            "Include key evidence and confidence level. Be specific and factual."
+        )
+
+        try:
+            answer = await self.llm.query(
+                prompt,
+                system_prompt=(
+                    "You are synthesizing research findings into a direct answer. "
+                    "Be concise, factual, and cite the most relevant evidence."
+                ),
+                research_id=self._session.id if self._session else "",
+            )
+            return answer.strip()
+        except Exception as exc:
+            logger.warning("benchmark_synthesis_failed", error=str(exc))
+            # Fallback: concatenate agent summaries
+            return " | ".join(
+                r.summary for r in results if r.success and r.summary
+            ) or "Unable to synthesize answer"

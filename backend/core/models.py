@@ -515,7 +515,7 @@ AgentResult.model_rebuild()
 class ResearchConfig(BaseModel):
     """Configuration for a specific research session."""
 
-    max_hypothesis_depth: int = 2
+    max_hypothesis_depth: int = 5
     max_mcts_iterations: int = 15
     max_agents: int = 8
     max_agents_per_swarm: int = 5
@@ -529,11 +529,11 @@ class ResearchConfig(BaseModel):
     slack_channel_id: str | None = None
 
     # --- Scaled orchestration (per-hypothesis swarms) ---
-    max_concurrent_agents: int = 20  # Global concurrency limit (semaphore)
-    max_total_agents: int = 500  # Hard cap across entire session
-    max_hypothesis_breadth: int = 10  # Max competing hypotheses per tree level
+    max_concurrent_agents: int = 50  # Global concurrency limit (semaphore)
+    max_total_agents: int = 10_000  # Hard cap across entire session
+    max_hypothesis_breadth: int = 30  # Max competing hypotheses per tree level
     agent_token_budget: int = 50_000  # Per-agent token limit
-    session_token_budget: int = 2_000_000  # Total session token limit
+    session_token_budget: int = 10_000_000  # Total session token limit
 
 
 class ResearchResult(BaseModel):

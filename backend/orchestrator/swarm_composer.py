@@ -17,6 +17,8 @@ from core.audit import AuditLogger
 from core.constants import MANDATORY_AGENTS
 from core.llm import LLMClient
 from core.models import (
+    AgentConstraints,
+    AgentSpec,
     AgentTask,
     AgentType,
     HypothesisNode,
@@ -123,6 +125,224 @@ class SwarmComposer:
         )
 
         return selected
+
+    # ------------------------------------------------------------------
+    # Dynamic AgentSpec generation
+    # ------------------------------------------------------------------
+
+    async def compose_swarm_specs(
+        self,
+        query: str,
+        hypothesis: HypothesisNode,
+        config: ResearchConfig,
+        agent_constraints: list[AgentConstraints] | None = None,
+    ) -> list[AgentSpec]:
+        """Dynamically generate AgentSpec objects for a hypothesis swarm.
+
+        Instead of just picking agent types from a template library, this method
+        asks the LLM to define the full role, instructions, tools, and constraints
+        for each agent in the swarm. The orchestrator controls what each agent does.
+
+        Always includes a scientific_critic spec (non-negotiable).
+
+        Args:
+            query: The research query.
+            hypothesis: The hypothesis to explore.
+            config: Research configuration.
+            agent_constraints: Pre-allocated per-agent constraints from TokenBudgetManager.
+                If provided, overrides the LLM-generated constraints.
+
+        Returns:
+            List of AgentSpec objects for the swarm.
+        """
+        available_types = config.agent_types or list(AgentType)
+
+        # Build available tools summary
+        tool_catalog = []
+        for entry in self._tool_entries:
+            if entry.enabled:
+                tool_catalog.append(f"{entry.name} [{entry.category}]")
+
+        prompt = self._build_spec_composition_prompt(
+            query, hypothesis, available_types, tool_catalog, config,
+        )
+
+        specs: list[AgentSpec] = []
+
+        try:
+            response = await self.llm.query(
+                prompt,
+                system_prompt=(
+                    "You are a research orchestrator dynamically composing an agent swarm. "
+                    "For each agent, define its role, specific instructions, recommended tools, "
+                    "and an optional agent_type_hint if it maps to a known specialist. "
+                    "Respond with ONLY a JSON array of agent spec objects."
+                ),
+                research_id=self.session_id,
+            )
+            parsed = LLMClient.parse_json(response)
+            if not isinstance(parsed, list):
+                parsed = parsed.get("agents", []) if isinstance(parsed, dict) else []
+
+            for i, raw_spec in enumerate(parsed):
+                if not isinstance(raw_spec, dict):
+                    continue
+                spec = self._parse_agent_spec(
+                    raw_spec, hypothesis,
+                    constraint_override=(
+                        agent_constraints[i] if agent_constraints and i < len(agent_constraints)
+                        else None
+                    ),
+                )
+                if spec:
+                    specs.append(spec)
+
+        except Exception as exc:
+            logger.warning("spec_composition_llm_failed", error=str(exc))
+            # Fallback: generate specs from the static compose_swarm path
+            agent_types = await self.compose_swarm(query, hypothesis, config)
+            for i, at in enumerate(agent_types):
+                constraint = (
+                    agent_constraints[i] if agent_constraints and i < len(agent_constraints)
+                    else AgentConstraints(token_budget=config.agent_token_budget)
+                )
+                specs.append(AgentSpec(
+                    role=f"{at.value} for hypothesis investigation",
+                    instructions=self._default_instruction(query, hypothesis, at),
+                    tools=self._fallback_tool_selection(at, []),
+                    constraints=constraint,
+                    hypothesis_branch=hypothesis.id,
+                    agent_type_hint=at,
+                ))
+
+        # Enforce mandatory agent: scientific_critic
+        has_critic = any(
+            s.agent_type_hint == AgentType.SCIENTIFIC_CRITIC for s in specs
+        )
+        if not has_critic:
+            critic_constraint = (
+                agent_constraints[len(specs)]
+                if agent_constraints and len(specs) < len(agent_constraints)
+                else AgentConstraints(token_budget=config.agent_token_budget)
+            )
+            specs.append(AgentSpec(
+                role="Scientific critic and falsifier",
+                instructions=(
+                    f"Critically evaluate evidence for the hypothesis: '{hypothesis.hypothesis}'. "
+                    f"Search for counter-evidence and contradictions. Attempt to falsify KG edges "
+                    f"added by other agents. Report any weaknesses in the evidence chain."
+                ),
+                tools=self._fallback_tool_selection(AgentType.SCIENTIFIC_CRITIC, []),
+                constraints=critic_constraint,
+                hypothesis_branch=hypothesis.id,
+                agent_type_hint=AgentType.SCIENTIFIC_CRITIC,
+                falsification_protocol="Search for contradicting evidence in PubMed and Semantic Scholar.",
+            ))
+
+        # Cap at max agents per swarm
+        specs = specs[:config.max_agents_per_swarm]
+
+        self.audit.log(
+            "swarm_specs_composed",
+            session_id=self.session_id,
+            hypothesis_id=hypothesis.id,
+            specs=[{"role": s.role, "hint": str(s.agent_type_hint)} for s in specs],
+            count=len(specs),
+        )
+
+        self._emit(
+            "swarm_specs_composed",
+            hypothesis_id=hypothesis.id,
+            hypothesis=hypothesis.hypothesis,
+            agent_count=len(specs),
+            roles=[s.role for s in specs],
+        )
+
+        return specs
+
+    def _build_spec_composition_prompt(
+        self,
+        query: str,
+        hypothesis: HypothesisNode,
+        available_types: list[AgentType],
+        tool_catalog: list[str],
+        config: ResearchConfig,
+    ) -> str:
+        type_descriptions = {
+            AgentType.LITERATURE_ANALYST: "Searches PubMed/Semantic Scholar for publications",
+            AgentType.PROTEIN_ENGINEER: "Fetches protein data from UniProt, predicts structure via ESM",
+            AgentType.GENOMICS_MAPPER: "Maps genes to pathways via MyGene and KEGG",
+            AgentType.PATHWAY_ANALYST: "Deep pathway analysis via KEGG and Reactome",
+            AgentType.DRUG_HUNTER: "Searches ChEMBL for drugs, ClinicalTrials.gov for trials",
+            AgentType.CLINICAL_ANALYST: "Analyzes clinical trial outcomes and designs",
+            AgentType.SCIENTIFIC_CRITIC: "Falsifies KG edges, searches for counter-evidence",
+            AgentType.EXPERIMENT_DESIGNER: "Proposes experiments to resolve uncertainties",
+        }
+
+        lines = [
+            f"Research query: {query}",
+            f"Hypothesis to explore: {hypothesis.hypothesis}",
+            f"Rationale: {hypothesis.rationale}",
+            "",
+            "Known specialist types (use as agent_type_hint if applicable):",
+        ]
+        for at in available_types:
+            lines.append(f"  - {at.value}: {type_descriptions.get(at, 'Specialist agent')}")
+
+        lines.extend([
+            "",
+            f"Available tools: {', '.join(tool_catalog[:30])}",
+            "",
+            f"Create {config.max_agents_per_swarm - 1} agent specs (critic is auto-added).",
+            "For each agent, provide a JSON object with:",
+            '  - "role": concise role description',
+            '  - "instructions": 2-4 sentences of specific investigation instructions',
+            '  - "tools": array of tool names from the catalog above',
+            '  - "agent_type_hint": one of the specialist types if applicable, or null',
+            "",
+            "scientific_critic is always included automatically — do not include it.",
+            "Return a JSON array of agent spec objects.",
+        ])
+        return "\n".join(lines)
+
+    def _parse_agent_spec(
+        self,
+        raw: dict[str, Any],
+        hypothesis: HypothesisNode,
+        constraint_override: AgentConstraints | None = None,
+    ) -> AgentSpec | None:
+        """Parse a raw dict from LLM response into an AgentSpec."""
+        role = raw.get("role", "")
+        instructions = raw.get("instructions", "")
+        if not role or not instructions:
+            return None
+
+        # Parse agent_type_hint
+        agent_type_hint = None
+        hint_str = raw.get("agent_type_hint", "")
+        if hint_str:
+            for at in AgentType:
+                if at.value == str(hint_str).strip().lower():
+                    agent_type_hint = at
+                    break
+
+        # Parse tools — validate against catalog
+        raw_tools = raw.get("tools", [])
+        valid_tool_names = {e.name for e in self._tool_entries if e.enabled}
+        tools = [str(t) for t in raw_tools if str(t) in valid_tool_names]
+
+        constraints = constraint_override or AgentConstraints()
+
+        return AgentSpec(
+            role=role,
+            instructions=instructions,
+            tools=tools,
+            constraints=constraints,
+            hypothesis_branch=hypothesis.id,
+            agent_type_hint=agent_type_hint,
+            system_prompt=raw.get("system_prompt", ""),
+            falsification_protocol=raw.get("falsification_protocol", ""),
+        )
 
     # ------------------------------------------------------------------
     # Task generation
@@ -279,10 +499,7 @@ class SwarmComposer:
         default_tools: list[str],
     ) -> list[str]:
         """Heuristic fallback: template defaults + top tools from matching categories."""
-        from agents.templates import AGENT_TEMPLATES
-
         result = list(default_tools)
-        template = AGENT_TEMPLATES.get(agent_type)
 
         # Map agent types to relevant categories
         agent_category_map: dict[AgentType, list[str]] = {
