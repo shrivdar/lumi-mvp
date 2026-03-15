@@ -43,5 +43,9 @@ htmlcov/
 # Data lake (parquet files + raw downloads, keep scripts)
 data/*/
 
+# Benchmarks
+vendor/
+results/
+
 # Misc
 *.log
