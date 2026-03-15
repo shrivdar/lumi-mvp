@@ -232,12 +232,18 @@ def data_lake_context() -> str:
         available_count += 1
 
         row_info = f"{rows:,} rows × {cols} cols" if rows else "size unknown"
-        status = ""
 
-        lines.append(f"### {name}{status}")
+        lines.append(f"### {name}")
         lines.append(f"**{meta['description']}**")
         lines.append(f"File: `{meta['file']}` ({row_info})")
         lines.append(f"Key columns: {', '.join(f'`{c}`' for c in meta['key_columns'])}")
+
+        # Include full column schema from manifest when available
+        manifest_cols = manifest_entry.get("columns")
+        if manifest_cols:
+            col_list = ", ".join(f"`{c['name']}`" for c in manifest_cols)
+            lines.append(f"All columns: {col_list}")
+
         lines.append(f"```python\n{meta['example_query']}\n```")
         lines.append("")
 

@@ -302,7 +302,11 @@ def _download_clinvar() -> DatasetResult:
 
 
 def _download_gwas_catalog() -> DatasetResult:
-    """GWAS Catalog associations TSV → parquet."""
+    """GWAS Catalog associations TSV → parquet.
+
+    Tries the REST API first; falls back to the EBI FTP mirror when the API
+    returns an error (the API intermittently returns HTTP 500).
+    """
     name = "gwas_catalog"
     out_dir = DATA_DIR / name
     parquet = out_dir / "gwas_associations.parquet"
@@ -311,8 +315,35 @@ def _download_gwas_catalog() -> DatasetResult:
         r, c = _verify_parquet(parquet)
         return DatasetResult(name, parquet, r, c, skipped=True)
 
-    url = "https://www.ebi.ac.uk/gwas/api/search/downloads/alternative"
-    raw = _download(url, out_dir / "gwas_associations.tsv", desc="GWAS Catalog")
+    raw = out_dir / "gwas_associations.tsv"
+
+    # Primary: REST API download
+    api_url = "https://www.ebi.ac.uk/gwas/api/search/downloads/alternative"
+    try:
+        _download(api_url, raw, desc="GWAS Catalog (API)")
+    except Exception as api_exc:
+        log.warning("  ⚠ GWAS API failed (%s), falling back to FTP mirror", api_exc)
+        raw.unlink(missing_ok=True)
+
+        # Fallback: EBI FTP — the TSV is inside a directory listing; grab the
+        # alternative associations file directly via HTTPS-over-FTP gateway.
+        ftp_url = (
+            "https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/"
+            "gwas-catalog-associations_ontology-annotated.tsv"
+        )
+        try:
+            _download(ftp_url, raw, desc="GWAS Catalog (FTP)")
+        except Exception as ftp_exc:
+            # Last resort: try plain FTP via urllib
+            log.warning("  ⚠ HTTPS FTP gateway failed (%s), trying plain FTP", ftp_exc)
+            raw.unlink(missing_ok=True)
+            import urllib.request
+            ftp_direct = (
+                "ftp://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/"
+                "gwas-catalog-associations_ontology-annotated.tsv"
+            )
+            out_dir.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(ftp_direct, raw)
 
     df = pd.read_csv(raw, sep="\t", low_memory=False)
     _write_parquet(df, parquet)
@@ -889,16 +920,28 @@ def main() -> None:
     print(f"\nTotal: {len(downloaded)} downloaded, {len(skipped)} skipped, {len(failed)} failed")
     print(f"Total parquet size on disk: {total_size:.2f} GB")
 
-    # Write manifest
-    manifest = {
-        r.name: {
+    # Write manifest with column schemas
+    manifest: dict[str, Any] = {}
+    for r in results:
+        entry: dict[str, Any] = {
             "parquet": str(r.parquet_path),
             "rows": r.rows,
             "cols": r.cols,
             "error": r.error,
         }
-        for r in results
-    }
+        # Read column schema from parquet metadata if file exists
+        if r.error is None and r.parquet_path.exists():
+            try:
+                pq.read_metadata(r.parquet_path)  # validates file
+                schema = pq.read_schema(r.parquet_path)
+                entry["columns"] = [
+                    {"name": schema.field(i).name, "type": str(schema.field(i).type)}
+                    for i in range(len(schema))
+                ]
+            except Exception:
+                pass
+        manifest[r.name] = entry
+
     manifest_path = DATA_DIR / "manifest.json"
     with open(manifest_path, "w") as fh:
         json.dump(manifest, fh, indent=2)
