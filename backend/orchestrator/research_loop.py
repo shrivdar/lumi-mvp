@@ -29,10 +29,13 @@ from core.models import (
     ResearchEvent,
     ResearchResult,
     ResearchSession,
+    ScreeningResult,
+    ScreeningTier,
     SessionStatus,
     TaskStatus,
     ToolRegistryEntry,
 )
+from integrations.biosecurity import BiosecurityScreener
 from orchestrator.hypothesis_tree import HypothesisTree
 from orchestrator.swarm_composer import SwarmComposer
 from orchestrator.uncertainty import UncertaintyAggregator
@@ -106,6 +109,19 @@ class ResearchOrchestrator:
 
             # Phase 3: Compile results
             result = self._compile_results(session, start_ms)
+
+            # Phase 4: Biosecurity screening
+            screening = await self._screen_results(result)
+            result.screening = screening
+
+            if screening.tier == ScreeningTier.BLOCKED:
+                result.report_markdown = (
+                    "**This research output has been blocked by biosecurity screening.**\n\n"
+                    f"Reason: {screening.reasoning}"
+                )
+                result.key_findings = []
+                result.recommended_experiments = []
+
             session.result = result
             session.status = SessionStatus.COMPLETED
 
@@ -678,6 +694,38 @@ class ResearchOrchestrator:
         )
 
         return result
+
+    # ------------------------------------------------------------------
+    # Phase 4: Biosecurity screening
+    # ------------------------------------------------------------------
+
+    async def _screen_results(self, result: ResearchResult) -> ScreeningResult:
+        """Screen compiled results for dual-use/biosecurity concerns."""
+        screener = BiosecurityScreener()
+        screening = await screener.screen(result)
+
+        self._emit(
+            "biosecurity_screening_completed",
+            tier=screening.tier,
+            flagged_categories=[str(c) for c in screening.flagged_categories],
+        )
+
+        if screening.tier == ScreeningTier.BLOCKED:
+            self.audit.warn(
+                "biosecurity_blocked",
+                research_id=result.research_id,
+                reasoning=screening.reasoning,
+                flagged_categories=[str(c) for c in screening.flagged_categories],
+            )
+        elif screening.tier == ScreeningTier.WARNING:
+            self.audit.log(
+                "biosecurity_warning",
+                research_id=result.research_id,
+                reasoning=screening.reasoning,
+                disclaimer=screening.disclaimer,
+            )
+
+        return screening
 
     # ------------------------------------------------------------------
     # Session management

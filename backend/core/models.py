@@ -162,6 +162,24 @@ class SessionStatus(enum.StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class BiosecurityCategory(enum.StrEnum):
+    """Categories of dual-use/biosecurity concern."""
+
+    PATHOGEN_ENHANCEMENT = "pathogen_enhancement"
+    TOXIN_SYNTHESIS = "toxin_synthesis"
+    WEAPONS_POTENTIAL = "weapons_potential"
+    GAIN_OF_FUNCTION = "gain_of_function"
+    DUAL_USE_CONCERN = "dual_use_concern"
+
+
+class ScreeningTier(enum.StrEnum):
+    """Biosecurity screening decision tiers."""
+
+    CLEAR = "CLEAR"        # Proceed normally
+    WARNING = "WARNING"    # Add disclaimer to output
+    BLOCKED = "BLOCKED"    # Refuse to present results
+
+
 class ToolSourceType(enum.StrEnum):
     """How a tool is provided to the system."""
 
@@ -461,7 +479,19 @@ class ResearchResult(BaseModel):
     total_duration_ms: int = 0
     total_llm_calls: int = 0
     total_tokens: int = 0
+    screening: ScreeningResult | None = None
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class ScreeningResult(BaseModel):
+    """Result of biosecurity screening on a research output."""
+
+    research_id: str
+    tier: ScreeningTier
+    flagged_categories: list[BiosecurityCategory] = Field(default_factory=list)
+    reasoning: str = ""
+    disclaimer: str = ""
+    screened_at: datetime = Field(default_factory=_utcnow)
 
 
 class ResearchSession(BaseModel):
