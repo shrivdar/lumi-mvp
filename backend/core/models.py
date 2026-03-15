@@ -461,7 +461,7 @@ class AgentResult(BaseModel):
     reasoning_trace: str = ""
     recommended_next: str | None = None
     sub_agent_results: list[AgentResult] = Field(default_factory=list)
-    token_usage: dict[str, int] = Field(default_factory=dict)
+    token_usage: dict[str, Any] = Field(default_factory=dict)
     duration_ms: int = 0
     llm_calls: int = 0
     llm_tokens_used: int = 0
