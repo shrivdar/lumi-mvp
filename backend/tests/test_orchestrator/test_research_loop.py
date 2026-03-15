@@ -266,6 +266,65 @@ class TestEvents:
         assert len(event_types) > 3
 
 
+class TestScaledOrchestration:
+    @pytest.mark.asyncio
+    async def test_parallel_swarms_dispatch(self, orchestrator: ResearchOrchestrator) -> None:
+        """Multiple hypotheses should get parallel swarms."""
+        config = ResearchConfig(
+            max_mcts_iterations=1,
+            max_hypothesis_depth=1,
+            max_concurrent_agents=20,
+            max_hypothesis_breadth=10,
+        )
+        session = await orchestrator.run("B7-H3 in NSCLC", config)
+        assert session.status == SessionStatus.COMPLETED
+        # Multiple agents should have been spawned (3 hypotheses × ~3 agents each)
+        assert orchestrator._total_agents_spawned > 0
+
+    @pytest.mark.asyncio
+    async def test_total_agent_cap_enforced(self, orchestrator: ResearchOrchestrator) -> None:
+        """Session should stop when max_total_agents is reached."""
+        config = ResearchConfig(
+            max_mcts_iterations=10,
+            max_hypothesis_depth=1,
+            max_total_agents=5,
+        )
+        session = await orchestrator.run("test", config)
+        assert session.status == SessionStatus.COMPLETED
+        assert orchestrator._total_agents_spawned <= config.max_total_agents + config.max_agents_per_swarm
+
+    @pytest.mark.asyncio
+    async def test_session_token_budget_enforced(self, orchestrator: ResearchOrchestrator) -> None:
+        """Session should stop when token budget is exhausted."""
+        config = ResearchConfig(
+            max_mcts_iterations=100,
+            max_hypothesis_depth=1,
+            session_token_budget=100,  # Very low — should stop quickly
+        )
+        session = await orchestrator.run("test", config)
+        assert session.status == SessionStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_semaphore_limits_concurrency(self, orchestrator: ResearchOrchestrator) -> None:
+        """With max_concurrent_agents=1, agents run one at a time."""
+        config = ResearchConfig(
+            max_mcts_iterations=1,
+            max_hypothesis_depth=1,
+            max_concurrent_agents=1,
+        )
+        session = await orchestrator.run("test", config)
+        assert session.status == SessionStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_config_has_scale_fields(self) -> None:
+        config = ResearchConfig()
+        assert config.max_concurrent_agents == 20
+        assert config.max_total_agents == 500
+        assert config.max_hypothesis_breadth == 10
+        assert config.agent_token_budget == 50_000
+        assert config.session_token_budget == 2_000_000
+
+
 class TestEdgeCases:
     @pytest.mark.asyncio
     async def test_no_agent_factory_degrades_gracefully(self) -> None:

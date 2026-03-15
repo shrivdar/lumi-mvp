@@ -317,6 +317,56 @@ class TestSerialization:
         assert path[1].id == children[0].id
 
 
+class TestSelectLeaves:
+    def test_select_leaves_returns_multiple(self, populated_tree: HypothesisTree) -> None:
+        leaves = populated_tree.select_leaves(max_leaves=3)
+        assert len(leaves) == 3
+        for leaf in leaves:
+            assert leaf.status == HypothesisStatus.EXPLORING
+
+    def test_select_leaves_respects_max(self, populated_tree: HypothesisTree) -> None:
+        leaves = populated_tree.select_leaves(max_leaves=2)
+        assert len(leaves) == 2
+
+    def test_select_leaves_skips_pruned(self, populated_tree: HypothesisTree) -> None:
+        root = populated_tree.root
+        assert root is not None
+        children = populated_tree.get_children(root.id)
+        populated_tree.prune(children[0].id)
+
+        leaves = populated_tree.select_leaves(max_leaves=5)
+        pruned_ids = {children[0].id}
+        for leaf in leaves:
+            assert leaf.id not in pruned_ids
+
+    def test_select_leaves_falls_back_to_select(self, tree: HypothesisTree) -> None:
+        """If no candidate leaves exist, falls back to regular select."""
+        tree.set_root("Root")
+        # Root is the only node — select_leaves should fall back
+        leaves = tree.select_leaves(max_leaves=3)
+        assert len(leaves) == 1
+
+
+class TestBreadthLimit:
+    def test_expand_respects_max_breadth(self) -> None:
+        tree = HypothesisTree(session_id="test", max_depth=3, max_breadth=2)
+        root = tree.set_root("Root")
+        children = tree.expand(root.id, [
+            {"hypothesis": "A"},
+            {"hypothesis": "B"},
+            {"hypothesis": "C"},
+        ])
+        assert len(children) == 2  # capped at max_breadth
+
+    def test_expand_blocks_at_breadth_limit(self) -> None:
+        tree = HypothesisTree(session_id="test", max_depth=3, max_breadth=2)
+        root = tree.set_root("Root")
+        tree.expand(root.id, [{"hypothesis": "A"}, {"hypothesis": "B"}])
+        # Already at max_breadth — further expansion blocked
+        more = tree.expand(root.id, [{"hypothesis": "C"}])
+        assert len(more) == 0
+
+
 class TestEvents:
     def test_events_emitted_on_init(self, tree: HypothesisTree) -> None:
         tree.set_root("Test")

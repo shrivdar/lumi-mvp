@@ -71,6 +71,8 @@ class ResearchOrchestrator:
         self._uncertainty: UncertaintyAggregator | None = None
         self._all_results: list[AgentResult] = []
         self._events: list[ResearchEvent] = []
+        self._total_agents_spawned: int = 0
+        self._session_tokens_used: int = 0
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -152,6 +154,7 @@ class ResearchOrchestrator:
 
         tree = HypothesisTree(
             max_depth=config.max_hypothesis_depth,
+            max_breadth=config.max_hypothesis_breadth,
             session_id=session_id,
         )
 
@@ -240,84 +243,193 @@ class ResearchOrchestrator:
         config: ResearchConfig,
         session: ResearchSession,
     ) -> None:
-        """Run the MCTS loop: Select → Compose → Dispatch → Execute → Critique → Backpropagate."""
+        """Run the MCTS loop with per-hypothesis parallel swarms.
+
+        Each iteration selects multiple leaf hypotheses, composes a swarm
+        for each, and dispatches all agents concurrently behind a shared
+        semaphore.  Results are backpropagated as they arrive.
+        """
         assert self._tree is not None
         assert self._composer is not None
         assert self._uncertainty is not None
 
+        semaphore = asyncio.Semaphore(config.max_concurrent_agents)
+
         for iteration in range(config.max_mcts_iterations):
             session.current_iteration = iteration + 1
+
+            # Budget guard — stop if session token budget exhausted
+            if self._session_tokens_used >= config.session_token_budget:
+                logger.info(
+                    "mcts_terminated",
+                    reason="session_token_budget_exhausted",
+                    tokens_used=self._session_tokens_used,
+                )
+                self._emit(
+                    "mcts_iteration_end",
+                    iteration=iteration + 1,
+                    should_stop=True,
+                    stop_reason="session_token_budget_exhausted",
+                )
+                break
+
+            # Budget guard — stop if total agent cap reached
+            if self._total_agents_spawned >= config.max_total_agents:
+                logger.info(
+                    "mcts_terminated",
+                    reason="max_total_agents_reached",
+                    agents_spawned=self._total_agents_spawned,
+                )
+                self._emit(
+                    "mcts_iteration_end",
+                    iteration=iteration + 1,
+                    should_stop=True,
+                    stop_reason="max_total_agents_reached",
+                )
+                break
 
             self._emit(
                 "mcts_iteration_start",
                 iteration=iteration + 1,
                 total_visits=self._tree.total_visits,
                 node_count=self._tree.node_count,
+                total_agents_spawned=self._total_agents_spawned,
+                session_tokens_used=self._session_tokens_used,
             )
 
-            # 1. SELECT — pick the most promising hypothesis via UCB1
-            selected = self._tree.select()
+            # 1. SELECT — pick multiple leaf hypotheses for parallel exploration
+            remaining_agent_slots = config.max_total_agents - self._total_agents_spawned
+            max_swarms = max(1, remaining_agent_slots // max(config.max_agents_per_swarm, 1))
+            leaves = self._tree.select_leaves(max_leaves=max_swarms)
 
-            # 2. COMPOSE SWARM — select agents for this hypothesis
-            agent_types = await self._composer.compose_swarm(query, selected, config)
+            # 2. COMPOSE + GENERATE per-hypothesis swarms concurrently
+            async def _compose_for_hypothesis(
+                hypothesis: HypothesisNode,
+            ) -> tuple[HypothesisNode, list[AgentTask]]:
+                agent_types = await self._composer.compose_swarm(query, hypothesis, config)
+                tasks = await self._composer.generate_tasks(
+                    query, hypothesis, agent_types, session.id,
+                )
+                return hypothesis, tasks
 
-            # 3. GENERATE TASKS — create per-agent instructions
-            tasks = await self._composer.generate_tasks(
-                query, selected, agent_types, session.id,
+            compose_results = await asyncio.gather(
+                *[_compose_for_hypothesis(h) for h in leaves],
+                return_exceptions=True,
             )
 
-            # 4. EXECUTE — run agents (concurrently where possible)
-            results = await self._execute_agents(tasks, selected, config)
-            self._all_results.extend(results)
+            # 3. DISPATCH all swarms concurrently behind shared semaphore
+            all_swarm_coros = []
+            hypothesis_task_map: list[tuple[HypothesisNode, list[AgentTask]]] = []
+            for result in compose_results:
+                if isinstance(result, Exception):
+                    logger.warning("swarm_composition_failed", error=str(result))
+                    continue
+                hypothesis, tasks = result
+                # Cap agent spawns to stay within budget
+                budget_left = config.max_total_agents - self._total_agents_spawned
+                tasks = tasks[:budget_left]
+                if not tasks:
+                    continue
+                hypothesis_task_map.append((hypothesis, tasks))
+                all_swarm_coros.append(
+                    self._execute_agents_with_semaphore(
+                        tasks, hypothesis, config, semaphore,
+                    )
+                )
 
-            # 5. EVALUATE — compute info gain
-            info_gain = self._evaluate_iteration(results, selected)
+            if not all_swarm_coros:
+                # No swarms could be composed — fall back to single select
+                selected = self._tree.select()
+                agent_types = await self._composer.compose_swarm(query, selected, config)
+                tasks = await self._composer.generate_tasks(
+                    query, selected, agent_types, session.id,
+                )
+                swarm_results_list = [
+                    await self._execute_agents_with_semaphore(
+                        tasks, selected, config, semaphore,
+                    )
+                ]
+                hypothesis_task_map = [(selected, tasks)]
+            else:
+                swarm_results_list = await asyncio.gather(*all_swarm_coros)
 
-            # 6. BACKPROPAGATE — propagate info gain up the tree
-            edges_added = sum(len(r.edges_added) for r in results)
-            edges_falsified = sum(
-                1 for r in results for f in r.falsification_results if f.falsified
-            )
-            contradictions = sum(
-                1 for r in results for e in r.edges_added if e.is_contradiction
-            )
+            # 4. EVALUATE + BACKPROPAGATE per hypothesis (real-time)
+            iteration_info_gains: list[float] = []
+            iteration_edges_added = 0
 
-            self._tree.backpropagate(
-                selected.id,
-                info_gain,
-                edges_added=edges_added,
-                edges_falsified=edges_falsified,
-                contradictions_found=contradictions,
-            )
+            for (hypothesis, _tasks), results in zip(
+                hypothesis_task_map, swarm_results_list, strict=False,
+            ):
+                self._all_results.extend(results)
+
+                # Track token usage
+                for r in results:
+                    self._session_tokens_used += r.llm_tokens_used
+
+                info_gain = self._evaluate_iteration(results, hypothesis)
+                iteration_info_gains.append(info_gain)
+
+                edges_added = sum(len(r.edges_added) for r in results)
+                edges_falsified = sum(
+                    1 for r in results for f in r.falsification_results if f.falsified
+                )
+                contradictions = sum(
+                    1 for r in results for e in r.edges_added if e.is_contradiction
+                )
+                iteration_edges_added += edges_added
+
+                self._tree.backpropagate(
+                    hypothesis.id,
+                    info_gain,
+                    edges_added=edges_added,
+                    edges_falsified=edges_falsified,
+                    contradictions_found=contradictions,
+                )
+
+                # EXPAND — if high info gain and depth allows
+                if info_gain > 0.5 and hypothesis.depth < config.max_hypothesis_depth:
+                    child_hypotheses = await self._generate_child_hypotheses(
+                        query, hypothesis, results,
+                    )
+                    if child_hypotheses:
+                        self._tree.expand(hypothesis.id, child_hypotheses)
+
+                # Update hypothesis confidence
+                self._update_hypothesis_confidence(hypothesis)
 
             # Update session stats
             session.total_nodes = self.kg.node_count()
             session.total_edges = self.kg.edge_count()
             session.total_hypotheses = self._tree.node_count
 
-            # 7. EXPAND — if this node has high info gain and depth allows, expand
-            if info_gain > 0.5 and selected.depth < config.max_hypothesis_depth:
-                child_hypotheses = await self._generate_child_hypotheses(
-                    query, selected, results,
+            # 5. UNCERTAINTY / HITL — aggregate across all swarm results
+            all_iter_results = [
+                r for (_h, _t), results in zip(
+                    hypothesis_task_map, swarm_results_list, strict=False,
                 )
-                if child_hypotheses:
-                    self._tree.expand(selected.id, child_hypotheses)
+                for r in results
+            ]
+            if all_iter_results:
+                agg_uncertainty = self._uncertainty.aggregate(all_iter_results)
+                should_hitl, hitl_reason = self._uncertainty.should_trigger_hitl(
+                    agg_uncertainty, config,
+                )
+                if should_hitl:
+                    # Use the first hypothesis for context
+                    await self._handle_hitl(
+                        query, hypothesis_task_map[0][0],
+                        agg_uncertainty, hitl_reason, config,
+                    )
 
-            # 8. Update hypothesis confidence based on evidence
-            self._update_hypothesis_confidence(selected)
-
-            # 9. CHECK UNCERTAINTY / HITL
-            agg_uncertainty = self._uncertainty.aggregate(results)
-            should_hitl, hitl_reason = self._uncertainty.should_trigger_hitl(
-                agg_uncertainty, config,
-            )
-            if should_hitl:
-                await self._handle_hitl(query, selected, agg_uncertainty, hitl_reason, config)
-
-            # 10. AUTO-PRUNE low-value branches
+            # 6. AUTO-PRUNE
             self._tree.auto_prune()
 
-            # 11. CHECK TERMINATION
+            # 7. CHECK TERMINATION
+            avg_info_gain = (
+                sum(iteration_info_gains) / len(iteration_info_gains)
+                if iteration_info_gains
+                else 0.0
+            )
             should_stop, stop_reason = self._tree.should_terminate(
                 confidence_threshold=config.confidence_threshold,
                 max_iterations=config.max_mcts_iterations,
@@ -327,8 +439,11 @@ class ResearchOrchestrator:
             self._emit(
                 "mcts_iteration_end",
                 iteration=iteration + 1,
-                info_gain=info_gain,
-                edges_added=edges_added,
+                info_gain=avg_info_gain,
+                edges_added=iteration_edges_added,
+                swarms_dispatched=len(hypothesis_task_map),
+                total_agents_spawned=self._total_agents_spawned,
+                session_tokens_used=self._session_tokens_used,
                 should_stop=should_stop,
                 stop_reason=stop_reason,
             )
@@ -341,79 +456,102 @@ class ResearchOrchestrator:
     # Agent execution
     # ------------------------------------------------------------------
 
+    async def _execute_agents_with_semaphore(
+        self,
+        tasks: list[AgentTask],
+        hypothesis: HypothesisNode,
+        config: ResearchConfig,
+        semaphore: asyncio.Semaphore,
+    ) -> list[AgentResult]:
+        """Execute agent tasks behind a shared semaphore, isolating failures."""
+
+        async def _run_single(task: AgentTask) -> AgentResult | None:
+            async with semaphore:
+                # Check per-agent token budget will be tracked post-execution
+                self._total_agents_spawned += 1
+
+                try:
+                    if self.agent_factory is None:
+                        raise OrchestrationError("No agent_factory configured")
+
+                    agent = self.agent_factory(
+                        agent_type=task.agent_type,
+                        llm=self.llm,
+                        kg=self.kg,
+                        yami=self.yami,
+                    )
+
+                    self._emit(
+                        "agent_started",
+                        agent_id=agent.agent_id,
+                        agent_type=str(task.agent_type),
+                        hypothesis_id=hypothesis.id,
+                        task_id=task.task_id,
+                        total_agents_spawned=self._total_agents_spawned,
+                    )
+
+                    task.status = TaskStatus.RUNNING
+                    result = await agent.execute(task)
+
+                    # Enforce per-agent token budget
+                    if result.llm_tokens_used > config.agent_token_budget:
+                        logger.warning(
+                            "agent_token_budget_exceeded",
+                            agent_type=str(task.agent_type),
+                            tokens_used=result.llm_tokens_used,
+                            budget=config.agent_token_budget,
+                        )
+
+                    self._emit(
+                        "agent_completed",
+                        agent_id=agent.agent_id,
+                        agent_type=str(task.agent_type),
+                        success=result.success,
+                        nodes_added=len(result.nodes_added),
+                        edges_added=len(result.edges_added),
+                        duration_ms=result.duration_ms,
+                        tokens_used=result.llm_tokens_used,
+                    )
+
+                    return result
+
+                except Exception as exc:
+                    # Isolate agent failures — never let one agent crash the session
+                    self.audit.error(
+                        "agent_execution_failed",
+                        agent_type=str(task.agent_type),
+                        task_id=task.task_id,
+                        error=str(exc),
+                    )
+                    self._emit(
+                        "agent_failed",
+                        agent_type=str(task.agent_type),
+                        task_id=task.task_id,
+                        error=str(exc),
+                    )
+                    return AgentResult(
+                        task_id=task.task_id,
+                        agent_id=task.agent_id or "unknown",
+                        agent_type=task.agent_type,
+                        hypothesis_id=hypothesis.id,
+                        success=False,
+                        errors=[str(exc)],
+                    )
+
+        # Run agents concurrently (semaphore limits actual parallelism)
+        coros = [_run_single(task) for task in tasks]
+        raw_results = await asyncio.gather(*coros)
+        return [r for r in raw_results if r is not None]
+
     async def _execute_agents(
         self,
         tasks: list[AgentTask],
         hypothesis: HypothesisNode,
         config: ResearchConfig,
     ) -> list[AgentResult]:
-        """Execute agent tasks, isolating failures per CLAUDE.md."""
-        results: list[AgentResult] = []
-
-        async def _run_single(task: AgentTask) -> AgentResult | None:
-            try:
-                if self.agent_factory is None:
-                    raise OrchestrationError("No agent_factory configured")
-
-                agent = self.agent_factory(
-                    agent_type=task.agent_type,
-                    llm=self.llm,
-                    kg=self.kg,
-                    yami=self.yami,
-                )
-
-                self._emit(
-                    "agent_started",
-                    agent_id=agent.agent_id,
-                    agent_type=str(task.agent_type),
-                    hypothesis_id=hypothesis.id,
-                    task_id=task.task_id,
-                )
-
-                task.status = TaskStatus.RUNNING
-                result = await agent.execute(task)
-
-                self._emit(
-                    "agent_completed",
-                    agent_id=agent.agent_id,
-                    agent_type=str(task.agent_type),
-                    success=result.success,
-                    nodes_added=len(result.nodes_added),
-                    edges_added=len(result.edges_added),
-                    duration_ms=result.duration_ms,
-                )
-
-                return result
-
-            except Exception as exc:
-                # Isolate agent failures — never let one agent crash the session
-                self.audit.error(
-                    "agent_execution_failed",
-                    agent_type=str(task.agent_type),
-                    task_id=task.task_id,
-                    error=str(exc),
-                )
-                self._emit(
-                    "agent_failed",
-                    agent_type=str(task.agent_type),
-                    task_id=task.task_id,
-                    error=str(exc),
-                )
-                return AgentResult(
-                    task_id=task.task_id,
-                    agent_id=task.agent_id or "unknown",
-                    agent_type=task.agent_type,
-                    hypothesis_id=hypothesis.id,
-                    success=False,
-                    errors=[str(exc)],
-                )
-
-        # Run agents concurrently
-        coros = [_run_single(task) for task in tasks]
-        raw_results = await asyncio.gather(*coros)
-        results = [r for r in raw_results if r is not None]
-
-        return results
+        """Execute agent tasks without external semaphore (backwards compat)."""
+        sem = asyncio.Semaphore(config.max_concurrent_agents)
+        return await self._execute_agents_with_semaphore(tasks, hypothesis, config, sem)
 
     # ------------------------------------------------------------------
     # Evaluation
