@@ -129,8 +129,22 @@ class ResearchOrchestrator:
             tree, root_hypotheses = await self._initialize(query, config, session.id)
             self._tree = tree
 
-            # Phase 2: MCTS Loop
-            await self._mcts_loop(query, config, session)
+            # Phase 2: MCTS Loop (wall-clock timeout guard)
+            try:
+                await asyncio.wait_for(
+                    self._mcts_loop(query, config, session),
+                    timeout=config.session_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "session_timeout",
+                    session_id=session.id,
+                    timeout_seconds=config.session_timeout_seconds,
+                )
+                self._emit(
+                    "session_timeout",
+                    timeout_seconds=config.session_timeout_seconds,
+                )
 
             # Phase 3: Compile results
             result = self._compile_results(session, start_ms)

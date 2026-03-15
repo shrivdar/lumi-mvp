@@ -1,0 +1,32 @@
+{
+  "gene_ontology": {
+    "parquet": "/Users/DarshShrivastava/Projects/lumigenic/lumi-mvp/lumi-mvp/data/gene_ontology/go_annotations.parquet",
+    "rows": 937262,
+    "cols": 17,
+    "error": null
+  },
+  "msigdb": {
+    "parquet": "/Users/DarshShrivastava/Projects/lumigenic/lumi-mvp/lumi-mvp/data/msigdb/msigdb_hallmark.parquet",
+    "rows": 571288,
+    "cols": 3,
+    "error": null
+  },
+  "gwas_catalog": {
+    "parquet": "/Users/DarshShrivastava/Projects/lumigenic/lumi-mvp/lumi-mvp/data/gwas_catalog/FAILED",
+    "rows": 0,
+    "cols": 0,
+    "error": "500 Server Error: Internal Server Error for url: https://www.ebi.ac.uk/gwas/api/search/downloads/alternative"
+  },
+  "drugbank": {
+    "parquet": "/Users/DarshShrivastava/Projects/lumigenic/lumi-mvp/lumi-mvp/data/drugbank/drugbank_vocabulary.parquet",
+    "rows": 19842,
+    "cols": 7,
+    "error": null
+  },
+  "reactome": {
+    "parquet": "/Users/DarshShrivastava/Projects/lumigenic/lumi-mvp/lumi-mvp/data/reactome/reactome_pathways.parquet",
+    "rows": 53286,
+    "cols": 6,
+    "error": null
+  }
+}

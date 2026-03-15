@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     api_key: str = "dev-api-key-change-me"
     log_level: str = "INFO"
     environment: str = "development"
+    frontend_url: str = "http://localhost:3000"
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 
