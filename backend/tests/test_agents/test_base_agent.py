@@ -7,7 +7,6 @@ import pytest
 from agents.base import BaseAgentImpl
 from agents.templates import get_template
 from core.models import (
-    AgentTask,
     AgentType,
     EdgeConfidence,
     EdgeRelationType,
@@ -18,8 +17,6 @@ from core.models import (
     NodeType,
 )
 from tests.test_agents.conftest import MockLLMClient
-from world_model.knowledge_graph import InMemoryKnowledgeGraph
-
 
 # ---------------------------------------------------------------------------
 # Concrete subclass for testing
@@ -150,7 +147,8 @@ class TestBaseAgentFalsification:
         """When counter-evidence is found, confidence should decrease."""
         template = get_template(AgentType.LITERATURE_ANALYST)
         llm = MockLLMClient(responses=[
-            '{"disproof_criteria": "Find papers showing BRCA1 is not linked to breast cancer", "search_query": "BRCA1 NOT breast cancer"}',
+            '{"disproof_criteria": "Find papers showing BRCA1 is not linked",'
+            ' "search_query": "BRCA1 NOT breast cancer"}',
         ])
         agent = StubAgent(template=template, llm=llm, kg=seeded_kg, tools=mock_tools)
 

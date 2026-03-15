@@ -10,7 +10,6 @@ from agents.literature_analyst import LiteratureAnalystAgent
 from agents.templates import get_template
 from core.models import AgentType, NodeType
 from tests.test_agents.conftest import MockLLMClient
-from world_model.knowledge_graph import InMemoryKnowledgeGraph
 
 
 class TestLiteratureAnalyst:
@@ -20,10 +19,12 @@ class TestLiteratureAnalyst:
     async def test_produces_nodes_and_edges(self, agent_kg, mock_tools, sample_task):
         """Literature analyst should produce KG nodes and edges from mock papers."""
         llm = MockLLMClient(responses=[
-            # 1. Plan response - search queries
-            json.dumps({"queries": ["BRCA1 breast cancer", "BRCA1 treatment resistance"]}),
-            # 2. Extraction response - entities and relationships
-            json.dumps({
+            # Turn 0 (plan)
+            "<think>1. Search PubMed for BRCA1 breast cancer\n2. Extract entities\n3. Build answer</think>",
+            # Turn 1: tool call for pubmed
+            '<tool>pubmed:{"action": "search", "query": "BRCA1 breast cancer", "max_results": 5}</tool>',
+            # Turn 2: final answer with entities and relationships
+            '<answer>' + json.dumps({
                 "entities": [
                     {"name": "BRCA1", "type": "GENE", "description": "Breast cancer gene 1"},
                     {"name": "Breast Cancer", "type": "DISEASE", "description": "Malignant breast neoplasm"},
@@ -33,15 +34,16 @@ class TestLiteratureAnalyst:
                         "source": "BRCA1",
                         "target": "Breast Cancer",
                         "relation": "ASSOCIATED_WITH",
-                        "evidence_pmid": "PMID:12345678",
+                        "evidence_source": "PUBMED",
+                        "evidence_id": "PMID:12345678",
                         "claim": "BRCA1 mutations increase breast cancer risk",
                         "confidence": 0.85,
                     }
                 ],
                 "summary": "BRCA1 is associated with breast cancer.",
-            }),
-            # 3. Falsification response
-            json.dumps({"disproof_criteria": "test", "search_query": "BRCA1 NOT breast cancer"}),
+            }) + '</answer>',
+            # Falsification response
+            '{"disproof_criteria": "test", "search_query": "BRCA1 NOT breast cancer"}',
         ])
 
         template = get_template(AgentType.LITERATURE_ANALYST)
@@ -65,20 +67,32 @@ class TestLiteratureAnalyst:
         # Verify edge in KG
         assert agent_kg.edge_count() >= 1
 
+        # Verify multi-turn metadata
+        assert len(result.turns) >= 3
+
     @pytest.mark.asyncio
     async def test_handles_no_papers_found(self, agent_kg, sample_task):
         """Should gracefully handle when no papers are returned."""
         llm = MockLLMClient(responses=[
-            json.dumps({"queries": ["obscure query"]}),
+            # Plan
+            "<think>1. Search for papers\n2. Report findings</think>",
+            # Tool call
+            '<tool>pubmed:{"action": "search", "query": "obscure query", "max_results": 5}</tool>',
+            # Answer with no results
+            '<answer>' + json.dumps({
+                "entities": [],
+                "relationships": [],
+                "summary": "No papers found for the given queries.",
+            }) + '</answer>',
         ])
-        # Empty tools
+        from unittest.mock import AsyncMock, MagicMock
         empty_tools = {
-            "pubmed": pytest.importorskip("unittest.mock").MagicMock(),
-            "semantic_scholar": pytest.importorskip("unittest.mock").MagicMock(),
+            "pubmed": MagicMock(),
+            "semantic_scholar": MagicMock(),
         }
-        from unittest.mock import AsyncMock
         for t in empty_tools.values():
             t.execute = AsyncMock(return_value={"results": []})
+            t.description = "Mock tool"
 
         template = get_template(AgentType.LITERATURE_ANALYST)
         agent = LiteratureAnalystAgent(
@@ -94,14 +108,18 @@ class TestLiteratureAnalyst:
     async def test_all_nodes_have_provenance(self, agent_kg, mock_tools, sample_task):
         """Every node must have agent_id and hypothesis_branch set."""
         llm = MockLLMClient(responses=[
-            json.dumps({"queries": ["BRCA1"]}),
-            json.dumps({
+            # Plan
+            "<think>Search and extract</think>",
+            # Tool call
+            '<tool>pubmed:{"action": "search", "query": "BRCA1", "max_results": 5}</tool>',
+            # Answer
+            '<answer>' + json.dumps({
                 "entities": [
                     {"name": "BRCA1", "type": "GENE", "description": "test"},
                 ],
                 "relationships": [],
                 "summary": "test",
-            }),
+            }) + '</answer>',
         ])
 
         template = get_template(AgentType.LITERATURE_ANALYST)

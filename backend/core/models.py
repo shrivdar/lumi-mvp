@@ -384,6 +384,30 @@ class FalsificationResult(BaseModel):
     timestamp: datetime = Field(default_factory=_utcnow)
 
 
+class TurnType(enum.StrEnum):
+    """Type of action in a multi-turn agent investigation loop."""
+
+    THINK = "think"
+    TOOL_CALL = "tool_call"
+    CODE_EXECUTION = "code_execution"
+    ANSWER = "answer"
+
+
+class AgentTurn(BaseModel):
+    """A single turn in a multi-turn agent investigation loop."""
+
+    turn_number: int
+    turn_type: TurnType
+    input_prompt: str = ""
+    raw_response: str = ""
+    parsed_action: str = ""
+    execution_result: str = ""
+    error: str | None = None
+    tokens_used: int = 0
+    duration_ms: int = 0
+    timestamp: datetime = Field(default_factory=_utcnow)
+
+
 class UncertaintyVector(BaseModel):
     """Multi-dimensional uncertainty assessment from an agent."""
 
@@ -437,6 +461,7 @@ class AgentResult(BaseModel):
     llm_calls: int = 0
     llm_tokens_used: int = 0
     success: bool = True
+    turns: list[AgentTurn] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utcnow)
 
