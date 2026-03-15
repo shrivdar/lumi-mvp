@@ -521,6 +521,7 @@ class ResearchResult(BaseModel):
     total_llm_calls: int = 0
     total_tokens: int = 0
     screening: ScreeningResult | None = None
+    living_document: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
 
 

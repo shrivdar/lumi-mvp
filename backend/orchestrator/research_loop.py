@@ -36,9 +36,11 @@ from core.models import (
     ToolRegistryEntry,
 )
 from integrations.biosecurity import BiosecurityScreener
+from integrations.living_document import LivingDocument
 from orchestrator.hypothesis_tree import HypothesisTree
 from orchestrator.swarm_composer import SwarmComposer
 from orchestrator.uncertainty import UncertaintyAggregator
+from rl.trajectory_collector import TrajectoryCollector
 
 logger = structlog.get_logger(__name__)
 
@@ -69,6 +71,10 @@ class ResearchOrchestrator:
         self._tool_instances = tool_instances or {}
         self.slack_tool = slack_tool
         self.audit = AuditLogger("orchestrator")
+
+        # Integration components
+        self._living_doc: LivingDocument | None = None
+        self._trajectory_collector: TrajectoryCollector | None = None
 
         self._session: ResearchSession | None = None
         self._tree: HypothesisTree | None = None
@@ -103,6 +109,14 @@ class ResearchOrchestrator:
         start_ms = int(time.monotonic() * 1000)
 
         try:
+            # Phase 0: Attach integration components
+            self._living_doc = LivingDocument(
+                session_id=session.id,
+                title=f"Research: {query[:80]}",
+            )
+            self._living_doc.attach(self.kg)
+            self._trajectory_collector = TrajectoryCollector(benchmark_run_id=session.id)
+
             # Phase 1: Initialize
             session.status = SessionStatus.RUNNING
             tree, root_hypotheses = await self._initialize(query, config, session.id)
@@ -126,6 +140,10 @@ class ResearchOrchestrator:
                 result.key_findings = []
                 result.recommended_experiments = []
 
+            # Attach living document snapshot to result
+            if self._living_doc:
+                result.living_document = self._living_doc.render()
+
             session.result = result
             session.status = SessionStatus.COMPLETED
 
@@ -140,6 +158,21 @@ class ResearchOrchestrator:
         finally:
             elapsed = int(time.monotonic() * 1000) - start_ms
             session.updated_at = session.created_at.__class__.now(session.created_at.tzinfo)
+
+            # Flush collected trajectories to disk
+            if self._trajectory_collector:
+                try:
+                    self._trajectory_collector.flush()
+                except Exception as flush_exc:
+                    logger.warning("trajectory_flush_failed", error=str(flush_exc))
+
+            # Detach living document from KG
+            if self._living_doc:
+                try:
+                    self._living_doc.detach()
+                except Exception:
+                    pass
+
             self.audit.log(
                 "research_completed",
                 session_id=session.id,
@@ -492,11 +525,33 @@ class ResearchOrchestrator:
                     if self.agent_factory is None:
                         raise OrchestrationError("No agent_factory configured")
 
+                    # Dynamic tool selection: pick tools for this specific task
+                    agent_tools: dict[str, Any] = {}
+                    if self._composer and self._tool_instances:
+                        try:
+                            tool_names = await self._composer.select_tools_for_task(
+                                task.agent_type, task,
+                            )
+                            agent_tools = {
+                                n: t for n, t in self._tool_instances.items()
+                                if n in tool_names
+                            }
+                        except Exception as exc:
+                            logger.warning(
+                                "dynamic_tool_selection_failed",
+                                agent_type=str(task.agent_type),
+                                error=str(exc),
+                            )
+                    # Always include python_repl if available
+                    if "python_repl" in self._tool_instances and "python_repl" not in agent_tools:
+                        agent_tools["python_repl"] = self._tool_instances["python_repl"]
+
                     agent = self.agent_factory(
                         agent_type=task.agent_type,
                         llm=self.llm,
                         kg=self.kg,
                         yami=self.yami,
+                        tools=agent_tools,
                     )
 
                     self._emit(
@@ -506,10 +561,18 @@ class ResearchOrchestrator:
                         hypothesis_id=hypothesis.id,
                         task_id=task.task_id,
                         total_agents_spawned=self._total_agents_spawned,
+                        tools=list(agent_tools.keys()),
                     )
 
                     task.status = TaskStatus.RUNNING
                     result = await agent.execute(task)
+
+                    # Collect trajectory for RL training
+                    if self._trajectory_collector:
+                        try:
+                            self._trajectory_collector.collect(task, result)
+                        except Exception as tc_exc:
+                            logger.warning("trajectory_collection_failed", error=str(tc_exc))
 
                     # Enforce per-agent token budget
                     if result.llm_tokens_used > config.agent_token_budget:
