@@ -149,6 +149,10 @@ class TestBaseAgentFalsification:
         llm = MockLLMClient(responses=[
             '{"disproof_criteria": "Find papers showing BRCA1 is not linked",'
             ' "search_query": "BRCA1 NOT breast cancer"}',
+            # LLM eval for each candidate paper (2 from pubmed + 1 from s2)
+            '{"contradicts": true, "reasoning": "counter-evidence"}',
+            '{"contradicts": true, "reasoning": "counter-evidence"}',
+            '{"contradicts": true, "reasoning": "counter-evidence"}',
         ])
         agent = StubAgent(template=template, llm=llm, kg=seeded_kg, tools=mock_tools)
 

@@ -119,7 +119,7 @@ def mock_llm() -> MockLLMClient:
 def mock_pubmed_tool() -> MagicMock:
     """Mock PubMed tool with sample results."""
     return make_mock_tool("pubmed", {
-        "results": [
+        "articles": [
             {
                 "pmid": "PMID:12345678",
                 "title": "BRCA1 mutations in breast cancer",
@@ -145,7 +145,7 @@ def mock_pubmed_tool() -> MagicMock:
 def mock_semantic_scholar_tool() -> MagicMock:
     """Mock Semantic Scholar tool."""
     return make_mock_tool("semantic_scholar", {
-        "results": [
+        "papers": [
             {
                 "paper_id": "abc123",
                 "title": "Novel B7-H3 targeting in NSCLC",
