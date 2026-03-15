@@ -24,7 +24,7 @@ export type EdgeRelationType =
 export type AgentType =
   | "literature_analyst" | "protein_engineer" | "genomics_mapper"
   | "pathway_analyst" | "drug_hunter" | "clinical_analyst"
-  | "scientific_critic" | "experiment_designer";
+  | "scientific_critic" | "experiment_designer" | "tool_creator";
 
 export type EvidenceSourceType =
   | "PUBMED" | "SEMANTIC_SCHOLAR" | "UNIPROT" | "KEGG" | "REACTOME"
@@ -38,7 +38,7 @@ export type HypothesisStatus =
 
 export type TaskStatus = "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED" | "WAITING_HITL";
 export type SessionStatus = "INITIALIZING" | "RUNNING" | "WAITING_HITL" | "COMPLETED" | "FAILED" | "CANCELLED";
-export type ToolSourceType = "NATIVE" | "MCP" | "CONTAINER";
+export type ToolSourceType = "NATIVE" | "MCP" | "CONTAINER" | "DYNAMIC";
 
 export interface EvidenceSource {
   source_type: EvidenceSourceType;
@@ -293,6 +293,7 @@ export const AGENT_COLORS: Record<AgentType, string> = {
   clinical_analyst: "#1ABC9C",
   scientific_critic: "#E67E22",
   experiment_designer: "#8E44AD",
+  tool_creator: "#00BCD4",
 };
 
 export const AGENT_LABELS: Record<AgentType, string> = {
@@ -304,6 +305,7 @@ export const AGENT_LABELS: Record<AgentType, string> = {
   clinical_analyst: "Clinical Analyst",
   scientific_critic: "Scientific Critic",
   experiment_designer: "Experiment Designer",
+  tool_creator: "Tool Creator",
 };
 
 export const STATUS_COLORS: Record<SessionStatus, string> = {

@@ -62,6 +62,7 @@ class ResearchOrchestrator:
         tool_entries: list[ToolRegistryEntry] | None = None,
         tool_instances: dict[str, Any] | None = None,  # name → BaseTool for dynamic assignment
         slack_tool: Any = None,  # SlackTool instance for HITL
+        checkpoint_callback: Any = None,  # async callable(session_id, iteration, orchestrator) for DB persistence
     ) -> None:
         self.llm = llm
         self.kg = kg
@@ -70,6 +71,7 @@ class ResearchOrchestrator:
         self.tool_entries = tool_entries or []
         self._tool_instances = tool_instances or {}
         self.slack_tool = slack_tool
+        self._checkpoint_callback = checkpoint_callback
         self.audit = AuditLogger("orchestrator")
 
         # Integration components
@@ -498,6 +500,15 @@ class ResearchOrchestrator:
                 should_stop=should_stop,
                 stop_reason=stop_reason,
             )
+
+            # 8. CHECKPOINT — persist state after each iteration
+            if self._checkpoint_callback:
+                try:
+                    await self._checkpoint_callback(
+                        session.id, iteration + 1, self,
+                    )
+                except Exception as ckpt_exc:
+                    logger.warning("checkpoint_failed", error=str(ckpt_exc))
 
             if should_stop:
                 logger.info("mcts_terminated", reason=stop_reason, iteration=iteration + 1)
