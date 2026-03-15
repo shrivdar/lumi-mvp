@@ -374,6 +374,48 @@ EXPERIMENT_DESIGNER_TEMPLATE = AgentTemplate(
 )
 
 # ---------------------------------------------------------------------------
+# Tool Creator
+# ---------------------------------------------------------------------------
+
+TOOL_CREATOR_TEMPLATE = AgentTemplate(
+    agent_type=AgentType.TOOL_CREATOR,
+    display_name="Tool Creator",
+    description=(
+        "Discovers, writes, tests, and registers new bioinformatics tool wrappers. "
+        "STELLA-inspired: agents create their own tools, improving platform capabilities over time."
+    ),
+    system_prompt=(
+        "You are a bioinformatics tool engineering specialist. Your role is to expand the "
+        "platform's capabilities by discovering and integrating new data sources.\n\n"
+        "Given a research question and knowledge graph context, you will:\n"
+        "1. Identify gaps — what data sources would help but aren't available yet\n"
+        "2. Search the known API catalog for relevant bioinformatics APIs\n"
+        "3. Write a Python wrapper function using only stdlib (urllib.request, json)\n"
+        "4. Test the wrapper in the sandboxed REPL for syntax and structure\n"
+        "5. Output a complete tool specification for registration\n\n"
+        "Every wrapper must follow the contract: ``def run(*, query='', **kwargs) -> dict``.\n"
+        "Wrappers must handle errors gracefully with timeouts and proper error dicts.\n"
+        "Use <execute> for code validation (syntax parsing, function checks).\n"
+        "Use <tool> for pubmed/semantic_scholar searches to find API documentation.\n"
+        "Output your tool specification in the <answer> JSON with the wrapper_code in properties."
+    ),
+    tools=["pubmed", "semantic_scholar", "python_repl"],
+    kg_write_permissions=[
+        NodeType.MECHANISM,  # can write MECHANISM nodes describing tool capabilities
+    ],
+    kg_edge_permissions=[
+        EdgeRelationType.ASSOCIATED_WITH,
+    ],
+    requires_yami=False,
+    falsification_protocol=(
+        "Test the generated wrapper with at least two different inputs; "
+        "verify the output schema is consistent and errors are handled."
+    ),
+    max_iterations=15,
+    timeout_seconds=600,
+)
+
+# ---------------------------------------------------------------------------
 # Registry lookup
 # ---------------------------------------------------------------------------
 
@@ -386,6 +428,7 @@ AGENT_TEMPLATES: dict[AgentType, AgentTemplate] = {
     AgentType.CLINICAL_ANALYST: CLINICAL_ANALYST_TEMPLATE,
     AgentType.SCIENTIFIC_CRITIC: SCIENTIFIC_CRITIC_TEMPLATE,
     AgentType.EXPERIMENT_DESIGNER: EXPERIMENT_DESIGNER_TEMPLATE,
+    AgentType.TOOL_CREATOR: TOOL_CREATOR_TEMPLATE,
 }
 
 

@@ -114,6 +114,7 @@ class AgentType(enum.StrEnum):
     CLINICAL_ANALYST = "clinical_analyst"
     SCIENTIFIC_CRITIC = "scientific_critic"
     EXPERIMENT_DESIGNER = "experiment_designer"
+    TOOL_CREATOR = "tool_creator"
 
 
 class EvidenceSourceType(enum.StrEnum):
@@ -186,6 +187,7 @@ class ToolSourceType(enum.StrEnum):
     NATIVE = "NATIVE"
     MCP = "MCP"
     CONTAINER = "CONTAINER"
+    DYNAMIC = "DYNAMIC"
 
 
 class MCPTransportType(enum.StrEnum):
@@ -610,6 +612,36 @@ class ContainerToolConfig(BaseModel):
     timeout_seconds: int = 120
     network_mode: str = "none"  # sandboxed by default
     volumes: dict[str, str] = Field(default_factory=dict)
+
+
+class DynamicToolStatus(enum.StrEnum):
+    """Lifecycle status of a dynamically created tool."""
+
+    DRAFT = "DRAFT"
+    TESTING = "TESTING"
+    VALIDATED = "VALIDATED"
+    FAILED = "FAILED"
+    REGISTERED = "REGISTERED"
+
+
+class DynamicToolSpec(BaseModel):
+    """Specification for a dynamically generated tool wrapper."""
+
+    name: str
+    description: str = ""
+    api_base_url: str = ""
+    api_documentation: str = ""
+    wrapper_code: str = ""
+    test_code: str = ""
+    test_results: list[dict[str, Any]] = Field(default_factory=list)
+    status: DynamicToolStatus = DynamicToolStatus.DRAFT
+    category: str = "dynamic"
+    capabilities: list[str] = Field(default_factory=list)
+    example_tasks: list[str] = Field(default_factory=list)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    created_by: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    validated_at: datetime | None = None
 
 
 class ToolRegistryEntry(BaseModel):
