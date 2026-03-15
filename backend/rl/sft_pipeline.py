@@ -1,11 +1,12 @@
 """SFT data pipeline — filter successful trajectories and format for fine-tuning.
 
 Supports:
-- Filtering by reward threshold (default: reward == 1.0)
-- Formatting as conversation turns for SFT
+- Filtering by reward threshold (default: reward >= 0.5)
+- Quality filtering: skip crashed agents, empty answers, low-confidence results
+- Instruction-response pair formatting for SFT training
 - Rejection sampling: run N per instance, keep only successful ones
 - Export as HuggingFace Dataset (optional, if `datasets` installed)
-- Export as JSONL
+- Export as JSONL (both conversation and prompt/completion formats)
 """
 
 from __future__ import annotations
@@ -27,13 +28,17 @@ class SFTPipeline:
     def __init__(
         self,
         *,
-        reward_threshold: float = 1.0,
+        reward_threshold: float = 0.5,
         max_turns: int | None = None,
         include_thinking: bool = False,
+        min_turns: int = 1,
+        max_tokens: int | None = None,
     ) -> None:
         self.reward_threshold = reward_threshold
         self.max_turns = max_turns
         self.include_thinking = include_thinking
+        self.min_turns = min_turns
+        self.max_tokens = max_tokens
 
     def load_trajectories(self, path: str | Path) -> list[Trajectory]:
         """Load trajectories from a JSONL file."""
@@ -72,6 +77,150 @@ class SFTPipeline:
             threshold=self.reward_threshold,
         )
         return filtered
+
+    def quality_filter(self, trajectories: list[Trajectory]) -> list[Trajectory]:
+        """Apply quality filters beyond reward threshold.
+
+        Removes trajectories where:
+        - Agent crashed (no turns at all)
+        - No final answer produced (empty or whitespace-only)
+        - Fewer turns than min_turns
+        - Exceeds max_tokens budget (if set)
+        - Success flag is False (agent explicitly failed)
+        """
+        accepted: list[Trajectory] = []
+        reasons: dict[str, int] = {
+            "no_turns": 0,
+            "no_answer": 0,
+            "too_few_turns": 0,
+            "too_many_tokens": 0,
+            "not_successful": 0,
+        }
+
+        for t in trajectories:
+            if not t.turns:
+                reasons["no_turns"] += 1
+                continue
+            if not t.final_answer or not t.final_answer.strip():
+                reasons["no_answer"] += 1
+                continue
+            if len(t.turns) < self.min_turns:
+                reasons["too_few_turns"] += 1
+                continue
+            if self.max_tokens and t.total_tokens > self.max_tokens:
+                reasons["too_many_tokens"] += 1
+                continue
+            if not t.success:
+                reasons["not_successful"] += 1
+                continue
+            accepted.append(t)
+
+        logger.info(
+            "sft_quality_filter",
+            input=len(trajectories),
+            output=len(accepted),
+            rejected_reasons=reasons,
+        )
+        return accepted
+
+    def filter_and_prepare(self, trajectories: list[Trajectory]) -> list[Trajectory]:
+        """Combined filter pipeline: reward threshold → quality filter.
+
+        Convenience method that chains filter() and quality_filter().
+        """
+        step1 = self.filter(trajectories)
+        return self.quality_filter(step1)
+
+    def format_instruction_response(
+        self,
+        trajectory: Trajectory,
+    ) -> dict[str, str]:
+        """Format a trajectory as an instruction-response pair for SFT.
+
+        Instruction = task + observation history (tool results, intermediate steps).
+        Response = final agent action/answer.
+
+        Returns:
+            {"prompt": "...", "completion": "...", "metadata": {...}}
+        """
+        # Build instruction from task + observation history
+        instruction_parts = [trajectory.instruction]
+
+        # Add context if available
+        if trajectory.context:
+            ctx_str = json.dumps(trajectory.context, default=str)
+            if len(ctx_str) < 2000:
+                instruction_parts.append(f"\nContext: {ctx_str}")
+
+        # Add observation history from prior turns (exclude the final answer)
+        observation_turns = trajectory.turns[:-1] if len(trajectory.turns) > 1 else []
+        for turn in observation_turns:
+            if self.max_turns is not None and turn.turn_number > self.max_turns:
+                break
+            if turn.turn_type == "think" and not self.include_thinking:
+                continue
+
+            if turn.tool_calls:
+                for tc in turn.tool_calls:
+                    instruction_parts.append(
+                        f"\n[Tool: {tc.tool_name}] {tc.result[:500]}" if tc.result else ""
+                    )
+            if turn.code_executions:
+                for ce in turn.code_executions:
+                    instruction_parts.append(
+                        f"\n[Code Output] {ce.output[:500]}" if ce.output else ""
+                    )
+            if turn.content and turn.role != "assistant":
+                instruction_parts.append(f"\n{turn.content[:500]}")
+
+        prompt = "\n".join(p for p in instruction_parts if p)
+
+        # Response is the final answer or last assistant turn
+        completion = trajectory.final_answer
+        if not completion and trajectory.turns:
+            last_turn = trajectory.turns[-1]
+            completion = last_turn.content or ""
+
+        return {
+            "prompt": prompt,
+            "completion": completion,
+            "metadata": {
+                "trajectory_id": trajectory.trajectory_id,
+                "task_id": trajectory.task_id,
+                "agent_type": trajectory.agent_type,
+                "reward": trajectory.reward,
+                "total_tokens": trajectory.total_tokens,
+                "num_turns": len(trajectory.turns),
+            },
+        }
+
+    def format_all_instruction_response(
+        self,
+        trajectories: list[Trajectory],
+    ) -> list[dict[str, str]]:
+        """Format multiple trajectories as instruction-response pairs."""
+        return [self.format_instruction_response(t) for t in trajectories]
+
+    def export_sft_dataset(
+        self,
+        trajectories: list[Trajectory],
+        output_path: str | Path,
+    ) -> Path:
+        """Export as prompt/completion JSONL ready for training scripts.
+
+        This is the primary export format consumed by training/sft.py.
+        Each line: {"prompt": "...", "completion": "...", "metadata": {...}}
+        """
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_path, "w") as f:
+            for traj in trajectories:
+                record = self.format_instruction_response(traj)
+                f.write(json.dumps(record) + "\n")
+
+        logger.info("sft_export_dataset", path=str(output_path), count=len(trajectories))
+        return output_path
 
     def rejection_sample(
         self,

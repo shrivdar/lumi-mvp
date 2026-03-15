@@ -275,6 +275,7 @@ def _compile_results(config: EvalConfig, results: list[dict]) -> dict:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="YOHAS Checkpoint Evaluation")
+    parser.add_argument("--config", type=Path, default=None, help="Path to training config file (YAML/JSON)")
     parser.add_argument("--dry-run", action="store_true", help="Run without loading model")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Checkpoint path")
     parser.add_argument(
@@ -289,7 +290,12 @@ def main(argv: list[str] | None = None) -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-    config = EvalConfig()
+    if args.config:
+        from rl.training.config import TrainingConfig
+        config = TrainingConfig.from_file(args.config).eval
+    else:
+        config = EvalConfig()
+
     if args.dry_run:
         config.dry_run = True
     if args.checkpoint:

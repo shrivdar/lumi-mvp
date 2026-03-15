@@ -1,0 +1,74 @@
+# Docker Compose overlay for model serving.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.serve.yml up model-server
+#
+# The model-server expects a checkpoint mounted at /models/checkpoint.
+# Set MODEL_PATH, SERVE_ENGINE, etc. via .env or environment overrides.
+
+services:
+  model-server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: dev
+    ports:
+      - "${SERVE_PORT:-8080}:8080"
+    volumes:
+      - ./backend:/app
+      - ./checkpoints:/models
+      - ./data:/data
+    environment:
+      MODEL_PATH: "${MODEL_PATH:-/models/rl/final}"
+      SERVE_ENGINE: "${SERVE_ENGINE:-sglang}"
+      SERVE_HOST: "0.0.0.0"
+      SERVE_PORT: "8080"
+      SERVE_DTYPE: "${SERVE_DTYPE:-bfloat16}"
+      SERVE_TP_SIZE: "${SERVE_TP_SIZE:-1}"
+      SERVE_MAX_MODEL_LEN: "${SERVE_MAX_MODEL_LEN:-8192}"
+      SERVE_GPU_MEM_UTIL: "${SERVE_GPU_MEM_UTIL:-0.90}"
+      SERVE_MAX_NUM_SEQS: "${SERVE_MAX_NUM_SEQS:-32}"
+      SERVE_API_KEY: "${SERVE_API_KEY:-}"
+      BASE_MODEL: "${BASE_MODEL:-}"
+      LORA_PATH: "${LORA_PATH:-}"
+    command: >
+      python -m rl.training.serve
+      --checkpoint ${MODEL_PATH:-/models/rl/final}
+      --engine ${SERVE_ENGINE:-sglang}
+      --port 8080
+      --max-model-len ${SERVE_MAX_MODEL_LEN:-8192}
+      --tp-size ${SERVE_TP_SIZE:-1}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    networks:
+      - yohas
+
+  # Reverse proxy for the model server (optional, enables auth + rate limiting)
+  model-proxy:
+    image: nginx:alpine
+    ports:
+      - "${MODEL_PROXY_PORT:-8081}:80"
+    volumes:
+      - ./infra/nginx/serve.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      model-server:
+        condition: service_healthy
+    networks:
+      - yohas
+    profiles:
+      - proxy
+
+networks:
+  yohas:
+    driver: bridge

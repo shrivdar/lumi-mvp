@@ -1,13 +1,18 @@
 """Training hyperparameters for SFT and RL fine-tuning on DGX Spark.
 
 DGX Spark: Grace Blackwell GB10, 128 GB unified memory, 1 GPU.
-Primary model: Qwen2.5-32B-Instruct (fits in FP16 with LoRA).
+Primary model: Qwen2.5-32B-Instruct (fits in FP16 with LoRA / QLoRA).
 Fast iteration model: Llama-3.1-8B-Instruct.
+
+Config can be loaded from / saved to YAML/JSON files:
+    config = TrainingConfig.from_file("configs/train.yaml")
+    config.to_file("configs/train.json")
 """
 
 from __future__ import annotations
 
 import enum
+import json
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -86,6 +91,17 @@ class SFTConfig(BaseModel):
     dry_run_steps: int = 2
 
 
+class GRPOConfig(BaseModel):
+    """GRPO-specific hyperparameters (Group Relative Policy Optimization)."""
+
+    num_generations: int = 4
+    temperature: float = 0.7
+    kl_coeff: float = 0.1
+    clip_range: float = 0.2
+    reward_baseline: str = "moving_average"  # "moving_average" | "per_prompt_mean" | "none"
+    baseline_ema_decay: float = 0.99
+
+
 class RLConfig(BaseModel):
     """Reinforcement learning configuration (PPO / GRPO)."""
 
@@ -107,9 +123,10 @@ class RLConfig(BaseModel):
     gamma: float = 1.0
     lam: float = 0.95
 
-    # GRPO-specific
+    # GRPO-specific (legacy fields kept for backward compat)
     grpo_num_generations: int = 4
     grpo_temperature: float = 0.7
+    grpo: GRPOConfig = Field(default_factory=GRPOConfig)
 
     # Training
     num_episodes: int = 1000
@@ -169,6 +186,56 @@ class TrainingConfig(BaseModel):
     eval: EvalConfig = Field(default_factory=EvalConfig)
 
     @classmethod
+    def for_sft_8b(cls) -> TrainingConfig:
+        """SFT 8B config — full fine-tuning friendly hyperparameters.
+
+        learning_rate=2e-5, epochs=3, batch_size=4, gradient_accumulation=8.
+        """
+        return cls(
+            sft=SFTConfig(
+                base_model=BaseModelChoice.LLAMA_8B,
+                learning_rate=2e-5,
+                num_epochs=3,
+                per_device_batch_size=4,
+                gradient_accumulation_steps=8,
+            ),
+            rl=RLConfig(base_model=BaseModelChoice.LLAMA_8B),
+            eval=EvalConfig(base_model=BaseModelChoice.LLAMA_8B),
+        )
+
+    @classmethod
+    def for_sft_32b_qlora(cls) -> TrainingConfig:
+        """SFT 32B (QLoRA) config — LoRA r=64, alpha=128, lr=1e-4."""
+        return cls(
+            sft=SFTConfig(
+                base_model=BaseModelChoice.QWEN_32B,
+                learning_rate=1e-4,
+                num_epochs=3,
+                per_device_batch_size=1,
+                gradient_accumulation_steps=16,
+                lora=LoRAConfig(r=64, lora_alpha=128),
+            ),
+            rl=RLConfig(base_model=BaseModelChoice.QWEN_32B),
+            eval=EvalConfig(base_model=BaseModelChoice.QWEN_32B),
+        )
+
+    @classmethod
+    def for_grpo(cls) -> TrainingConfig:
+        """GRPO config — kl_coeff=0.1, clip_range=0.2, moving_average baseline."""
+        return cls(
+            sft=SFTConfig(),
+            rl=RLConfig(
+                algorithm=RLAlgorithm.GRPO,
+                grpo=GRPOConfig(
+                    kl_coeff=0.1,
+                    clip_range=0.2,
+                    reward_baseline="moving_average",
+                ),
+            ),
+            eval=EvalConfig(),
+        )
+
+    @classmethod
     def for_fast_iteration(cls) -> TrainingConfig:
         """Config preset using Llama-3.1-8B for quick experimentation."""
         return cls(
@@ -198,3 +265,44 @@ class TrainingConfig(BaseModel):
             rl=RLConfig(dry_run=True, num_episodes=2),
             eval=EvalConfig(dry_run=True),
         )
+
+    # ------------------------------------------------------------------
+    # Config file I/O
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> TrainingConfig:
+        """Load config from a YAML or JSON file.
+
+        Supports .yaml/.yml (requires PyYAML) and .json files.
+        """
+        path = Path(path)
+        text = path.read_text()
+
+        if path.suffix in (".yaml", ".yml"):
+            try:
+                import yaml
+            except ImportError as e:
+                raise ImportError("PyYAML required: pip install pyyaml") from e
+            data = yaml.safe_load(text)
+        else:
+            data = json.loads(text)
+
+        return cls.model_validate(data)
+
+    def to_file(self, path: str | Path) -> Path:
+        """Save config to a YAML or JSON file."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = self.model_dump(mode="json")
+
+        if path.suffix in (".yaml", ".yml"):
+            try:
+                import yaml
+            except ImportError as e:
+                raise ImportError("PyYAML required: pip install pyyaml") from e
+            path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+        else:
+            path.write_text(json.dumps(data, indent=2, default=str))
+
+        return path
