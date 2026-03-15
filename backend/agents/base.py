@@ -64,6 +64,7 @@ class BaseAgentImpl:
         audit_logger: AuditLogger | None = None,
         parent_agent_id: str | None = None,
         depth: int = 0,
+        trajectory_collector: Any | None = None,  # rl.TrajectoryCollector
     ) -> None:
         self.agent_id = agent_id or str(uuid.uuid4())
         self.template = template
@@ -77,6 +78,7 @@ class BaseAgentImpl:
         self._current_know_how: str = ""
         self.parent_agent_id = parent_agent_id
         self.depth = depth
+        self.trajectory_collector = trajectory_collector
 
         # Tracking state during execution
         self._nodes_added: list[KGNode] = []
@@ -182,7 +184,7 @@ class BaseAgentImpl:
                 duration_ms=duration_ms,
             )
 
-            return AgentResult(
+            result = AgentResult(
                 task_id=task.task_id,
                 agent_id=self.agent_id,
                 agent_type=self.agent_type,
@@ -207,6 +209,8 @@ class BaseAgentImpl:
                 success=True,
                 errors=self._errors,
             )
+            self._record_trajectory(task, result)
+            return result
 
         except Exception as exc:
             duration_ms = int(time.monotonic() * 1000) - start_ms
@@ -216,7 +220,7 @@ class BaseAgentImpl:
                 task_id=task.task_id,
                 error=str(exc),
             )
-            return AgentResult(
+            result = AgentResult(
                 task_id=task.task_id,
                 agent_id=self.agent_id,
                 agent_type=self.agent_type,
@@ -234,6 +238,21 @@ class BaseAgentImpl:
                 success=False,
                 errors=[*self._errors, str(exc)],
             )
+            self._record_trajectory(task, result)
+            return result
+
+    # ------------------------------------------------------------------
+    # Trajectory recording
+    # ------------------------------------------------------------------
+
+    def _record_trajectory(self, task: AgentTask, result: AgentResult) -> None:
+        """Record the trajectory if a collector is attached. Non-critical."""
+        if self.trajectory_collector is None:
+            return
+        try:
+            self.trajectory_collector.collect(task, result)
+        except Exception as exc:
+            logger.warning("trajectory_record_failed", agent_id=self.agent_id, error=str(exc))
 
     # ------------------------------------------------------------------
     # Subclass hook — override this
