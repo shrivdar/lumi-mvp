@@ -95,6 +95,26 @@ class IntegrationsRegistry:
 
         logger.info("integrations_bootstrapped", tool_count=len(self._instances))
 
+    def register_catalog_tools(self) -> int:
+        """Register all MCP and container tools from the tool catalog.
+
+        This pre-populates the registry with tool metadata from the catalog,
+        so agents can see available tools before MCP servers are connected.
+        Tools registered here will be updated with live manifests when MCP
+        servers connect and discover their actual tools.
+        """
+        from core.models import ToolSourceType
+        from integrations.tool_catalog import get_catalog
+
+        catalog = get_catalog()
+        count = 0
+        for entry in catalog:
+            if entry.source_type in (ToolSourceType.MCP, ToolSourceType.CONTAINER):
+                self._tool_registry.register(entry)
+                count += 1
+        logger.info("catalog_tools_registered", count=count)
+        return count
+
     def get_instance(self, name: str) -> BaseTool | None:
         return self._instances.get(name)
 

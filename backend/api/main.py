@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.middleware import APIKeyAuthMiddleware, RequestIDMiddleware, TimingMiddleware
-from api.routes import agents, graph, health, hypothesis, monitoring, research
+from api.routes import agents, graph, health, hypothesis, mcp, monitoring, research
 from api.websocket import router as ws_router
 from core.audit import configure_audit_logging
 from core.config import settings
@@ -52,6 +52,7 @@ def create_app() -> FastAPI:
     app.include_router(agents.router, prefix="/api/v1")
     app.include_router(hypothesis.router, prefix="/api/v1")
     app.include_router(monitoring.router, prefix="/api/v1")
+    app.include_router(mcp.router, prefix="/api/v1")
     app.include_router(ws_router, prefix="/api/v1")
 
     return app
