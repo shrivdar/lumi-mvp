@@ -534,32 +534,60 @@ class BaseAgentImpl:
                 search_query = f"{source_name} {target_name} contradicts disproven negative"
 
             # Search for counter-evidence using available tools
-            counter_evidence: list[EvidenceSource] = []
+            tool_result_keys = {"pubmed": "articles", "semantic_scholar": "papers"}
+            candidate_papers: list[tuple[str, dict]] = []  # (tool_name, paper)
             for tool_name in ["pubmed", "semantic_scholar"]:
                 tool = self.tools.get(tool_name)
                 if tool is None:
                     continue
                 try:
                     search_results = await tool.execute(action="search", query=search_query, max_results=3)
-                    for paper in search_results.get("results", []):
-                        counter_evidence.append(
-                            EvidenceSource(
-                                source_type=(
-                                    EvidenceSourceType.PUBMED
-                                    if tool_name == "pubmed"
-                                    else EvidenceSourceType.SEMANTIC_SCHOLAR
-                                ),
-                                source_id=paper.get("pmid") or paper.get("paper_id", ""),
-                                title=paper.get("title", ""),
-                                claim=f"Potential counter-evidence for {source_name} {edge.relation} {target_name}",
-                                doi=paper.get("doi"),
-                                quality_score=0.5,
-                                confidence=0.4,
-                                agent_id=self.agent_id,
-                            )
-                        )
+                    result_key = tool_result_keys.get(tool_name, "results")
+                    for paper in search_results.get(result_key, []):
+                        candidate_papers.append((tool_name, paper))
                 except Exception:
                     continue
+
+            # LLM evaluation: ask whether each candidate actually contradicts the claim
+            claim_statement = f"{source_name} {edge.relation} {target_name}"
+            counter_evidence: list[EvidenceSource] = []
+            for tool_name, paper in candidate_papers:
+                abstract = paper.get("abstract") or ""
+                title = paper.get("title") or ""
+                if not abstract and not title:
+                    continue
+                try:
+                    eval_prompt = (
+                        f"Does the following paper provide evidence AGAINST the claim: "
+                        f"\"{claim_statement}\"?\n\n"
+                        f"Paper title: {title}\n"
+                        f"Abstract: {abstract}\n\n"
+                        f"Respond as JSON: {{\"contradicts\": true/false, \"reasoning\": \"...\"}}"
+                    )
+                    eval_response = await self.query_llm(eval_prompt)
+                    eval_parsed = self.llm.parse_json(eval_response)
+                    is_counter = eval_parsed.get("contradicts", False)
+                except Exception:
+                    # If LLM eval fails, fall back to treating it as potential counter-evidence
+                    is_counter = True
+
+                if is_counter:
+                    counter_evidence.append(
+                        EvidenceSource(
+                            source_type=(
+                                EvidenceSourceType.PUBMED
+                                if tool_name == "pubmed"
+                                else EvidenceSourceType.SEMANTIC_SCHOLAR
+                            ),
+                            source_id=paper.get("pmid") or paper.get("paper_id", ""),
+                            title=title,
+                            claim=f"Counter-evidence for {claim_statement}",
+                            doi=paper.get("doi"),
+                            quality_score=0.5,
+                            confidence=0.4,
+                            agent_id=self.agent_id,
+                        )
+                    )
 
             # Assess result
             original_confidence = edge.confidence.overall
