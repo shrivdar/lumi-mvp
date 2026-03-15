@@ -55,7 +55,13 @@ async def create_research(
     orchestrators: dict = Depends(get_orchestrators),
     agent_results: dict = Depends(get_agent_results),
 ) -> CreateResearchResponse:
-    """Create a new research session and dispatch to background execution."""
+    """Create a new research session and dispatch to background execution.
+
+    Production mode: dispatches to Celery for distributed agent execution.
+    Development mode: runs as an asyncio background task.
+    """
+    from agents.factory import create_agent
+    from core.config import settings
     from core.llm import LLMClient
     from orchestrator.research_loop import ResearchOrchestrator
 
@@ -63,30 +69,110 @@ async def create_research(
     kg = InMemoryKnowledgeGraph(graph_id=session.id)
 
     llm = LLMClient()
-    orchestrator = ResearchOrchestrator(llm=llm, kg=kg)
+
+    # Build tool instances for agent execution
+    tool_instances = _build_tool_instances_for_api()
+
+    # Initialize Slack for HITL
+    slack_tool = None
+    try:
+        from integrations.slack import SlackTool
+        slack_tool = SlackTool()
+    except Exception:
+        pass
+
+    orchestrator = ResearchOrchestrator(
+        llm=llm,
+        kg=kg,
+        agent_factory=create_agent,
+        tool_instances=tool_instances,
+        slack_tool=slack_tool,
+    )
 
     sessions[session.id] = session
     kgs[session.id] = kg
     orchestrators[session.id] = orchestrator
     agent_results[session.id] = []
 
-    # Dispatch to Celery in production; for now run in background task
-    import asyncio
+    config_dict = body.config.model_dump(mode="json")
 
-    async def _run() -> None:
-        try:
-            result_session = await orchestrator.run(body.query, body.config)
-            sessions[session.id] = result_session
-        except Exception:
-            session.status = SessionStatus.FAILED
-            sessions[session.id] = session
+    if settings.environment == "production":
+        # Production: dispatch to Celery
+        from workers.tasks import run_research
+        celery_result = run_research.delay(session.id, body.query, config_dict)
+        return CreateResearchResponse(
+            research_id=session.id,
+            status=str(session.status),
+        )
+    else:
+        # Development: run as asyncio background task
+        import asyncio
 
-    asyncio.create_task(_run())
+        async def _run() -> None:
+            try:
+                result_session = await orchestrator.run(body.query, body.config)
+                sessions[session.id] = result_session
+            except Exception:
+                session.status = SessionStatus.FAILED
+                sessions[session.id] = session
+
+        asyncio.create_task(_run())
 
     return CreateResearchResponse(
         research_id=session.id,
         status=str(session.status),
     )
+
+
+def _build_tool_instances_for_api() -> dict:
+    """Build tool instances for the API server context."""
+    tools: dict = {}
+    try:
+        from integrations.pubmed import PubMedTool
+        tools["pubmed"] = PubMedTool()
+    except Exception:
+        pass
+    try:
+        from integrations.semantic_scholar import SemanticScholarTool
+        tools["semantic_scholar"] = SemanticScholarTool()
+    except Exception:
+        pass
+    try:
+        from integrations.uniprot import UniProtTool
+        tools["uniprot"] = UniProtTool()
+    except Exception:
+        pass
+    try:
+        from integrations.kegg import KEGGTool
+        tools["kegg"] = KEGGTool()
+    except Exception:
+        pass
+    try:
+        from integrations.reactome import ReactomeTool
+        tools["reactome"] = ReactomeTool()
+    except Exception:
+        pass
+    try:
+        from integrations.mygene import MyGeneTool
+        tools["mygene"] = MyGeneTool()
+    except Exception:
+        pass
+    try:
+        from integrations.chembl import ChEMBLTool
+        tools["chembl"] = ChEMBLTool()
+    except Exception:
+        pass
+    try:
+        from integrations.clinicaltrials import ClinicalTrialsTool
+        tools["clinicaltrials"] = ClinicalTrialsTool()
+    except Exception:
+        pass
+    try:
+        from integrations.python_repl import PythonREPLTool
+        tools["python_repl"] = PythonREPLTool()
+    except Exception:
+        pass
+    return tools
 
 
 @router.get("")

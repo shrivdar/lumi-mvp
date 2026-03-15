@@ -22,6 +22,7 @@ const ABBREVIATIONS: Record<AgentType, string> = {
   clinical_analyst: "CLN",
   scientific_critic: "CRT",
   experiment_designer: "EXP",
+  tool_creator: "TLC",
 };
 
 const ORBIT_RADII = [110, 140, 170];
