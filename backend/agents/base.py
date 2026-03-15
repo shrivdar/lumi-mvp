@@ -21,7 +21,9 @@ from core.constants import MAX_SUB_AGENT_DEPTH, MAX_SUB_AGENTS_PER_PARENT
 from core.exceptions import AgentError
 from core.interfaces import BaseTool, KnowledgeGraph, YamiInterface
 from core.models import (
+    AgentConstraints,
     AgentResult,
+    AgentSpec,
     AgentTask,
     AgentTemplate,
     AgentTurn,
@@ -56,7 +58,8 @@ class BaseAgentImpl:
         self,
         *,
         agent_id: str | None = None,
-        template: AgentTemplate,
+        template: AgentTemplate | None = None,
+        spec: AgentSpec | None = None,
         llm: Any,  # LLMClient
         kg: KnowledgeGraph,
         yami: YamiInterface | None = None,
@@ -66,9 +69,12 @@ class BaseAgentImpl:
         depth: int = 0,
         trajectory_collector: Any | None = None,  # rl.TrajectoryCollector
     ) -> None:
+        if template is None and spec is None:
+            raise ValueError("Either template or spec must be provided")
+
         self.agent_id = agent_id or str(uuid.uuid4())
         self.template = template
-        self.agent_type = template.agent_type
+        self.spec = spec
         self.llm = llm
         self.kg = kg
         self.yami = yami
@@ -76,9 +82,16 @@ class BaseAgentImpl:
         self.audit = audit_logger or AuditLogger("agents")
         self._know_how_retriever = KnowHowRetriever()
         self._current_know_how: str = ""
-        self.parent_agent_id = parent_agent_id
+        self.parent_agent_id = parent_agent_id or (spec.parent_agent_id if spec else None)
         self.depth = depth
         self.trajectory_collector = trajectory_collector
+
+        # Resolve agent_type: spec hint → template type → class default
+        if spec and spec.agent_type_hint:
+            self.agent_type = spec.agent_type_hint
+        elif template:
+            self.agent_type = template.agent_type
+        # else: keep class-level default
 
         # Tracking state during execution
         self._nodes_added: list[KGNode] = []
@@ -90,6 +103,58 @@ class BaseAgentImpl:
         self._errors: list[str] = []
         self._sub_agent_results: list[AgentResult] = []
         self._sub_agents_spawned: int = 0
+
+    # ------------------------------------------------------------------
+    # Spec/template accessors — unified resolution
+    # ------------------------------------------------------------------
+
+    @property
+    def effective_system_prompt(self) -> str:
+        """Return system prompt: spec override → template → empty."""
+        if self.spec and self.spec.system_prompt:
+            return self.spec.system_prompt
+        if self.template:
+            return self.template.system_prompt
+        return ""
+
+    @property
+    def effective_kg_write_permissions(self) -> list:
+        """Return KG write permissions: spec override → template → all types."""
+        if self.spec and self.spec.kg_write_permissions:
+            return self.spec.kg_write_permissions
+        if self.template:
+            return self.template.kg_write_permissions
+        return list(NodeType)
+
+    @property
+    def effective_kg_edge_permissions(self) -> list:
+        """Return KG edge permissions: spec override → template → all types."""
+        if self.spec and self.spec.kg_edge_permissions:
+            return self.spec.kg_edge_permissions
+        if self.template:
+            return self.template.kg_edge_permissions
+        return list(EdgeRelationType)
+
+    @property
+    def effective_falsification_protocol(self) -> str:
+        """Return falsification protocol: spec override → template → empty."""
+        if self.spec and self.spec.falsification_protocol:
+            return self.spec.falsification_protocol
+        if self.template:
+            return self.template.falsification_protocol
+        return ""
+
+    @property
+    def effective_constraints(self) -> AgentConstraints:
+        """Return agent constraints from spec, or defaults derived from template."""
+        if self.spec:
+            return self.spec.constraints
+        if self.template:
+            return AgentConstraints(
+                max_turns=self.template.max_iterations * 2,
+                timeout_seconds=self.template.timeout_seconds,
+            )
+        return AgentConstraints()
 
     # ------------------------------------------------------------------
     # Main execute loop (template method)
@@ -163,7 +228,7 @@ class BaseAgentImpl:
 
             # 4. Self-falsification
             falsification_results: list[FalsificationResult] = []
-            if self._edges_added and self.template.falsification_protocol:
+            if self._edges_added and self.effective_falsification_protocol:
                 try:
                     falsification_results = await self.falsify(self._edges_added)
                 except Exception as exc:
@@ -271,7 +336,16 @@ class BaseAgentImpl:
         - ``summary``: str
         - ``reasoning_trace``: str
         - ``recommended_next``: str | None
+
+        When running from an AgentSpec (no subclass), the base implementation
+        runs the multi-turn loop using the spec's role and instructions.
         """
+        if self.spec is not None:
+            return await self._multi_turn_investigate(
+                task,
+                kg_context,
+                investigation_focus="",  # spec role/instructions injected automatically
+            )
         raise NotImplementedError("Subclasses must implement _investigate()")
 
     # ------------------------------------------------------------------
@@ -317,7 +391,7 @@ class BaseAgentImpl:
         max_tokens: int | None = None,
     ) -> str:
         """Wraps LLM call with system prompt, KG injection, know-how, audit, and token tracking."""
-        sys_prompt = system_prompt or self.template.system_prompt
+        sys_prompt = system_prompt or self.effective_system_prompt
         # Inject domain know-how if retrieved for this execution
         if self._current_know_how:
             sys_prompt = sys_prompt + "\n\n" + self._current_know_how
@@ -783,21 +857,34 @@ class BaseAgentImpl:
         task: AgentTask,
         kg_context: dict[str, Any],
         *,
-        max_turns: int = 20,
+        max_turns: int | None = None,
         investigation_focus: str = "",
     ) -> dict[str, Any]:
         """Multi-turn investigation loop: Plan → Generate → Execute → Observe → Repeat.
 
         Agents call this from their ``_investigate()`` override, passing
         an ``investigation_focus`` string that steers the LLM.
+
+        Turn budget resolution: explicit ``max_turns`` arg → spec constraints →
+        default (20).
         """
+        # Resolve turn budget from spec constraints, then fallback to default
+        constraints = self.effective_constraints
+        if max_turns is None:
+            max_turns = constraints.max_turns
+
         turns: list[AgentTurn] = []
         observations: list[str] = []
 
         tool_descriptions = self._build_tool_descriptions()
 
-        allowed_nodes = ", ".join(str(t) for t in self.template.kg_write_permissions)
-        allowed_edges = ", ".join(str(t) for t in self.template.kg_edge_permissions)
+        allowed_nodes = ", ".join(str(t) for t in self.effective_kg_write_permissions)
+        allowed_edges = ", ".join(str(t) for t in self.effective_kg_edge_permissions)
+
+        # Inject spec role/instructions into the investigation focus if from a spec
+        if self.spec:
+            spec_prefix = f"Agent role: {self.spec.role}\nAgent instructions: {self.spec.instructions}\n\n"
+            investigation_focus = spec_prefix + (investigation_focus or "")
 
         # ---- Phase 1: Planning ----
         plan_prompt = (
@@ -870,6 +957,16 @@ class BaseAgentImpl:
                 "If you have gathered enough information, provide your <answer>."
                 + urgency
             )
+
+            # Check token budget before making another LLM call
+            if constraints.token_budget and self._llm_tokens >= constraints.token_budget:
+                logger.info(
+                    "token_budget_exhausted",
+                    agent_id=self.agent_id,
+                    tokens_used=self._llm_tokens,
+                    budget=constraints.token_budget,
+                )
+                break
 
             start_ms = int(time.monotonic() * 1000)
             # Use higher token limit for later turns where answer is expected
@@ -1204,6 +1301,7 @@ class BaseAgentImpl:
         task_description: str,
         *,
         agent_type: AgentType | None = None,
+        spec: AgentSpec | None = None,
         tool_names: list[str] | None = None,
         hypothesis_branch: str | None = None,
     ) -> AgentResult:
@@ -1216,6 +1314,8 @@ class BaseAgentImpl:
         Args:
             task_description: What the sub-agent should investigate.
             agent_type: Optional agent type override. Defaults to parent's type.
+            spec: Optional AgentSpec for dynamic orchestration. When provided,
+                the sub-agent uses the spec instead of a static template.
             tool_names: Optional specific tool list. Defaults to parent's tools.
             hypothesis_branch: Optional override. Defaults to current task branch.
 
@@ -1243,37 +1343,52 @@ class BaseAgentImpl:
                 },
             )
 
-        # Resolve agent type and template
-        resolved_type = agent_type or self.agent_type
-        from agents.templates import get_template
-        child_template = get_template(resolved_type)
-
         # Resolve tools: use specified subset, or inherit parent's tools
         if tool_names is not None:
             child_tools = {n: t for n, t in self.tools.items() if n in tool_names}
         else:
             child_tools = dict(self.tools)
 
-        # Create the sub-agent (same concrete class if same type, else base)
-        child_agent = self.__class__(
-            template=child_template,
-            llm=self.llm,
-            kg=self.kg,
-            yami=self.yami,
-            tools=child_tools,
-            audit_logger=self.audit,
-            parent_agent_id=self.agent_id,
-            depth=child_depth,
-        ) if resolved_type == self.agent_type else BaseAgentImpl(
-            template=child_template,
-            llm=self.llm,
-            kg=self.kg,
-            yami=self.yami,
-            tools=child_tools,
-            audit_logger=self.audit,
-            parent_agent_id=self.agent_id,
-            depth=child_depth,
-        )
+        if spec is not None:
+            # Dynamic: create base agent from spec
+            spec.parent_agent_id = self.agent_id
+            child_agent = BaseAgentImpl(
+                spec=spec,
+                llm=self.llm,
+                kg=self.kg,
+                yami=self.yami,
+                tools=child_tools,
+                audit_logger=self.audit,
+                parent_agent_id=self.agent_id,
+                depth=child_depth,
+            )
+            resolved_type = spec.agent_type_hint or self.agent_type
+        else:
+            # Static: resolve agent type and template
+            resolved_type = agent_type or self.agent_type
+            from agents.templates import get_template
+            child_template = get_template(resolved_type)
+
+            # Create the sub-agent (same concrete class if same type, else base)
+            child_agent = self.__class__(
+                template=child_template,
+                llm=self.llm,
+                kg=self.kg,
+                yami=self.yami,
+                tools=child_tools,
+                audit_logger=self.audit,
+                parent_agent_id=self.agent_id,
+                depth=child_depth,
+            ) if resolved_type == self.agent_type else BaseAgentImpl(
+                template=child_template,
+                llm=self.llm,
+                kg=self.kg,
+                yami=self.yami,
+                tools=child_tools,
+                audit_logger=self.audit,
+                parent_agent_id=self.agent_id,
+                depth=child_depth,
+            )
 
         # Build a task for the sub-agent
         child_task = AgentTask(
