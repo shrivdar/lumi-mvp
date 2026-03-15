@@ -18,7 +18,7 @@ import structlog
 
 from core.audit import AuditLogger, Timer, set_request_context
 from core.constants import MAX_SUB_AGENT_DEPTH, MAX_SUB_AGENTS_PER_PARENT
-from core.exceptions import AgentError
+from core.exceptions import AgentError, TokenBudgetExceededError
 from core.interfaces import BaseTool, KnowledgeGraph, YamiInterface
 from core.models import (
     AgentConstraints,
@@ -274,6 +274,39 @@ class BaseAgentImpl:
                 turns=investigation.get("turns", []),
                 success=True,
                 errors=self._errors,
+            )
+            self._record_trajectory(task, result)
+            return result
+
+        except TokenBudgetExceededError as exc:
+            # Hard kill — return partial results, agent is terminated
+            duration_ms = int(time.monotonic() * 1000) - start_ms
+            self.audit.log(
+                "agent_token_budget_hard_kill",
+                agent_id=self.agent_id,
+                task_id=task.task_id,
+                tokens_used=self._llm_tokens,
+                budget=exc.details.get("budget", 0),
+            )
+            result = AgentResult(
+                task_id=task.task_id,
+                agent_id=self.agent_id,
+                agent_type=self.agent_type,
+                hypothesis_id=task.hypothesis_branch or "",
+                parent_agent_id=self.parent_agent_id,
+                depth=self.depth,
+                nodes_added=self._nodes_added,
+                edges_added=self._edges_added,
+                nodes_updated=self._nodes_updated,
+                edges_updated=self._edges_updated,
+                uncertainty=self.get_uncertainty(),
+                summary=f"Agent killed: token budget exceeded ({self._llm_tokens} tokens used)",
+                sub_agent_results=self._sub_agent_results,
+                duration_ms=duration_ms,
+                llm_calls=self._llm_calls,
+                llm_tokens_used=self._llm_tokens,
+                success=False,
+                errors=[*self._errors, f"TOKEN_BUDGET_HARD_KILL: {exc}"],
             )
             self._record_trajectory(task, result)
             return result
@@ -1027,15 +1060,18 @@ class BaseAgentImpl:
                 + urgency
             )
 
-            # Check token budget before making another LLM call
+            # Hard kill: token budget exceeded — raise immediately
             if constraints.token_budget and self._llm_tokens >= constraints.token_budget:
-                logger.info(
-                    "token_budget_exhausted",
-                    agent_id=self.agent_id,
-                    tokens_used=self._llm_tokens,
-                    budget=constraints.token_budget,
+                raise TokenBudgetExceededError(
+                    f"Agent {self.agent_id} token budget hard kill: "
+                    f"{self._llm_tokens}/{constraints.token_budget}",
+                    error_code="TOKEN_BUDGET_HARD_KILL",
+                    details={
+                        "agent_id": self.agent_id,
+                        "tokens_used": self._llm_tokens,
+                        "budget": constraints.token_budget,
+                    },
                 )
-                break
 
             start_ms = int(time.monotonic() * 1000)
             # Use higher token limit for later turns where answer is expected

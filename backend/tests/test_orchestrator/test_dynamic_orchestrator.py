@@ -110,17 +110,14 @@ class TestComposeSwarmSpecs:
 
     @pytest.mark.asyncio
     async def test_compose_specs_fallback_on_llm_failure(self, sample_hypothesis, tool_entries):
-        """Falls back to static compose_swarm when LLM fails."""
-        # First call for compose_swarm_specs fails, second for fallback compose_swarm
+        """Falls back to heuristic spec generation when LLM fails."""
         llm = MockLLMClient(responses=[
-            "invalid json!@#",  # compose_swarm_specs fails
-            '["literature_analyst", "protein_engineer"]',  # compose_swarm fallback
-            '{"literature_analyst": "Search for lit", "protein_engineer": "Analyze proteins"}',  # tasks
+            "invalid json!@#",  # compose_swarm_specs fails — triggers heuristic fallback
         ])
         composer = SwarmComposer(
             llm=llm, tool_registry_entries=tool_entries, session_id="test",
         )
-        config = ResearchConfig(max_agents_per_swarm=5)
+        config = ResearchConfig(max_agents_per_swarm=15)
 
         specs = await composer.compose_swarm_specs("test query", sample_hypothesis, config)
 
@@ -343,9 +340,9 @@ class TestSynthesizeBenchmarkAnswer:
 class TestResearchConfigDefaults:
     def test_scale_constants(self):
         config = ResearchConfig()
-        assert config.max_concurrent_agents == 50
+        assert config.max_concurrent_agents == 100
         assert config.max_total_agents == 10_000
-        assert config.max_hypothesis_breadth == 30
+        assert config.max_hypothesis_breadth == 50
         assert config.max_hypothesis_depth == 5
 
     def test_agent_token_budget(self):

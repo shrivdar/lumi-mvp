@@ -17,7 +17,6 @@ from core.models import (
     EdgeRelationType,
     EvidenceSource,
     EvidenceSourceType,
-    FalsificationResult,
     KGEdge,
     KGNode,
     NodeType,
@@ -29,7 +28,6 @@ from core.models import (
 )
 from orchestrator.research_loop import ResearchOrchestrator
 from world_model.knowledge_graph import InMemoryKnowledgeGraph
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,11 +70,11 @@ def _make_agent_result(
 class MockToolAgent:
     """Mock agent that records which tools were passed to it."""
 
-    def __init__(self, agent_type, llm, kg, yami=None, tools=None, **kwargs):
+    def __init__(self, agent_type=None, llm=None, kg=None, yami=None, tools=None, spec=None, **kwargs):
         self.agent_id = "mock-agent-001"
-        self.agent_type = agent_type
+        self.agent_type = agent_type or (spec.agent_type_hint if spec else AgentType.LITERATURE_ANALYST)
         self._tools = tools or {}
-        self._result = _make_agent_result(agent_type)
+        self._result = _make_agent_result(self.agent_type)
 
     async def execute(self, task):
         task.status = "completed"
@@ -93,8 +91,21 @@ def _make_mock_llm() -> MagicMock:
                 {"hypothesis": "EGFR pathway involved", "rationale": "Common in NSCLC"},
                 {"hypothesis": "Immune evasion via B7-H3", "rationale": "Immune checkpoint"}
             ]"""
-        if "agent_type" in prompt.lower() or "swarm" in prompt.lower():
-            return '["literature_analyst", "genomics_mapper", "scientific_critic"]'
+        if "composing an agent swarm" in system_prompt.lower() or "agent spec" in prompt.lower():
+            return __import__("json").dumps([
+                {
+                    "role": "Literature analyst for hypothesis investigation",
+                    "instructions": "Search PubMed for relevant literature on this hypothesis.",
+                    "tools": ["pubmed", "semantic_scholar"],
+                    "agent_type_hint": "literature_analyst",
+                },
+                {
+                    "role": "Genomics mapper for pathway analysis",
+                    "instructions": "Map genes to pathways relevant to the hypothesis.",
+                    "tools": ["pubmed"],
+                    "agent_type_hint": "genomics_mapper",
+                },
+            ])
         if "instruction" in prompt.lower() or "investigation" in prompt.lower():
             return '{"literature_analyst": "Search for BRCA1 in NSCLC", "genomics_mapper": "Map gene pathways", "scientific_critic": "Verify claims"}'
         if "select" in prompt.lower() and "tool" in prompt.lower():
@@ -161,20 +172,20 @@ class TestToolWiring:
 
     @pytest.mark.asyncio
     async def test_agents_receive_tools(self) -> None:
-        """Agent factory is called with tools dict from dynamic selection."""
+        """Spec factory is called with tools dict from dynamic selection."""
         llm = _make_mock_llm()
         kg = InMemoryKnowledgeGraph(graph_id="test-wiring")
         tool_instances = _make_tool_instances()
         tools_received: list[dict] = []
 
-        def tracking_factory(agent_type, llm, kg, yami=None, tools=None, **kwargs):
+        def tracking_spec_factory(spec, llm, kg, yami=None, tools=None, **kwargs):
             tools_received.append(dict(tools) if tools else {})
-            return MockToolAgent(agent_type, llm, kg, tools=tools)
+            return MockToolAgent(spec=spec, llm=llm, kg=kg, tools=tools)
 
         orch = ResearchOrchestrator(
             llm=llm,
             kg=kg,
-            agent_factory=tracking_factory,
+            spec_factory=tracking_spec_factory,
             tool_entries=_make_tool_entries(),
             tool_instances=tool_instances,
         )
@@ -201,14 +212,14 @@ class TestToolWiring:
         tool_instances = {"python_repl": repl}
         tools_received: list[dict] = []
 
-        def tracking_factory(agent_type, llm, kg, yami=None, tools=None, **kwargs):
+        def tracking_spec_factory(spec, llm, kg, yami=None, tools=None, **kwargs):
             tools_received.append(dict(tools) if tools else {})
-            return MockToolAgent(agent_type, llm, kg, tools=tools)
+            return MockToolAgent(spec=spec, llm=llm, kg=kg, tools=tools)
 
         orch = ResearchOrchestrator(
             llm=llm,
             kg=kg,
-            agent_factory=tracking_factory,
+            spec_factory=tracking_spec_factory,
             tool_instances=tool_instances,
         )
 
@@ -323,15 +334,15 @@ class TestFullStackIntegration:
         tool_instances = _make_tool_instances()
         agents_created: list[MockToolAgent] = []
 
-        def tracking_factory(agent_type, llm, kg, yami=None, tools=None, **kwargs):
-            agent = MockToolAgent(agent_type, llm, kg, tools=tools)
+        def tracking_spec_factory(spec, llm, kg, yami=None, tools=None, **kwargs):
+            agent = MockToolAgent(spec=spec, llm=llm, kg=kg, tools=tools)
             agents_created.append(agent)
             return agent
 
         orch = ResearchOrchestrator(
             llm=llm,
             kg=kg,
-            agent_factory=tracking_factory,
+            spec_factory=tracking_spec_factory,
             tool_entries=_make_tool_entries(),
             tool_instances=tool_instances,
         )

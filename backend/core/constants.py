@@ -81,14 +81,14 @@ KG_SNAPSHOT_INTERVAL_SECONDS = 300  # auto-persist every 5 min
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_AGENTS_PER_SWARM = 8
 DEFAULT_MAX_LLM_CALLS_PER_AGENT = 20
-DEFAULT_SESSION_TIMEOUT_S = 1_800  # 30 min
+DEFAULT_SESSION_TIMEOUT_S = 7_200  # 2 h
 DEFAULT_MIN_EVIDENCE_FOR_CONFIDENCE = 3
 
 # ---------------------------------------------------------------------------
 # Sub-agent spawning limits
 # ---------------------------------------------------------------------------
-MAX_SUB_AGENT_DEPTH = 3
-MAX_SUB_AGENTS_PER_PARENT = 5
+MAX_SUB_AGENT_DEPTH = 5
+MAX_SUB_AGENTS_PER_PARENT = 10
 
 # ---------------------------------------------------------------------------
 # Evidence quality thresholds

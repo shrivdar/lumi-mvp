@@ -427,9 +427,9 @@ class TestMultiTurnLoop:
         agent._investigate = budget_investigate
         result = await agent.execute(sample_task)
 
-        assert result.success is True
-        # Should stop early — plan (turn 0) + 1 execution turn that triggers budget
-        assert len(result.turns) <= 4
+        # Hard kill: token budget exceeded → success=False
+        assert result.success is False
+        assert any("TOKEN_BUDGET_HARD_KILL" in e for e in result.errors)
 
     @pytest.mark.asyncio
     async def test_observation_compression(self, agent_kg):

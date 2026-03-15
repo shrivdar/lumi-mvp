@@ -49,5 +49,9 @@ class LLMError(YOHASError):
     """Raised when an LLM call fails."""
 
 
+class TokenBudgetExceededError(AgentError):
+    """Raised when an agent exceeds its allocated token budget (hard kill)."""
+
+
 class MCPError(YOHASError):
     """Raised when an MCP server connection or tool call fails."""
