@@ -19,32 +19,25 @@ class TestScientificCritic:
     async def test_critic_lowers_weak_edge_confidence(self, seeded_kg, mock_tools):
         """Critic should lower confidence when counter-evidence is found."""
         llm = MockLLMClient(responses=[
-            # Disproof for edge e-brca1-bc (weak, 0.4 confidence)
-            json.dumps({
-                "disproof_criteria": "Show BRCA1 is not linked to breast cancer",
-                "search_queries": ["BRCA1 NOT associated breast cancer"],
-                "prior_wrong_probability": 0.3,
-            }),
-            # Assessment of counter-evidence
-            json.dumps({
-                "refutes": True,
-                "strength": "moderate",
-                "reasoning": "Papers suggest weak association",
-                "confidence_adjustment": -0.1,
-            }),
-            # Disproof for edge e-tp53-bc (strong, 0.9 confidence)
-            json.dumps({
-                "disproof_criteria": "Show TP53 is not a tumor suppressor",
-                "search_queries": ["TP53 NOT tumor suppressor"],
-                "prior_wrong_probability": 0.05,
-            }),
-            # Assessment
-            json.dumps({
-                "refutes": False,
-                "strength": "irrelevant",
-                "reasoning": "Counter-evidence is about different context",
-                "confidence_adjustment": 0.01,
-            }),
+            # Plan
+            "<think>1. Get recent edges\n2. Get weak edges\n"
+            "3. Search for counter-evidence\n4. Update confidence</think>",
+            # Get recent edges
+            '<tool>kg_get_recent_edges:{"n": 20}</tool>',
+            # Get weakest edges
+            '<tool>kg_get_weakest_edges:{"n": 10}</tool>',
+            # Search for counter-evidence for weak edge
+            '<tool>pubmed:{"action": "search", "query": "BRCA1 NOT breast cancer"}</tool>',
+            # Update confidence for the weak edge
+            '<tool>kg_update_edge_confidence:'
+            '{"edge_id": "e-brca1-bc", "confidence": 0.3, '
+            '"reason": "Counter-evidence found"}</tool>',
+            # Answer
+            '<answer>' + json.dumps({
+                "entities": [],
+                "relationships": [],
+                "summary": "Evaluated edges. Lowered confidence on BRCA1-BC edge.",
+            }) + '</answer>',
         ])
 
         template = get_template(AgentType.SCIENTIFIC_CRITIC)
@@ -62,16 +55,13 @@ class TestScientificCritic:
 
         # Record original confidences
         weak_edge = seeded_kg.get_edge("e-brca1-bc")
-        strong_edge = seeded_kg.get_edge("e-tp53-bc")
         assert weak_edge is not None
-        assert strong_edge is not None
         original_weak = weak_edge.confidence.overall
-        original_strong = strong_edge.confidence.overall
 
         result = await agent.execute(task)
 
         assert result.success is True
-        # Critic should have evaluated edges
+        # Critic should have updated edges via kg_update_edge_confidence tool
         assert len(result.edges_updated) > 0
 
         # Weak edge confidence should have changed
@@ -83,28 +73,30 @@ class TestScientificCritic:
     async def test_critic_only_adds_evidence_against_edges(self, seeded_kg, mock_tools):
         """Critic must not add new biological claims — only EVIDENCE_AGAINST."""
         llm = MockLLMClient(responses=[
-            json.dumps({
-                "disproof_criteria": "test",
-                "search_queries": ["test query"],
-                "prior_wrong_probability": 0.5,
-            }),
-            json.dumps({
-                "refutes": True,
-                "strength": "strong",
-                "reasoning": "Strong refutation",
-                "confidence_adjustment": -0.2,
-            }),
-            json.dumps({
-                "disproof_criteria": "test2",
-                "search_queries": ["test query 2"],
-                "prior_wrong_probability": 0.1,
-            }),
-            json.dumps({
-                "refutes": False,
-                "strength": "irrelevant",
-                "reasoning": "Not relevant",
-                "confidence_adjustment": 0.01,
-            }),
+            # Plan
+            "<think>Evaluate edges for validity</think>",
+            # Get edges
+            '<tool>kg_get_recent_edges:{"n": 20}</tool>',
+            # Search counter-evidence
+            '<tool>pubmed:{"action": "search", "query": "BRCA1 disprove"}</tool>',
+            # Update confidence
+            '<tool>kg_update_edge_confidence:'
+            '{"edge_id": "e-brca1-bc", "confidence": 0.2, '
+            '"reason": "Strong refutation"}</tool>',
+            # Answer with PUBLICATION node and EVIDENCE_AGAINST edge
+            '<answer>' + json.dumps({
+                "entities": [
+                    {"name": "Counter-evidence: BRCA1 reassessment", "type": "PUBLICATION",
+                     "description": "Paper reassessing BRCA1 association",
+                     "evidence_source": "PUBMED", "evidence_id": "PMID:99999999"},
+                ],
+                "relationships": [
+                    {"source": "Counter-evidence: BRCA1 reassessment", "target": "Breast Cancer",
+                     "relation": "EVIDENCE_AGAINST", "confidence": 0.6,
+                     "claim": "Weak BRCA1 association", "evidence_source": "PUBMED"},
+                ],
+                "summary": "Evaluated edges. Found counter-evidence for BRCA1-BC link.",
+            }) + '</answer>',
         ])
 
         template = get_template(AgentType.SCIENTIFIC_CRITIC)
@@ -133,7 +125,21 @@ class TestScientificCritic:
     @pytest.mark.asyncio
     async def test_critic_handles_empty_kg(self, agent_kg, mock_tools):
         """Critic should handle empty KG gracefully."""
-        llm = MockLLMClient()
+        llm = MockLLMClient(responses=[
+            # Plan
+            "<think>Get edges to evaluate</think>",
+            # Get recent edges — will return empty
+            '<tool>kg_get_recent_edges:{"n": 20}</tool>',
+            # Get weakest edges — will return empty
+            '<tool>kg_get_weakest_edges:{"n": 10}</tool>',
+            # Answer with empty findings
+            '<answer>' + json.dumps({
+                "entities": [],
+                "relationships": [],
+                "summary": "No edges to evaluate — knowledge graph is empty.",
+            }) + '</answer>',
+        ])
+
         template = get_template(AgentType.SCIENTIFIC_CRITIC)
         task = AgentTask(
             task_id="task-critic-003",

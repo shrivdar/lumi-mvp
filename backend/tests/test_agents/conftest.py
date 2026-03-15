@@ -8,8 +8,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agents.base import BaseAgentImpl
-from agents.templates import get_template
 from core.models import (
     AgentTask,
     AgentType,
@@ -22,7 +20,6 @@ from core.models import (
     NodeType,
 )
 from world_model.knowledge_graph import InMemoryKnowledgeGraph
-
 
 # ---------------------------------------------------------------------------
 # Mock LLMClient
