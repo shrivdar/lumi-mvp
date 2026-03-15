@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     # ── MCP Server Config ───────────────────────────
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
     mcp_auto_discover: bool = True
+    mcp_health_check_interval: int = 60  # seconds between health checks, 0 to disable
+    mcp_rate_limit_rps: float = 5.0
+    mcp_request_timeout: int = 30
+    mcp_max_retries: int = 3
 
     # ── Container Runtime ───────────────────────────
     container_runtime: str = "docker"  # "docker" or "podman"

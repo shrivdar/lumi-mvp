@@ -1,55 +1,225 @@
-# MCP tool server overlay
+# MCP tool server overlay — 11 category servers covering 150+ biomedical tools
 # Usage: docker compose -f docker-compose.yml -f docker-compose.mcp.yml up
 #
-# Add new MCP tool servers by copying the mcp-pubmed/mcp-uniprot examples below.
-# Each tool server runs as its own container on the shared yohas network.
+# Each MCP server runs as its own container on the shared yohas network.
+# All servers use Dockerfile.mcp-server with a SERVER_DIR build arg.
+
+x-mcp-common: &mcp-common
+  restart: unless-stopped
+  networks:
+    - yohas
+  depends_on:
+    - mcp-gateway
+  healthcheck:
+    test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 15s
+
+x-mcp-build: &mcp-build
+  context: ./infra/mcp
+  dockerfile: Dockerfile.mcp-server
 
 services:
-  mcp-pubmed:
+  # ═══════════════════════════════════════════════════════════════════
+  # 1. Genomics MCP Server (~13 tools)
+  #    NCBI Gene/dbSNP/ClinVar/SRA/Taxonomy, Ensembl, UCSC, gnomAD
+  # ═══════════════════════════════════════════════════════════════════
+  mcp-genomics:
+    <<: *mcp-common
     build:
-      context: ./infra/mcp/tool-template
-      dockerfile: Dockerfile
+      <<: *mcp-build
+      args:
+        SERVER_DIR: servers/genomics
     environment:
-      MCP_TOOL_NAME: pubmed
+      MCP_TOOL_NAME: genomics
+      MCP_TOOL_PORT: "8080"
+      MCP_RATE_LIMIT_RPS: "5"
+      NCBI_API_KEY: "${NCBI_API_KEY:-}"
+    volumes:
+      - mcp-genomics-data:/tool/data
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 2. Cancer Genomics MCP Server (~10 tools)
+  #    cBioPortal, COSMIC, DepMap, LINCS L1000
+  # ═══════════════════════════════════════════════════════════════════
+  mcp-cancer-genomics:
+    <<: *mcp-common
+    build:
+      <<: *mcp-build
+      args:
+        SERVER_DIR: servers/cancer-genomics
+    environment:
+      MCP_TOOL_NAME: cancer-genomics
+      MCP_TOOL_PORT: "8080"
+      COSMIC_API_KEY: "${COSMIC_API_KEY:-}"
+    volumes:
+      - mcp-cancer-genomics-data:/tool/data
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 3. Drug Discovery MCP Server (~11 tools)
+  #    PubChem, BindingDB, DDInter, OpenFDA, DailyMed, UniChem
+  # ═══════════════════════════════════════════════════════════════════
+  mcp-drug-discovery:
+    <<: *mcp-common
+    build:
+      <<: *mcp-build
+      args:
+        SERVER_DIR: servers/drug-discovery
+    environment:
+      MCP_TOOL_NAME: drug-discovery
+      MCP_TOOL_PORT: "8080"
+      MCP_RATE_LIMIT_RPS: "3"
+    volumes:
+      - mcp-drug-discovery-data:/tool/data
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 4. Protein Structure MCP Server (~10 tools)
+  #    RCSB PDB, AlphaFold DB, InterPro, EMDB, Foldseek
+  # ═══════════════════════════════════════════════════════════════════
+  mcp-protein-structure:
+    <<: *mcp-common
+    build:
+      <<: *mcp-build
+      args:
+        SERVER_DIR: servers/protein-structure
+    environment:
+      MCP_TOOL_NAME: protein-structure
+      MCP_TOOL_PORT: "8080"
+    volumes:
+      - mcp-protein-structure-data:/tool/data
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 5. Gene Expression MCP Server (~10 tools)
+  #    GEO, GTEx, Human Protein Atlas, GeneBass, RummaGEO
+  # ═══════════════════════════════════════════════════════════════════
+  mcp-gene-expression:
+    <<: *mcp-common
+    build:
+      <<: *mcp-build
+      args:
+        SERVER_DIR: servers/gene-expression
+    environment:
+      MCP_TOOL_NAME: gene-expression
       MCP_TOOL_PORT: "8080"
       NCBI_API_KEY: "${NCBI_API_KEY:-}"
     volumes:
-      - mcp-pubmed-data:/tool/data
-    networks:
-      - yohas
-    depends_on:
-      - mcp-gateway
+      - mcp-gene-expression-data:/tool/data
 
-  mcp-uniprot:
+  # ═══════════════════════════════════════════════════════════════════
+  # 6. Single Cell MCP Server (~10 tools)
+  #    CZ CELLxGENE, Human Cell Atlas, CellMarker, PanglaoDB
+  # ═══════════════════════════════════════════════════════════════════
+  mcp-single-cell:
+    <<: *mcp-common
     build:
-      context: ./infra/mcp/tool-template
-      dockerfile: Dockerfile
+      <<: *mcp-build
+      args:
+        SERVER_DIR: servers/single-cell
     environment:
-      MCP_TOOL_NAME: uniprot
+      MCP_TOOL_NAME: single-cell
       MCP_TOOL_PORT: "8080"
     volumes:
-      - mcp-uniprot-data:/tool/data
-    networks:
-      - yohas
-    depends_on:
-      - mcp-gateway
+      - mcp-single-cell-data:/tool/data
 
-  mcp-semantic-scholar:
+  # ═══════════════════════════════════════════════════════════════════
+  # 7. Regulatory / Epigenomics MCP Server (~10 tools)
+  #    ENCODE, SCREEN, JASPAR, ReMap, miRTarBase, miRDB
+  # ═══════════════════════════════════════════════════════════════════
+  mcp-regulatory-epigenomics:
+    <<: *mcp-common
     build:
-      context: ./infra/mcp/tool-template
-      dockerfile: Dockerfile
+      <<: *mcp-build
+      args:
+        SERVER_DIR: servers/regulatory-epigenomics
     environment:
-      MCP_TOOL_NAME: semantic-scholar
+      MCP_TOOL_NAME: regulatory-epigenomics
       MCP_TOOL_PORT: "8080"
-      S2_API_KEY: "${S2_API_KEY:-}"
     volumes:
-      - mcp-s2-data:/tool/data
-    networks:
-      - yohas
-    depends_on:
-      - mcp-gateway
+      - mcp-regulatory-epigenomics-data:/tool/data
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 8. Pathway / Network MCP Server (~11 tools)
+  #    STRING, BioGRID, QuickGO, MSigDB, Reactome analysis
+  # ═══════════════════════════════════════════════════════════════════
+  mcp-pathway-network:
+    <<: *mcp-common
+    build:
+      <<: *mcp-build
+      args:
+        SERVER_DIR: servers/pathway-network
+    environment:
+      MCP_TOOL_NAME: pathway-network
+      MCP_TOOL_PORT: "8080"
+      BIOGRID_API_KEY: "${BIOGRID_API_KEY:-}"
+    volumes:
+      - mcp-pathway-network-data:/tool/data
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 9. Disease / Phenotype MCP Server (~12 tools)
+  #    Open Targets, DisGeNET, Monarch, HPO, OMIM, ClinPGx
+  # ═══════════════════════════════════════════════════════════════════
+  mcp-disease-phenotype:
+    <<: *mcp-common
+    build:
+      <<: *mcp-build
+      args:
+        SERVER_DIR: servers/disease-phenotype
+    environment:
+      MCP_TOOL_NAME: disease-phenotype
+      MCP_TOOL_PORT: "8080"
+      DISGENET_API_KEY: "${DISGENET_API_KEY:-}"
+      OMIM_API_KEY: "${OMIM_API_KEY:-}"
+    volumes:
+      - mcp-disease-phenotype-data:/tool/data
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 10. Bioinformatics Tools MCP Server (~10 tools)
+  #     NCBI BLAST, EBI Clustal Omega/MUSCLE/InterProScan/HMMER,
+  #     SWISS-MODEL, AlphaFold
+  # ═══════════════════════════════════════════════════════════════════
+  mcp-bioinformatics-tools:
+    <<: *mcp-common
+    build:
+      <<: *mcp-build
+      args:
+        SERVER_DIR: servers/bioinformatics-tools
+    environment:
+      MCP_TOOL_NAME: bioinformatics-tools
+      MCP_TOOL_PORT: "8080"
+      MCP_REQUEST_TIMEOUT: "120"
+    volumes:
+      - mcp-bioinformatics-data:/tool/data
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 11. Computational Analysis MCP Server (~10 tools)
+  #     RDKit, BioPython, SciPy, PCA — local compute, no external APIs
+  # ═══════════════════════════════════════════════════════════════════
+  mcp-computational-analysis:
+    <<: *mcp-common
+    build:
+      <<: *mcp-build
+      args:
+        SERVER_DIR: servers/computational-analysis
+    environment:
+      MCP_TOOL_NAME: computational-analysis
+      MCP_TOOL_PORT: "8080"
+      MCP_REQUEST_TIMEOUT: "120"
+    mem_limit: 2g
+    cpus: 2.0
+    volumes:
+      - mcp-computational-data:/tool/data
 
 volumes:
-  mcp-pubmed-data:
-  mcp-uniprot-data:
-  mcp-s2-data:
+  mcp-genomics-data:
+  mcp-cancer-genomics-data:
+  mcp-drug-discovery-data:
+  mcp-gene-expression-data:
+  mcp-protein-structure-data:
+  mcp-single-cell-data:
+  mcp-regulatory-epigenomics-data:
+  mcp-pathway-network-data:
+  mcp-disease-phenotype-data:
+  mcp-bioinformatics-data:
+  mcp-computational-data:

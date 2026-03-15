@@ -1,0 +1,40 @@
+# Unified Dockerfile for all MCP servers
+# Build context: ./infra/mcp
+# Usage: docker build -f Dockerfile.mcp-server --build-arg SERVER_DIR=servers/genomics .
+
+ARG SERVER_DIR=servers/genomics
+
+FROM python:3.11-slim
+
+WORKDIR /tool
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r mcp && useradd -r -g mcp -d /tool -s /sbin/nologin mcp
+
+# Install shared dependencies
+COPY shared/requirements.txt /tool/shared-requirements.txt
+RUN pip install --no-cache-dir -r /tool/shared-requirements.txt
+
+# Copy shared module
+COPY shared/ /tool/shared/
+
+# Install server-specific dependencies
+ARG SERVER_DIR
+COPY ${SERVER_DIR}/requirements.txt /tool/requirements.txt
+RUN pip install --no-cache-dir -r /tool/requirements.txt
+
+# Copy server code
+COPY ${SERVER_DIR}/ /tool/
+
+ENV PYTHONPATH=/tool/shared:/tool
+ENV PYTHONUNBUFFERED=1
+
+RUN chown -R mcp:mcp /tool
+USER mcp
+
+EXPOSE 8080
+
+CMD ["python", "server.py"]
