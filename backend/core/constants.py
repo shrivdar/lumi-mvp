@@ -85,6 +85,12 @@ DEFAULT_SESSION_TIMEOUT_S = 1_800  # 30 min
 DEFAULT_MIN_EVIDENCE_FOR_CONFIDENCE = 3
 
 # ---------------------------------------------------------------------------
+# Sub-agent spawning limits
+# ---------------------------------------------------------------------------
+MAX_SUB_AGENT_DEPTH = 3
+MAX_SUB_AGENTS_PER_PARENT = 5
+
+# ---------------------------------------------------------------------------
 # Evidence quality thresholds
 # ---------------------------------------------------------------------------
 EVIDENCE_QUALITY_HIGH = 0.8
