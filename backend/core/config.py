@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     slack_signing_secret: str = ""
     slack_default_channel: str = "yohas-hitl"
 
+    # ── Biosecurity Screening ────────────────────────
+    biosecurity_screening_model: str = "claude-haiku-4-5-20251001"
+
     # ── Research defaults ───────────────────────────
     max_hypothesis_depth: int = 2
     max_mcts_iterations: int = 15
