@@ -39,6 +39,7 @@ from core.models import (
     TurnType,
     UncertaintyVector,
 )
+from integrations.data_lake import data_lake_context
 from know_how.retriever import KnowHowRetriever
 
 logger = structlog.get_logger(__name__)
@@ -395,6 +396,10 @@ class BaseAgentImpl:
         # Inject domain know-how if retrieved for this execution
         if self._current_know_how:
             sys_prompt = sys_prompt + "\n\n" + self._current_know_how
+        # Inject data lake context so agents know what local datasets are available
+        dl_ctx = data_lake_context()
+        if dl_ctx:
+            sys_prompt = sys_prompt + "\n\n" + dl_ctx
 
         self.audit.log(
             "agent_llm_call",
@@ -852,12 +857,55 @@ class BaseAgentImpl:
 
         return "\n".join(descriptions)
 
+    async def _compress_observations(
+        self,
+        observations: list[str],
+        *,
+        keep_recent: int = 10,
+    ) -> list[str]:
+        """Compress older observation history when it grows too large.
+
+        Keeps the last *keep_recent* observations verbatim and summarises
+        the rest into a single compressed block via an LLM call.  This
+        prevents context-window bloat in long-running investigations.
+        """
+        if len(observations) <= keep_recent + 1:
+            return observations
+
+        old_obs = observations[:-keep_recent]
+        recent_obs = observations[-keep_recent:]
+
+        # Estimate token count (~4 chars per token)
+        old_text = "\n\n".join(old_obs)
+        estimated_tokens = len(old_text) // 4
+
+        # Only compress if the old observations are substantial
+        if estimated_tokens < 5_000:
+            return observations
+
+        compress_prompt = (
+            "Summarise the following agent observation history into a concise "
+            "context block.  Preserve key facts, tool results, and findings. "
+            "Drop redundant reasoning and failed attempts.  Keep it under "
+            "2000 characters.\n\n"
+            f"--- OBSERVATIONS ---\n{old_text[:20_000]}\n--- END ---"
+        )
+
+        try:
+            summary = await self.query_llm(compress_prompt, max_tokens=1024)
+            compressed = [f"[COMPRESSED HISTORY — {len(old_obs)} turns]\n{summary}"]
+            return compressed + recent_obs
+        except Exception:
+            # If compression fails, just keep truncated old observations
+            return [f"[HISTORY — {len(old_obs)} earlier turns omitted]"] + recent_obs
+
     async def _multi_turn_investigate(
         self,
         task: AgentTask,
         kg_context: dict[str, Any],
         *,
         max_turns: int | None = None,
+        token_budget: int = 0,
         investigation_focus: str = "",
     ) -> dict[str, Any]:
         """Multi-turn investigation loop: Plan → Generate → Execute → Observe → Repeat.
@@ -867,6 +915,13 @@ class BaseAgentImpl:
 
         Turn budget resolution: explicit ``max_turns`` arg → spec constraints →
         default (20).
+
+        Args:
+            max_turns: Maximum number of turns before forcing an answer.
+                If None, resolved from spec constraints then default (20).
+            token_budget: Per-agent token budget. When exceeded the agent
+                is forced to answer on the next turn. 0 means no limit.
+            investigation_focus: Steering string for the LLM.
         """
         # Resolve turn budget from spec constraints, then fallback to default
         constraints = self.effective_constraints
@@ -914,12 +969,26 @@ class BaseAgentImpl:
 
         # ---- Phase 2: Multi-turn execution loop ----
         for turn_num in range(1, max_turns + 1):
+            # Compress observations if they've grown large
+            if len(observations) > 15:
+                observations = await self._compress_observations(observations)
+
+            # Token budget enforcement — force answer if budget exhausted
+            budget_exhausted = (
+                token_budget > 0 and self._llm_tokens >= token_budget
+            )
+
             obs_text = "\n\n".join(observations[-10:])
 
             # Determine if we should nudge the agent toward answering
             remaining = max_turns - turn_num
             urgency = ""
-            if remaining <= 2:
+            if budget_exhausted:
+                urgency = (
+                    "\n\n⚠️ TOKEN BUDGET EXHAUSTED. "
+                    "Provide your <answer> NOW with whatever information you have gathered."
+                )
+            elif remaining <= 2:
                 urgency = (
                     "\n\n⚠️ You are running low on turns. "
                     "Provide your <answer> NOW with whatever information you have gathered."
@@ -1035,7 +1104,18 @@ class BaseAgentImpl:
                     duration_ms=duration,
                 ))
 
-        # Budget exhausted — compile from observations
+            # If token budget is exhausted and agent didn't answer, force stop
+            if budget_exhausted:
+                self.audit.log(
+                    "agent_token_budget_stop",
+                    agent_id=self.agent_id,
+                    tokens_used=self._llm_tokens,
+                    budget=token_budget,
+                    turn=turn_num,
+                )
+                return self._compile_from_observations(turns, observations, task)
+
+        # Turn budget exhausted — compile from observations
         return self._compile_from_observations(turns, observations, task)
 
     def _compile_answer(

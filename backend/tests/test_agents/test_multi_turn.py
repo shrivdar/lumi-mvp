@@ -397,3 +397,57 @@ class TestMultiTurnLoop:
         # Turn 1 is a tool call, but think content should also be captured
         assert result.turns[1].turn_type == TurnType.TOOL_CALL
         assert len(result.turns) == 3
+
+    @pytest.mark.asyncio
+    async def test_token_budget_stops_agent(self, agent_kg, sample_task):
+        """Agent should stop when token budget is exhausted."""
+        llm = MockLLMClient(responses=[
+            "<think>Planning...</think>",
+            "<think>Thinking turn 1...</think>",
+            "<think>Thinking turn 2...</think>",
+            "<think>Thinking turn 3...</think>",
+            "<think>Thinking turn 4...</think>",
+        ])
+        # Simulate high token usage
+        llm._token_summary = {"total_tokens": 60_000}
+
+        template = get_template(AgentType.LITERATURE_ANALYST)
+        agent = MultiTurnStubAgent(
+            template=template, llm=llm, kg=agent_kg, tools={},
+        )
+
+        async def budget_investigate(task, kg_context):
+            return await agent._multi_turn_investigate(
+                task, kg_context,
+                max_turns=50,
+                token_budget=50_000,
+                investigation_focus="Test",
+            )
+
+        agent._investigate = budget_investigate
+        result = await agent.execute(sample_task)
+
+        assert result.success is True
+        # Should stop early — plan (turn 0) + 1 execution turn that triggers budget
+        assert len(result.turns) <= 4
+
+    @pytest.mark.asyncio
+    async def test_observation_compression(self, agent_kg):
+        """_compress_observations should summarize old turns."""
+        llm = MockLLMClient(responses=[
+            "Compressed summary of earlier observations.",
+        ])
+
+        template = get_template(AgentType.LITERATURE_ANALYST)
+        agent = MultiTurnStubAgent(
+            template=template, llm=llm, kg=agent_kg, tools={},
+        )
+
+        # Build a large observation history (needs >5000 estimated tokens in old part)
+        observations = [f"[TOOL turn {i}] result " + "x" * 2000 for i in range(20)]
+
+        compressed = await agent._compress_observations(observations, keep_recent=5)
+
+        # Should have: 1 compressed block + 5 recent
+        assert len(compressed) <= 6
+        assert "COMPRESSED HISTORY" in compressed[0]

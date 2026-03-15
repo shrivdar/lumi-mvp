@@ -1,9 +1,70 @@
-# Benchmark runner overlay
-# Usage: docker compose -f docker-compose.yml -f docker-compose.benchmark.yml run benchmark
+# Benchmark runner overlay — increased resources and trajectory output mount.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.benchmark.yml up
+#   or:  docker compose -f docker-compose.yml -f docker-compose.benchmark.yml run benchmark
 
 services:
+  api:
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+        reservations:
+          cpus: "2.0"
+          memory: 4G
+    volumes:
+      - ./backend:/app
+      - ./data:/data:ro
+      - ./trajectories:/trajectories
+    environment:
+      YOHAS_TRAJECTORY_DIR: /trajectories
+      YOHAS_BENCHMARK_MODE: "1"
+
+  worker:
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+        reservations:
+          cpus: "2.0"
+          memory: 4G
+    command: celery -A workers.celery_app worker --loglevel=info --concurrency=8
+    volumes:
+      - ./backend:/app
+      - ./data:/data:ro
+      - ./trajectories:/trajectories
+    environment:
+      YOHAS_TRAJECTORY_DIR: /trajectories
+      YOHAS_BENCHMARK_MODE: "1"
+
+  postgres:
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+    command: >
+      postgres
+      -c shared_buffers=1GB
+      -c work_mem=256MB
+      -c max_connections=200
+
+  redis:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru
+
   benchmark-db:
     image: postgres:16-alpine
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
     environment:
       POSTGRES_USER: benchmark
       POSTGRES_PASSWORD: benchmark
@@ -23,15 +84,27 @@ services:
       context: ./backend
       dockerfile: Dockerfile
       target: dev
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+        reservations:
+          cpus: "2.0"
+          memory: 4G
     command: python -m pytest tests/benchmarks/ -v --tb=short
     env_file:
       - .env
     environment:
       DATABASE_URL: "postgresql+asyncpg://benchmark:benchmark@benchmark-db:5432/yohas_benchmark"
       BENCHMARK_OUTPUT_DIR: /results
+      YOHAS_TRAJECTORY_DIR: /trajectories
+      YOHAS_BENCHMARK_MODE: "1"
       ENVIRONMENT: benchmark
     volumes:
       - ./backend:/app
+      - ./data:/data:ro
+      - ./trajectories:/trajectories
       - benchmark-results:/results
     depends_on:
       benchmark-db:
