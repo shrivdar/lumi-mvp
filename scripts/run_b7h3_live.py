@@ -66,8 +66,8 @@ DEFAULT_CONFIG = dict(
     max_agents_per_swarm=3,
     max_concurrent_agents=5,
     confidence_threshold=0.75,
-    session_token_budget=500_000,
-    agent_token_budget=30_000,
+    session_token_budget=2_000_000,
+    agent_token_budget=100_000,
     max_llm_calls_per_agent=15,
     enable_falsification=True,
     enable_hitl=False,  # No human in the loop for automated test
@@ -197,7 +197,7 @@ async def preflight_check() -> bool:
         from integrations.pubmed import PubMedTool
         tool = PubMedTool()
         result = await tool.execute(query="B7-H3 NSCLC", max_results=1)
-        has_results = bool(result.get("results"))
+        has_results = bool(result.get("articles") or result.get("results"))
         print(f"    {'OK' if has_results else 'WARN'} PubMed API")
     except Exception as exc:
         print(f"    WARN PubMed API: {exc} (non-fatal)")
@@ -207,7 +207,7 @@ async def preflight_check() -> bool:
         from integrations.semantic_scholar import SemanticScholarTool
         tool = SemanticScholarTool()
         result = await tool.execute(query="B7-H3 immune checkpoint", max_results=1)
-        has_results = bool(result.get("results"))
+        has_results = bool(result.get("papers") or result.get("results"))
         print(f"    {'OK' if has_results else 'WARN'} Semantic Scholar API")
     except Exception as exc:
         print(f"    WARN Semantic Scholar: {exc} (non-fatal)")

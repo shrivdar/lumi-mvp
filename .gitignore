@@ -49,3 +49,6 @@ results/
 
 # Misc
 *.log
+-e 
+# Live test run outputs
+outputs/

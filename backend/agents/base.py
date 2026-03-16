@@ -440,6 +440,12 @@ class BaseAgentImpl:
             prompt_len=len(prompt),
         )
 
+        # Snapshot session-level token counts BEFORE the call so we can
+        # compute the per-call delta (LLMClient tracks cumulative totals).
+        _tokens_before = 0
+        if hasattr(self.llm, "token_summary"):
+            _tokens_before = self.llm.token_summary.get("total_tokens", 0)
+
         with Timer() as t:
             response = await self.llm.query(
                 prompt,
@@ -451,8 +457,8 @@ class BaseAgentImpl:
 
         self._llm_calls += 1
         if hasattr(self.llm, "token_summary"):
-            summary = self.llm.token_summary
-            self._llm_tokens = summary.get("total_tokens", 0)
+            _tokens_after = self.llm.token_summary.get("total_tokens", 0)
+            self._llm_tokens += _tokens_after - _tokens_before
 
         self.audit.log(
             "agent_llm_result",
