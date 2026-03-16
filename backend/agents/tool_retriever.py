@@ -12,6 +12,7 @@ from typing import Any
 
 import structlog
 
+from core.config import settings
 from core.models import ToolRegistryEntry
 
 logger = structlog.get_logger(__name__)
@@ -262,6 +263,7 @@ class ToolRetriever:
                     "Respond with ONLY a JSON array of tool name strings, ordered by relevance. "
                     "Be precise — only select tools whose capabilities directly match the task."
                 ),
+                model=settings.llm_cheap_model,
             )
             from core.llm import LLMClient
             parsed = LLMClient.parse_json(response)

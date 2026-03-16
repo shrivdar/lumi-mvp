@@ -39,6 +39,7 @@ from core.models import (
     TurnType,
     UncertaintyVector,
 )
+from core.config import settings
 from integrations.data_lake import data_lake_context
 from know_how.retriever import KnowHowRetriever
 
@@ -423,8 +424,15 @@ class BaseAgentImpl:
         kg_context: dict[str, Any] | None = None,
         system_prompt: str | None = None,
         max_tokens: int | None = None,
+        model: str | None = None,
     ) -> str:
-        """Wraps LLM call with system prompt, KG injection, know-how, audit, and token tracking."""
+        """Wraps LLM call with system prompt, KG injection, know-how, audit, and token tracking.
+
+        Args:
+            model: Optional model override. Pass ``settings.llm_fast_model``
+                or ``settings.llm_cheap_model`` to route away from the
+                default Opus model.  ``None`` keeps the LLMClient default.
+        """
         sys_prompt = system_prompt or self.effective_system_prompt
         # Inject domain know-how if retrieved for this execution
         if self._current_know_how:
@@ -438,6 +446,7 @@ class BaseAgentImpl:
             "agent_llm_call",
             agent_id=self.agent_id,
             prompt_len=len(prompt),
+            model=model or "default",
         )
 
         # Snapshot session-level token counts BEFORE the call so we can
@@ -446,13 +455,20 @@ class BaseAgentImpl:
         if hasattr(self.llm, "token_summary"):
             _tokens_before = self.llm.token_summary.get("total_tokens", 0)
 
+        # Build optional kwargs
+        extra_kwargs: dict[str, Any] = {}
+        if max_tokens:
+            extra_kwargs["max_tokens"] = max_tokens
+        if model:
+            extra_kwargs["model"] = model
+
         with Timer() as t:
             response = await self.llm.query(
                 prompt,
                 system_prompt=sys_prompt,
                 kg_context=kg_context,
                 agent_id=self.agent_id,
-                **({"max_tokens": max_tokens} if max_tokens else {}),
+                **extra_kwargs,
             )
 
         self._llm_calls += 1
@@ -465,6 +481,7 @@ class BaseAgentImpl:
             agent_id=self.agent_id,
             duration_ms=t.elapsed_ms,
             response_len=len(response),
+            model=model or "default",
         )
 
         return response
@@ -566,7 +583,9 @@ class BaseAgentImpl:
             )
 
             try:
-                llm_response = await self.query_llm(falsification_prompt)
+                llm_response = await self.query_llm(
+                    falsification_prompt, model=settings.llm_cheap_model,
+                )
                 parsed = self.llm.parse_json(llm_response)
                 search_query = parsed.get("search_query", f"NOT {source_name} {edge.relation} {target_name}")
             except Exception:
@@ -603,7 +622,9 @@ class BaseAgentImpl:
                         f"Abstract: {abstract}\n\n"
                         f"Respond as JSON: {{\"contradicts\": true/false, \"reasoning\": \"...\"}}"
                     )
-                    eval_response = await self.query_llm(eval_prompt)
+                    eval_response = await self.query_llm(
+                        eval_prompt, model=settings.llm_cheap_model,
+                    )
                     eval_parsed = self.llm.parse_json(eval_response)
                     is_counter = eval_parsed.get("contradicts", False)
                 except Exception:
@@ -959,7 +980,9 @@ class BaseAgentImpl:
         )
 
         try:
-            summary = await self.query_llm(compress_prompt, max_tokens=1024)
+            summary = await self.query_llm(
+                compress_prompt, max_tokens=1024, model=settings.llm_cheap_model,
+            )
             compressed = [f"[COMPRESSED HISTORY — {len(old_obs)} turns]\n{summary}"]
             return compressed + recent_obs
         except Exception:
@@ -1022,7 +1045,9 @@ class BaseAgentImpl:
             "Wrap your plan in <think> tags."
         )
 
-        plan_response = await self.query_llm(plan_prompt, kg_context=kg_context)
+        plan_response = await self.query_llm(
+            plan_prompt, kg_context=kg_context, model=settings.llm_fast_model,
+        )
         plan_think = self._extract_tag(plan_response, "think") or plan_response
 
         turns.append(AgentTurn(
@@ -1112,6 +1137,7 @@ class BaseAgentImpl:
             answer_max_tokens = 8192 if remaining <= 5 else None
             response = await self.query_llm(
                 turn_prompt, kg_context=kg_context, max_tokens=answer_max_tokens,
+                model=settings.llm_fast_model,
             )
             duration = int(time.monotonic() * 1000) - start_ms
 
