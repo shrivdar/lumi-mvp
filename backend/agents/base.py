@@ -100,6 +100,9 @@ class BaseAgentImpl:
         self._edges_added: list[KGEdge] = []
         self._nodes_updated: list[str] = []
         self._edges_updated: list[str] = []
+        self._incremental_nodes: list[KGNode] = []  # nodes added via kg_add_node during turns
+        self._incremental_edges: list[KGEdge] = []  # edges added via kg_add_edge during turns
+        self._current_task: AgentTask | None = None  # set during execute() for virtual tools
         self._llm_calls: int = 0
         self._llm_tokens: int = 0
         self._errors: list[str] = []
@@ -184,6 +187,9 @@ class BaseAgentImpl:
         self._edges_added = []
         self._nodes_updated = []
         self._edges_updated = []
+        self._incremental_nodes = []
+        self._incremental_edges = []
+        self._current_task = task
         self._llm_calls = 0
         self._llm_tokens = 0
         self._errors = []
@@ -905,7 +911,166 @@ class BaseAgentImpl:
 
             return json.dumps({"status": "updated", "edge_id": edge_id, "new_confidence": new_confidence})
 
+        if tool_name == "kg_add_node":
+            return self._execute_kg_add_node(kwargs)
+
+        if tool_name == "kg_add_edge":
+            return self._execute_kg_add_edge(kwargs)
+
         return f"Error: Unknown KG tool '{tool_name}'"
+
+    def _execute_kg_add_node(self, kwargs: dict[str, Any]) -> str:
+        """Virtual tool: add a node to the KG incrementally during investigation."""
+        name = kwargs.get("name", "")
+        node_type_str = kwargs.get("type", "GENE")
+        properties = kwargs.get("properties", {})
+        description = kwargs.get("description", "")
+        confidence = float(kwargs.get("confidence", 0.7))
+
+        if not name:
+            return json.dumps({"error": "Node name is required"})
+
+        try:
+            node_type = NodeType(node_type_str)
+        except (ValueError, KeyError):
+            node_type = NodeType.GENE
+
+        # Check for duplicate by name — skip if already in KG or incremental list
+        existing = self.kg.get_node_by_name(name)
+        if existing:
+            return json.dumps({
+                "status": "already_exists",
+                "node_id": existing.id,
+                "name": existing.name,
+                "message": f"Node '{name}' already exists in KG",
+            })
+
+        for inc_node in self._incremental_nodes:
+            if inc_node.name.lower() == name.lower():
+                return json.dumps({
+                    "status": "already_exists",
+                    "node_id": inc_node.id,
+                    "name": inc_node.name,
+                    "message": f"Node '{name}' already added incrementally",
+                })
+
+        node = KGNode(
+            type=node_type,
+            name=name,
+            description=description,
+            properties=properties,
+            confidence=confidence,
+            sources=[
+                EvidenceSource(
+                    source_type=EvidenceSourceType.AGENT_REASONING,
+                    claim=description or f"Discovered by agent {self.agent_id}",
+                    quality_score=confidence,
+                    confidence=confidence,
+                    agent_id=self.agent_id,
+                )
+            ],
+        )
+
+        hypothesis_branch = self._current_task.hypothesis_branch if self._current_task else None
+        node_id = self.write_node(node, hypothesis_branch)
+        self._incremental_nodes.append(node)
+
+        return json.dumps({
+            "status": "created",
+            "node_id": node_id,
+            "name": name,
+            "type": str(node_type),
+        })
+
+    def _execute_kg_add_edge(self, kwargs: dict[str, Any]) -> str:
+        """Virtual tool: add an edge to the KG incrementally during investigation."""
+        source_name = kwargs.get("source", "")
+        target_name = kwargs.get("target", "")
+        relation_str = kwargs.get("relation", "ASSOCIATED_WITH")
+        confidence = float(kwargs.get("confidence", 0.5))
+        evidence_list = kwargs.get("evidence", [])
+        claim = kwargs.get("claim", "")
+
+        if not source_name or not target_name:
+            return json.dumps({"error": "Both 'source' and 'target' node names are required"})
+
+        # Resolve source node
+        source_node = self.kg.get_node_by_name(source_name)
+        if not source_node:
+            return json.dumps({
+                "error": f"Source node '{source_name}' not found in KG. Add it first with kg_add_node.",
+            })
+
+        # Resolve target node
+        target_node = self.kg.get_node_by_name(target_name)
+        if not target_node:
+            return json.dumps({
+                "error": f"Target node '{target_name}' not found in KG. Add it first with kg_add_node.",
+            })
+
+        try:
+            relation = EdgeRelationType(relation_str)
+        except (ValueError, KeyError):
+            relation = EdgeRelationType.ASSOCIATED_WITH
+
+        # Build evidence sources from the evidence list
+        evidence_sources: list[EvidenceSource] = []
+        if evidence_list:
+            for ev in evidence_list:
+                if isinstance(ev, str):
+                    evidence_sources.append(EvidenceSource(
+                        source_type=EvidenceSourceType.AGENT_REASONING,
+                        claim=ev,
+                        confidence=confidence,
+                        agent_id=self.agent_id,
+                    ))
+                elif isinstance(ev, dict):
+                    ev_type = EvidenceSourceType.AGENT_REASONING
+                    try:
+                        if ev.get("source_type"):
+                            ev_type = EvidenceSourceType(ev["source_type"])
+                    except (ValueError, KeyError):
+                        pass
+                    evidence_sources.append(EvidenceSource(
+                        source_type=ev_type,
+                        source_id=ev.get("source_id"),
+                        claim=ev.get("claim", claim),
+                        confidence=confidence,
+                        agent_id=self.agent_id,
+                    ))
+
+        if not evidence_sources:
+            evidence_sources.append(EvidenceSource(
+                source_type=EvidenceSourceType.AGENT_REASONING,
+                claim=claim or f"Edge added by agent {self.agent_id}",
+                confidence=confidence,
+                agent_id=self.agent_id,
+            ))
+
+        edge = KGEdge(
+            source_id=source_node.id,
+            target_id=target_node.id,
+            relation=relation,
+            confidence=EdgeConfidence(
+                overall=confidence,
+                evidence_quality=confidence,
+                evidence_count=len(evidence_sources),
+            ),
+            evidence=evidence_sources,
+        )
+
+        hypothesis_branch = self._current_task.hypothesis_branch if self._current_task else None
+        edge_id = self.write_edge(edge, hypothesis_branch)
+        self._incremental_edges.append(edge)
+
+        return json.dumps({
+            "status": "created",
+            "edge_id": edge_id,
+            "source": source_name,
+            "target": target_name,
+            "relation": str(relation),
+            "confidence": confidence,
+        })
 
     async def _execute_code_action(self, code: str) -> str:
         """Execute code via PythonREPLTool (mock-safe for initial dev)."""
@@ -935,6 +1100,14 @@ class BaseAgentImpl:
             "  - kg_get_orphan_nodes: Get KG nodes with no connections. Args: {}",
             "  - kg_update_edge_confidence: Update an edge's confidence. "
             "Args: {\"edge_id\": \"...\", \"confidence\": 0.5, \"reason\": \"...\"}",
+            "  - kg_add_node: Add a node to the knowledge graph incrementally. "
+            "Args: {\"name\": \"BRCA1\", \"type\": \"GENE\", \"description\": \"...\", "
+            "\"properties\": {}, \"confidence\": 0.8}",
+            "  - kg_add_edge: Add an edge/relationship to the knowledge graph incrementally. "
+            "Args: {\"source\": \"BRCA1\", \"target\": \"Breast Cancer\", "
+            "\"relation\": \"ASSOCIATED_WITH\", \"confidence\": 0.8, "
+            "\"claim\": \"BRCA1 mutations increase breast cancer risk\", "
+            "\"evidence\": [\"PMID:12345\"]}",
         ])
 
         if self.yami:
@@ -1100,8 +1273,8 @@ class BaseAgentImpl:
                 "To reason: <think>your reasoning</think>\n"
                 "To call a tool: <tool>tool_name:{\"arg\": \"value\"}</tool>\n"
                 "To execute code: <execute>python_code</execute>\n"
-                "To provide final answer (KEEP CONCISE — max 5-8 entities, 5-8 relationships, "
-                "short descriptions):\n"
+                "To provide final answer (be thorough — include 15-25 entities and relationships, "
+                "capture all discovered information):\n"
                 "<answer>{\"entities\": [{\"name\": \"...\", "
                 "\"type\": \"GENE|PROTEIN|DISEASE|...\", "
                 "\"description\": \"brief\", \"confidence\": 0.8, "
@@ -1115,6 +1288,9 @@ class BaseAgentImpl:
                 "\"evidence_id\": \"PMID:...\"}], "
                 "\"summary\": \"2-3 sentence summary\", "
                 "\"reasoning_trace\": \"brief trace\"}</answer>\n\n"
+                "💡 TIP: Use kg_add_node and kg_add_edge tools to add entities/relationships "
+                "to the knowledge graph incrementally as you discover them — don't wait until "
+                "the final answer. This builds a richer graph.\n\n"
                 "If you have gathered enough information, provide your <answer>."
                 + urgency
             )
@@ -1239,12 +1415,30 @@ class BaseAgentImpl:
                     "turns": turns,
                 }
 
-        nodes = self._parse_nodes_from_answer(parsed.get("entities", []))
-        edges = self._parse_edges_from_answer(parsed.get("relationships", []), nodes)
+        answer_nodes = self._parse_nodes_from_answer(parsed.get("entities", []))
+        answer_edges = self._parse_edges_from_answer(parsed.get("relationships", []), answer_nodes)
+
+        # Merge incrementally-added nodes/edges with final answer, avoiding duplicates
+        merged_nodes = list(self._incremental_nodes)
+        existing_names = {n.name.lower() for n in merged_nodes}
+        for node in answer_nodes:
+            if node.name.lower() not in existing_names:
+                merged_nodes.append(node)
+                existing_names.add(node.name.lower())
+
+        merged_edges = list(self._incremental_edges)
+        existing_edge_keys = {
+            (e.source_id, e.target_id, str(e.relation)) for e in merged_edges
+        }
+        for edge in answer_edges:
+            edge_key = (edge.source_id, edge.target_id, str(edge.relation))
+            if edge_key not in existing_edge_keys:
+                merged_edges.append(edge)
+                existing_edge_keys.add(edge_key)
 
         return {
-            "nodes": nodes,
-            "edges": edges,
+            "nodes": merged_nodes,
+            "edges": merged_edges,
             "summary": parsed.get("summary", "Multi-turn investigation complete."),
             "reasoning_trace": parsed.get(
                 "reasoning_trace", self._summarize_turns(turns)
@@ -1346,13 +1540,19 @@ class BaseAgentImpl:
         observations: list[str],
         task: AgentTask,
     ) -> dict[str, Any]:
-        """Fallback compilation when the turn budget is exhausted."""
+        """Fallback compilation when the turn budget is exhausted.
+
+        Returns any nodes/edges that were incrementally added during the
+        multi-turn loop via kg_add_node/kg_add_edge virtual tools.
+        """
         return {
-            "nodes": [],
-            "edges": [],
+            "nodes": list(self._incremental_nodes),
+            "edges": list(self._incremental_edges),
             "summary": (
                 f"Investigation reached turn limit ({len(turns)} turns). "
-                f"Observations collected: {len(observations)}"
+                f"Observations collected: {len(observations)}. "
+                f"Incremental KG additions: {len(self._incremental_nodes)} nodes, "
+                f"{len(self._incremental_edges)} edges."
             ),
             "reasoning_trace": self._summarize_turns(turns),
             "turns": turns,
