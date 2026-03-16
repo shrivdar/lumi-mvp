@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -21,13 +22,14 @@ class LLMClient:
     token tracking, audit logging, and structured output parsing."""
 
     def __init__(self) -> None:
-        self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self._client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
         self.call_count: int = 0
         self._per_model_usage: dict[str, dict[str, int]] = defaultdict(
             lambda: {"input_tokens": 0, "output_tokens": 0, "calls": 0}
         )
+        self._token_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Main query
@@ -61,7 +63,7 @@ class LLMClient:
 
         start = time.monotonic()
         try:
-            response = self._client.messages.create(
+            response = await self._client.messages.create(
                 model=resolved_model,
                 max_tokens=max_tokens,
                 system=system,
@@ -81,14 +83,16 @@ class LLMClient:
 
         input_tokens = response.usage.input_tokens
         output_tokens = response.usage.output_tokens
-        self.total_input_tokens += input_tokens
-        self.total_output_tokens += output_tokens
-        self.call_count += 1
 
-        model_stats = self._per_model_usage[resolved_model]
-        model_stats["input_tokens"] += input_tokens
-        model_stats["output_tokens"] += output_tokens
-        model_stats["calls"] += 1
+        async with self._token_lock:
+            self.total_input_tokens += input_tokens
+            self.total_output_tokens += output_tokens
+            self.call_count += 1
+
+            model_stats = self._per_model_usage[resolved_model]
+            model_stats["input_tokens"] += input_tokens
+            model_stats["output_tokens"] += output_tokens
+            model_stats["calls"] += 1
 
         text = response.content[0].text if response.content else ""
 
