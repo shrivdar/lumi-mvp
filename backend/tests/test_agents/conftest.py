@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from core.llm import LLMResponse
 from core.models import (
     AgentTask,
     AgentType,
@@ -29,12 +30,13 @@ from world_model.knowledge_graph import InMemoryKnowledgeGraph
 class MockLLMClient:
     """Mock LLM client that returns configurable responses."""
 
-    def __init__(self, responses: list[str] | None = None) -> None:
+    def __init__(self, responses: list[str] | None = None, call_tokens: int | None = None) -> None:
         self._responses = responses or []
         self._call_index = 0
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.call_count = 0
+        self._forced_call_tokens = call_tokens  # force specific token count per call
         self._token_summary: dict[str, int] | None = None  # override for tests
 
     async def query(
@@ -44,18 +46,22 @@ class MockLLMClient:
         system_prompt: str = "",
         kg_context: dict[str, Any] | None = None,
         max_tokens: int | None = None,
+        model: str | None = None,
         research_id: str = "",
         agent_id: str = "",
-    ) -> str:
+    ) -> LLMResponse:
         self.call_count += 1
-        self.total_input_tokens += len(prompt) // 4
+        input_tokens = len(prompt) // 4
+        self.total_input_tokens += input_tokens
         if self._call_index < len(self._responses):
             response = self._responses[self._call_index]
             self._call_index += 1
         else:
             response = '{"error": "no more mock responses"}'
-        self.total_output_tokens += len(response) // 4
-        return response
+        output_tokens = len(response) // 4
+        self.total_output_tokens += output_tokens
+        tokens = self._forced_call_tokens if self._forced_call_tokens is not None else input_tokens + output_tokens
+        return LLMResponse(text=response, call_tokens=tokens)
 
     @staticmethod
     def parse_json(text: str) -> Any:
@@ -162,8 +168,11 @@ def mock_semantic_scholar_tool() -> MagicMock:
 def mock_tools(mock_pubmed_tool: MagicMock, mock_semantic_scholar_tool: MagicMock) -> dict[str, MagicMock]:
     """All mock tools as a dict."""
     return {
+        # Both short and canonical names for compatibility
         "pubmed": mock_pubmed_tool,
+        "pubmed_search": mock_pubmed_tool,
         "semantic_scholar": mock_semantic_scholar_tool,
+        "semantic_scholar_search": mock_semantic_scholar_tool,
         "uniprot": make_mock_tool("uniprot", {
             "results": [
                 {

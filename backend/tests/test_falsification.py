@@ -47,7 +47,10 @@ def _make_agent(
     if llm_responses is None:
         llm_responses = ['{"search_query": "test counter query"}']
 
-    mock_llm.query = AsyncMock(side_effect=llm_responses)
+    from core.llm import LLMResponse
+    mock_llm.query = AsyncMock(
+        side_effect=[LLMResponse(text=r, call_tokens=100) for r in llm_responses]
+    )
 
     spec = AgentSpec(
         role="test_agent",
@@ -69,7 +72,7 @@ def _make_agent(
     # Patch query_llm to bypass know-how retriever / data-lake / audit overhead
     async def patched_query_llm(self, prompt, **kwargs):
         resp = await self.llm.query(prompt)
-        return resp
+        return resp.text
 
     agent.query_llm = patched_query_llm.__get__(agent, BaseAgentImpl)
 
@@ -163,7 +166,7 @@ async def test_pubmed_counter_evidence_decreases_confidence(kg):
         '{"contradicts": true, "reasoning": "The paper explicitly states no overexpression."}',
     ]
 
-    agent = _make_agent(kg, tools={"pubmed": pubmed_tool}, llm_responses=llm_responses)
+    agent = _make_agent(kg, tools={"pubmed_search": pubmed_tool}, llm_responses=llm_responses)
 
     edge = kg.get_edge("e-b7h3-nsclc")
     assert edge is not None
@@ -199,7 +202,7 @@ async def test_semantic_scholar_counter_evidence_decreases_confidence(kg):
         '{"contradicts": true, "reasoning": "Meta-analysis contradicts overexpression claim."}',
     ]
 
-    agent = _make_agent(kg, tools={"semantic_scholar": s2_tool}, llm_responses=llm_responses)
+    agent = _make_agent(kg, tools={"semantic_scholar_search": s2_tool}, llm_responses=llm_responses)
 
     edge = kg.get_edge("e-b7h3-nsclc")
     original = edge.confidence.overall
@@ -233,7 +236,7 @@ async def test_irrelevant_results_confidence_unchanged(kg):
         '{"contradicts": false, "reasoning": "Paper is about structure, not expression levels."}',
     ]
 
-    agent = _make_agent(kg, tools={"pubmed": pubmed_tool}, llm_responses=llm_responses)
+    agent = _make_agent(kg, tools={"pubmed_search": pubmed_tool}, llm_responses=llm_responses)
 
     edge = kg.get_edge("e-b7h3-nsclc")
     original = edge.confidence.overall
@@ -259,7 +262,7 @@ async def test_no_search_results_confidence_boosted(kg):
         '{"disproof_criteria": "No overexpression", "search_query": "B7-H3 NOT overexpressed NSCLC"}',
     ]
 
-    agent = _make_agent(kg, tools={"pubmed": empty_pubmed}, llm_responses=llm_responses)
+    agent = _make_agent(kg, tools={"pubmed_search": empty_pubmed}, llm_responses=llm_responses)
 
     edge = kg.get_edge("e-b7h3-nsclc")
     original = edge.confidence.overall
@@ -301,7 +304,7 @@ async def test_both_tools_with_mixed_results(kg):
 
     agent = _make_agent(
         kg,
-        tools={"pubmed": pubmed_tool, "semantic_scholar": s2_tool},
+        tools={"pubmed_search": pubmed_tool, "semantic_scholar_search": s2_tool},
         llm_responses=llm_responses,
     )
 

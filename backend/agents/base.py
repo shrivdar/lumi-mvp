@@ -192,9 +192,12 @@ class BaseAgentImpl:
         self._current_task = task
         self._llm_calls = 0
         self._llm_tokens = 0
+        self._know_how_injected = False
+        self._budget_strike = 0
         self._errors = []
         self._sub_agent_results = []
         self._sub_agents_spawned = 0
+        self._repl_session_id: str | None = None
 
         start_ms = int(time.monotonic() * 1000)
 
@@ -347,6 +350,17 @@ class BaseAgentImpl:
             self._record_trajectory(task, result)
             return result
 
+        finally:
+            # Clean up REPL session if one was created
+            if self._repl_session_id is not None:
+                repl = self.tools.get("python_repl")
+                if repl:
+                    try:
+                        await repl.destroy_session(self._repl_session_id)
+                    except Exception:
+                        pass
+                self._repl_session_id = None
+
     # ------------------------------------------------------------------
     # Trajectory recording
     # ------------------------------------------------------------------
@@ -440,9 +454,10 @@ class BaseAgentImpl:
                 default Opus model.  ``None`` keeps the LLMClient default.
         """
         sys_prompt = system_prompt or self.effective_system_prompt
-        # Inject domain know-how if retrieved for this execution
-        if self._current_know_how:
+        # Inject domain know-how only on first LLM call to save token budget
+        if self._current_know_how and not self._know_how_injected:
             sys_prompt = sys_prompt + "\n\n" + self._current_know_how
+            self._know_how_injected = True
         # Inject data lake context so agents know what local datasets are available
         dl_ctx = data_lake_context()
         if dl_ctx:
@@ -455,12 +470,6 @@ class BaseAgentImpl:
             model=model or "default",
         )
 
-        # Snapshot session-level token counts BEFORE the call so we can
-        # compute the per-call delta (LLMClient tracks cumulative totals).
-        _tokens_before = 0
-        if hasattr(self.llm, "token_summary"):
-            _tokens_before = self.llm.token_summary.get("total_tokens", 0)
-
         # Build optional kwargs
         extra_kwargs: dict[str, Any] = {}
         if max_tokens:
@@ -469,7 +478,7 @@ class BaseAgentImpl:
             extra_kwargs["model"] = model
 
         with Timer() as t:
-            response = await self.llm.query(
+            llm_resp = await self.llm.query(
                 prompt,
                 system_prompt=sys_prompt,
                 kg_context=kg_context,
@@ -478,19 +487,19 @@ class BaseAgentImpl:
             )
 
         self._llm_calls += 1
-        if hasattr(self.llm, "token_summary"):
-            _tokens_after = self.llm.token_summary.get("total_tokens", 0)
-            self._llm_tokens += _tokens_after - _tokens_before
+        # Use per-call token count returned by LLMClient — no shared-state
+        # race condition even when multiple agents share the same LLM client.
+        self._llm_tokens += llm_resp.call_tokens
 
         self.audit.log(
             "agent_llm_result",
             agent_id=self.agent_id,
             duration_ms=t.elapsed_ms,
-            response_len=len(response),
+            response_len=len(llm_resp.text),
             model=model or "default",
         )
 
-        return response
+        return llm_resp.text
 
     # ------------------------------------------------------------------
     # Yami helper
@@ -1073,15 +1082,29 @@ class BaseAgentImpl:
         })
 
     async def _execute_code_action(self, code: str) -> str:
-        """Execute code via PythonREPLTool (mock-safe for initial dev)."""
+        """Execute code via PythonREPLTool."""
         repl = self.tools.get("python_repl")
-        if repl:
-            try:
-                result = await repl.execute(code=code)
-                return str(result.get("output", ""))[:4000]
-            except Exception as e:
-                return f"Error executing code: {e}"
-        return f"Code execution not available (PythonREPLTool not configured). Code:\n{code[:500]}"
+        if repl is None:
+            return f"Code execution not available (PythonREPLTool not configured). Code:\n{code[:500]}"
+        try:
+            # Ensure a REPL session exists for this agent
+            if not hasattr(self, '_repl_session_id') or self._repl_session_id is None:
+                self._repl_session_id = await repl.create_session(
+                    session_id=f"agent-{self.agent_id[:12]}"
+                )
+            result = await repl.execute(
+                session_id=self._repl_session_id, code=code,
+            )
+            # REPL returns {stdout, stderr, error, success}
+            stdout = result.get("stdout", "")
+            stderr = result.get("stderr", "")
+            error = result.get("error", "")
+            if error:
+                return f"Error: {error}\nStderr: {stderr}"[:4000]
+            output = stdout if stdout else stderr
+            return (output or "(no output)")[:4000]
+        except Exception as e:
+            return f"Error executing code: {e}"
 
     def _build_tool_descriptions(self) -> str:
         """Build a description of available tools for multi-turn prompts."""
@@ -1295,18 +1318,22 @@ class BaseAgentImpl:
                 + urgency
             )
 
-            # Hard kill: token budget exceeded — raise immediately
+            # Soft-then-hard budget enforcement:
+            # - First time over budget: urgency message already injected above, allow one more call
+            # - Second time over budget: hard kill
             if constraints.token_budget and self._llm_tokens >= constraints.token_budget:
-                raise TokenBudgetExceededError(
-                    f"Agent {self.agent_id} token budget hard kill: "
-                    f"{self._llm_tokens}/{constraints.token_budget}",
-                    error_code="TOKEN_BUDGET_HARD_KILL",
-                    details={
-                        "agent_id": self.agent_id,
-                        "tokens_used": self._llm_tokens,
-                        "budget": constraints.token_budget,
-                    },
-                )
+                self._budget_strike += 1
+                if self._budget_strike >= 2:
+                    raise TokenBudgetExceededError(
+                        f"Agent {self.agent_id} token budget hard kill: "
+                        f"{self._llm_tokens}/{constraints.token_budget}",
+                        error_code="TOKEN_BUDGET_HARD_KILL",
+                        details={
+                            "agent_id": self.agent_id,
+                            "tokens_used": self._llm_tokens,
+                            "budget": constraints.token_budget,
+                        },
+                    )
 
             start_ms = int(time.monotonic() * 1000)
             # Use higher token limit for later turns where answer is expected

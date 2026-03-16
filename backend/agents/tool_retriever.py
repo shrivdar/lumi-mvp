@@ -266,7 +266,7 @@ class ToolRetriever:
                 model=settings.llm_cheap_model,
             )
             from core.llm import LLMClient
-            parsed = LLMClient.parse_json(response)
+            parsed = LLMClient.parse_json(response.text)
             if not isinstance(parsed, list):
                 parsed = parsed.get("tools", []) if isinstance(parsed, dict) else []
 

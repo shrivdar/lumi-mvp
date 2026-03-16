@@ -74,7 +74,7 @@ async def generate_report(
                 system_prompt="You are a scientific report writer. Be concise and precise.",
                 research_id=session.id,
             )
-            sections.append(f"\n{narrative}\n")
+            sections.append(f"\n{narrative.text}\n")
         except Exception:
             pass
 
@@ -307,7 +307,7 @@ async def generate_report_v2(
                 ),
                 research_id=session.id,
             )
-            sections.append(f"\n{narrative}\n")
+            sections.append(f"\n{narrative.text}\n")
         except Exception:
             pass
 

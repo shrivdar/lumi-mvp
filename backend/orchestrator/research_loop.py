@@ -10,6 +10,7 @@ Lifecycle:
 from __future__ import annotations
 
 import asyncio
+import gc
 import time
 from typing import Any
 
@@ -284,7 +285,7 @@ class ResearchOrchestrator:
                 ),
                 research_id=self._session.id if self._session else "",
             )
-            parsed = LLMClient.parse_json(response)
+            parsed = LLMClient.parse_json(response.text)
             if isinstance(parsed, list):
                 return [
                     {"hypothesis": h.get("hypothesis", ""), "rationale": h.get("rationale", "")}
@@ -478,6 +479,10 @@ class ResearchOrchestrator:
                             r.llm_tokens_used,
                         )
 
+                # Skip backpropagation when ALL agents failed — avoids poisoning
+                # the hypothesis tree with 0.0 info_gain from crashes/budget kills
+                all_failed = all(not r.success for r in results) if results else True
+
                 info_gain = self._evaluate_iteration(results, hypothesis)
                 iteration_info_gains.append(info_gain)
 
@@ -490,13 +495,23 @@ class ResearchOrchestrator:
                 )
                 iteration_edges_added += edges_added
 
-                self._tree.backpropagate(
-                    hypothesis.id,
-                    info_gain,
-                    edges_added=edges_added,
-                    edges_falsified=edges_falsified,
-                    contradictions_found=contradictions,
-                )
+                if not all_failed:
+                    self._tree.backpropagate(
+                        hypothesis.id,
+                        info_gain,
+                        edges_added=edges_added,
+                        edges_falsified=edges_falsified,
+                        contradictions_found=contradictions,
+                    )
+                else:
+                    # Log but don't backpropagate — agent failures are not evidence
+                    # against the hypothesis
+                    self._emit(
+                        "hypothesis_backprop_skipped",
+                        hypothesis_id=hypothesis.id,
+                        reason="all_agents_failed",
+                        agent_count=len(results),
+                    )
 
                 # EXPAND — if high info gain and depth allows
                 if info_gain > 0.5 and hypothesis.depth < config.max_hypothesis_depth:
@@ -533,8 +548,10 @@ class ResearchOrchestrator:
                         agg_uncertainty, hitl_reason, config,
                     )
 
-            # 6. AUTO-PRUNE
-            self._tree.auto_prune()
+            # 6. AUTO-PRUNE + memory cleanup between iterations
+            del all_swarm_coros, swarm_results_list
+            gc.collect()
+            self._tree.auto_prune(min_visits=5, min_avg_gain=0.05)
 
             # 7. CHECK TERMINATION
             avg_info_gain = (
@@ -663,6 +680,10 @@ class ResearchOrchestrator:
                         duration_ms=result.duration_ms,
                         tokens_used=result.llm_tokens_used,
                     )
+
+                    # Free agent memory immediately after completion
+                    del agent
+                    gc.collect()
 
                     return result
 
@@ -936,7 +957,7 @@ class ResearchOrchestrator:
                 research_id=self._session.id if self._session else "",
                 model=settings.llm_fast_model,
             )
-            parsed = LLMClient.parse_json(response)
+            parsed = LLMClient.parse_json(response.text)
             if isinstance(parsed, list):
                 return [
                     {"hypothesis": h["hypothesis"], "rationale": h.get("rationale", "")}
@@ -1212,7 +1233,7 @@ class ResearchOrchestrator:
             max_concurrent_agents=10,
             max_total_agents=20,
             session_token_budget=500_000,
-            agent_token_budget=50_000,
+            agent_token_budget=200_000,
         )
 
         session = self._create_session(question, config)
@@ -1381,7 +1402,7 @@ class ResearchOrchestrator:
                 research_id=self._session.id if self._session else "",
                 model=settings.llm_fast_model,
             )
-            parsed = LLMClient.parse_json(response)
+            parsed = LLMClient.parse_json(response.text)
             if isinstance(parsed, dict) and parsed.get("hypothesis"):
                 return {
                     "hypothesis": parsed["hypothesis"],
@@ -1429,7 +1450,7 @@ class ResearchOrchestrator:
                 ),
                 research_id=self._session.id if self._session else "",
             )
-            return answer.strip()
+            return answer.text.strip()
         except Exception as exc:
             logger.warning("benchmark_synthesis_failed", error=str(exc))
             # Fallback: concatenate agent summaries

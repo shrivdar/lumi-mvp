@@ -61,7 +61,7 @@ class TestAsyncLLMClient:
     async def test_query_returns_text(self, llm_client):
         """Basic query returns the mocked response text."""
         result = await llm_client.query("What is BRCA1?")
-        assert result == "Hello"
+        assert result.text == "Hello"
 
     async def test_query_awaits_async_create(self, llm_client):
         """Verify that messages.create is awaited (async), not called synchronously."""
@@ -116,7 +116,7 @@ class TestAsyncLLMClient:
 
         # All calls should complete
         assert len(results) == call_count
-        assert all(r == "Hello" for r in results)
+        assert all(r.text == "Hello" for r in results)
 
         # Wall-clock time should be ~0.1s (parallel), not ~0.5s (serial)
         assert elapsed < 0.3, f"Calls appear serialized: {elapsed:.2f}s elapsed"

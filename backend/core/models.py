@@ -355,7 +355,7 @@ class AgentConstraints(BaseModel):
     """Resource constraints for a dynamically-spawned agent."""
 
     max_turns: int = 200
-    token_budget: int = 50_000
+    token_budget: int = 200_000
     timeout_seconds: int = 300
     max_llm_calls: int = 20
 
@@ -532,7 +532,7 @@ class ResearchConfig(BaseModel):
     max_concurrent_agents: int = 100  # Global concurrency limit (semaphore)
     max_total_agents: int = 10_000  # Hard cap across entire session
     max_hypothesis_breadth: int = 50  # Max competing hypotheses per tree level
-    agent_token_budget: int = 50_000  # Per-agent token limit
+    agent_token_budget: int = 200_000  # Per-agent token limit
     session_token_budget: int = 10_000_000  # Total session token limit
     session_timeout_seconds: int = 1800  # Wall-clock timeout (default 30 min)
 

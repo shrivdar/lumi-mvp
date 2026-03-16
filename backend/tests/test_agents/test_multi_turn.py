@@ -401,15 +401,20 @@ class TestMultiTurnLoop:
     @pytest.mark.asyncio
     async def test_token_budget_stops_agent(self, agent_kg, sample_task):
         """Agent should stop when token budget is exhausted."""
-        llm = MockLLMClient(responses=[
-            "<think>Planning...</think>",
-            "<think>Thinking turn 1...</think>",
-            "<think>Thinking turn 2...</think>",
-            "<think>Thinking turn 3...</think>",
-            "<think>Thinking turn 4...</think>",
-        ])
-        # Simulate high token usage
-        llm._token_summary = {"total_tokens": 60_000}
+        # Each call consumes 30K tokens.  Budget is 50K.
+        # Call 1: 30K total (under budget) → OK
+        # Call 2: 60K total (over budget) → strike 1, urgency injected
+        # Call 3: 90K total → budget_exhausted fires, soft stop + compile from observations
+        llm = MockLLMClient(
+            responses=[
+                "<think>Planning...</think>",
+                "<think>Thinking turn 1...</think>",
+                "<think>Thinking turn 2...</think>",
+                "<think>Thinking turn 3...</think>",
+                "<think>Thinking turn 4...</think>",
+            ],
+            call_tokens=30_000,
+        )
 
         template = get_template(AgentType.LITERATURE_ANALYST)
         agent = MultiTurnStubAgent(
@@ -427,9 +432,10 @@ class TestMultiTurnLoop:
         agent._investigate = budget_investigate
         result = await agent.execute(sample_task)
 
-        # Hard kill: token budget exceeded → success=False
-        assert result.success is False
-        assert any("TOKEN_BUDGET_HARD_KILL" in e for e in result.errors)
+        # Soft budget stop: agent compiles from observations, still succeeds
+        assert result.success is True
+        # Agent should have stopped well before max_turns (50)
+        assert llm.call_count <= 5
 
     @pytest.mark.asyncio
     async def test_observation_compression(self, agent_kg):

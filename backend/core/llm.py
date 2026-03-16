@@ -7,7 +7,7 @@ import json
 import re
 import time
 from collections import defaultdict
-from typing import Any
+from typing import Any, NamedTuple
 
 import anthropic
 import structlog
@@ -15,6 +15,12 @@ import structlog
 from core.config import settings
 
 logger = structlog.get_logger(__name__)
+
+
+class LLMResponse(NamedTuple):
+    """Return type for LLMClient.query() — text plus per-call token usage."""
+    text: str
+    call_tokens: int  # input_tokens + output_tokens for this single call
 
 
 class LLMClient:
@@ -45,13 +51,17 @@ class LLMClient:
         model: str | None = None,
         research_id: str = "",
         agent_id: str = "",
-    ) -> str:
-        """Send a prompt to Claude and return the text response.
+    ) -> LLMResponse:
+        """Send a prompt to Claude and return text + per-call token count.
 
-        * *model* — optional model override; defaults to ``settings.llm_model``.
-        * *kg_context* — optional KG subgraph dict; serialised into the
-          system prompt so the LLM has domain context.
-        * Token usage is tracked per-call, accumulated, and broken down per model.
+        Returns an ``LLMResponse`` named-tuple.  Because it inherits from
+        ``tuple`` and the first element is ``text``, existing callers that
+        treat the return value as ``str`` will see a deprecation-free
+        migration path — but the *recommended* usage is::
+
+            resp = await llm.query(...)
+            text = resp.text          # the generated text
+            tokens = resp.call_tokens # input + output tokens for this call
         """
         resolved_model = model or settings.llm_model
         max_tokens = max_tokens or settings.llm_max_tokens
@@ -95,6 +105,7 @@ class LLMClient:
             model_stats["calls"] += 1
 
         text = response.content[0].text if response.content else ""
+        call_tokens = input_tokens + output_tokens
 
         log.info(
             "llm.call_end",
@@ -104,7 +115,7 @@ class LLMClient:
             output_tokens=output_tokens,
         )
 
-        return text
+        return LLMResponse(text=text, call_tokens=call_tokens)
 
     # ------------------------------------------------------------------
     # Structured output parsing

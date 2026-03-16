@@ -112,7 +112,7 @@ class SwarmComposer:
                 research_id=self.session_id,
                 model=settings.llm_fast_model,
             )
-            parsed = LLMClient.parse_json(response)
+            parsed = LLMClient.parse_json(response.text)
             if not isinstance(parsed, list):
                 parsed = parsed.get("agents", []) if isinstance(parsed, dict) else []
 
@@ -341,7 +341,7 @@ class SwarmComposer:
                 research_id=self.session_id,
                 model=settings.llm_fast_model,
             )
-            parsed = LLMClient.parse_json(response)
+            parsed = LLMClient.parse_json(response.text)
             if not isinstance(parsed, dict):
                 parsed = {}
         except Exception as exc:

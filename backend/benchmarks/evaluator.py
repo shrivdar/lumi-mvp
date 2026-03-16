@@ -130,7 +130,7 @@ class BenchmarkEvaluator:
             # Dry-run mode — simulate response
             return self._simulate_zero_shot(instance)
 
-        response = await asyncio.wait_for(
+        llm_resp = await asyncio.wait_for(
             self.llm.query(
                 prompt,
                 system_prompt="You are a biomedical expert. Answer the question precisely and concisely.",
@@ -138,6 +138,7 @@ class BenchmarkEvaluator:
             ),
             timeout=self.timeout_seconds,
         )
+        response = llm_resp.text
 
         predicted = self._extract_answer(response, instance.choices)
 
@@ -164,7 +165,7 @@ class BenchmarkEvaluator:
             predicted=predicted,
             ground_truth=instance.ground_truth,
             reasoning_trace=response,
-            tokens_used=len(prompt.split()) + len(response.split()),  # approximate
+            tokens_used=llm_resp.call_tokens,
             turns=1,
         )
 

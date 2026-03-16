@@ -430,6 +430,10 @@ class HypothesisTree:
         for node in list(self._nodes.values()):
             if node.status == HypothesisStatus.PRUNED:
                 continue
+            # Never prune the root node — it accumulates visits from all
+            # children's backpropagation and would be incorrectly pruned first
+            if node.id == self._root_id:
+                continue
             if node.visit_count >= min_visits and node.avg_info_gain < min_avg_gain:
                 count = self.prune(
                     node.id,

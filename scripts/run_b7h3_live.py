@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import os
 import signal
@@ -61,13 +62,13 @@ QUERY = "Role of B7-H3 (CD276) in non-small cell lung cancer immune evasion and 
 
 DEFAULT_CONFIG = dict(
     max_hypothesis_depth=2,
-    max_mcts_iterations=5,
-    max_agents=8,
-    max_agents_per_swarm=3,
-    max_concurrent_agents=5,
+    max_mcts_iterations=3,
+    max_agents=6,
+    max_agents_per_swarm=2,
+    max_concurrent_agents=2,
     confidence_threshold=0.75,
-    session_token_budget=2_000_000,
-    agent_token_budget=100_000,
+    session_token_budget=500_000,
+    agent_token_budget=200_000,
     max_llm_calls_per_agent=15,
     enable_falsification=True,
     enable_hitl=False,  # No human in the loop for automated test
@@ -184,7 +185,7 @@ async def preflight_check() -> bool:
             system_prompt="You are a test probe. Respond with exactly the word READY.",
             max_tokens=10,
         )
-        ok = "READY" in response.upper()
+        ok = "READY" in response.text.upper()
         print(f"    {'OK' if ok else 'FAIL'} LLM connectivity (Claude API)")
         if not ok:
             all_ok = False
@@ -282,6 +283,38 @@ async def run_live(args: argparse.Namespace) -> int:
     catalog = get_catalog()
     print(f"    Tool catalog: {len(catalog)} entries")
 
+    # Prepare output directory early for checkpointing
+    output_dir = Path(__file__).resolve().parent.parent / "outputs" / "live_runs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_dir = output_dir / f"b7h3_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Checkpoint callback — saves KG + metrics after each MCTS iteration
+    async def _checkpoint(session_id: str, iteration: int, orch: Any) -> None:
+        try:
+            ckpt = {
+                "session_id": session_id,
+                "iteration": iteration,
+                "timestamp": time.monotonic() - _metrics.start_time,
+                "kg_nodes": kg.node_count(),
+                "kg_edges": kg.edge_count(),
+                "agents_completed": len(_metrics.agent_results),
+            }
+            # Save incremental checkpoint
+            with open(run_dir / "checkpoint.json", "w") as f:
+                json.dump(ckpt, f, indent=2, default=str)
+            # Save KG snapshot (overwrite each iteration)
+            with open(run_dir / "knowledge_graph.json", "w") as f:
+                json.dump(kg.to_json(), f, indent=2, default=str)
+            # Save agent results so far
+            with open(run_dir / "agent_results.json", "w") as f:
+                json.dump(_metrics.agent_results, f, indent=2, default=str)
+            print(f"    [checkpoint] iter={iteration} nodes={kg.node_count()} edges={kg.edge_count()}")
+            gc.collect()
+        except Exception as exc:
+            print(f"    [checkpoint] WARN: {exc}")
+
     # Build orchestrator
     orchestrator = ResearchOrchestrator(
         llm=llm,
@@ -290,8 +323,10 @@ async def run_live(args: argparse.Namespace) -> int:
         spec_factory=create_agent_from_spec,
         tool_entries=catalog,
         tool_instances=tool_instances,
+        checkpoint_callback=_checkpoint,
     )
     print("    Orchestrator ready")
+    print(f"    Output dir: {run_dir}")
     print()
 
     # --- Run ---
@@ -390,12 +425,7 @@ async def run_live(args: argparse.Namespace) -> int:
     print(f"    Falsification:     {summary['edges_falsified']}/{summary['falsification_attempts']}")
     print(f"    Errors:            {summary['error_count']}")
 
-    # --- Save outputs ---
-    output_dir = Path(__file__).resolve().parent.parent / "outputs" / "live_runs"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    run_dir = output_dir / f"b7h3_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    # --- Save outputs (run_dir created earlier for checkpointing) ---
 
     # 1. Metrics JSON
     metrics_path = run_dir / "metrics.json"

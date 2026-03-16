@@ -7,7 +7,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agents.tool_retriever import ToolRetriever
+from core.llm import LLMResponse
 from core.models import ToolRegistryEntry, ToolSourceType
+
+
+def _r(text: str) -> LLMResponse:
+    """Wrap a string in LLMResponse for mock LLM return values."""
+    return LLMResponse(text=text, call_tokens=100)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -45,7 +51,7 @@ def tool_entries() -> list[ToolRegistryEntry]:
 @pytest.fixture()
 def mock_llm() -> MagicMock:
     llm = MagicMock()
-    llm.query = AsyncMock(return_value='["pubmed", "semantic_scholar"]')
+    llm.query = AsyncMock(return_value=_r('["pubmed", "semantic_scholar"]'))
     return llm
 
 
@@ -63,7 +69,7 @@ class TestToolRetrieverLLM:
     @pytest.mark.asyncio
     async def test_select_tools_for_literature_task(self, retriever: ToolRetriever) -> None:
         """LLM selects pubmed + semantic_scholar for a literature task."""
-        retriever.llm.query = AsyncMock(return_value='["pubmed", "semantic_scholar"]')
+        retriever.llm.query = AsyncMock(return_value=_r('["pubmed", "semantic_scholar"]'))
 
         tools = await retriever.select_tools(
             task="Find papers about BRCA1 mutations in breast cancer",
@@ -77,7 +83,7 @@ class TestToolRetrieverLLM:
     @pytest.mark.asyncio
     async def test_select_tools_for_protein_task(self, retriever: ToolRetriever) -> None:
         """LLM selects uniprot + esm for a protein task."""
-        retriever.llm.query = AsyncMock(return_value='["uniprot", "esm", "pubmed"]')
+        retriever.llm.query = AsyncMock(return_value=_r('["uniprot", "esm", "pubmed"]'))
 
         tools = await retriever.select_tools(
             task="Analyze the structure of B7-H3 protein and predict binding sites",
@@ -90,7 +96,7 @@ class TestToolRetrieverLLM:
     @pytest.mark.asyncio
     async def test_select_tools_for_drug_task(self, retriever: ToolRetriever) -> None:
         """LLM selects chembl + clinicaltrials for a drug discovery task."""
-        retriever.llm.query = AsyncMock(return_value='["chembl", "clinicaltrials", "pubmed"]')
+        retriever.llm.query = AsyncMock(return_value=_r('["chembl", "clinicaltrials", "pubmed"]'))
 
         tools = await retriever.select_tools(
             task="Find drugs that target B7-H3 and their clinical trial status",
@@ -104,7 +110,7 @@ class TestToolRetrieverLLM:
     async def test_select_respects_top_k(self, retriever: ToolRetriever) -> None:
         """Should return at most top_k tools."""
         retriever.llm.query = AsyncMock(
-            return_value='["pubmed", "semantic_scholar", "chembl", "clinicaltrials", "kegg"]'
+            return_value=_r('["pubmed", "semantic_scholar", "chembl", "clinicaltrials", "kegg"]')
         )
 
         tools = await retriever.select_tools(task="broad search", top_k=2)
@@ -115,7 +121,7 @@ class TestToolRetrieverLLM:
     async def test_select_filters_unknown_tools(self, retriever: ToolRetriever) -> None:
         """LLM response with unknown tool names should be filtered out."""
         retriever.llm.query = AsyncMock(
-            return_value='["pubmed", "fake_tool", "nonexistent"]'
+            return_value=_r('["pubmed", "fake_tool", "nonexistent"]')
         )
 
         tools = await retriever.select_tools(task="test", top_k=3)
@@ -231,7 +237,7 @@ class TestToolRetrieverDisabledTools:
                 enabled=False,
             ),
         ]
-        mock_llm.query = AsyncMock(return_value='["pubmed", "chembl"]')
+        mock_llm.query = AsyncMock(return_value=_r('["pubmed", "chembl"]'))
         retriever = ToolRetriever(llm=mock_llm, tool_entries=entries)
 
         tools = await retriever.select_tools(task="Find drugs", top_k=3)
