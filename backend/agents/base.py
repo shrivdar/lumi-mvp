@@ -573,9 +573,9 @@ class BaseAgentImpl:
                 search_query = f"{source_name} {target_name} contradicts disproven negative"
 
             # Search for counter-evidence using available tools
-            tool_result_keys = {"pubmed": "articles", "semantic_scholar": "papers"}
+            tool_result_keys = {"pubmed_search": "articles", "semantic_scholar_search": "papers"}
             candidate_papers: list[tuple[str, dict]] = []  # (tool_name, paper)
-            for tool_name in ["pubmed", "semantic_scholar"]:
+            for tool_name in ["pubmed_search", "semantic_scholar_search"]:
                 tool = self.tools.get(tool_name)
                 if tool is None:
                     continue
@@ -615,7 +615,7 @@ class BaseAgentImpl:
                         EvidenceSource(
                             source_type=(
                                 EvidenceSourceType.PUBMED
-                                if tool_name == "pubmed"
+                                if tool_name == "pubmed_search"
                                 else EvidenceSourceType.SEMANTIC_SCHOLAR
                             ),
                             source_id=paper.get("pmid") or paper.get("paper_id", ""),
