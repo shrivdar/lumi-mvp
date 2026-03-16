@@ -15,6 +15,7 @@ import structlog
 
 from core.audit import AuditLogger
 from core.constants import MANDATORY_AGENTS
+from core.config import settings
 from core.llm import LLMClient
 from core.models import (
     AgentConstraints,
@@ -109,6 +110,7 @@ class SwarmComposer:
                     "Respond with ONLY a JSON array of agent spec objects."
                 ),
                 research_id=self.session_id,
+                model=settings.llm_fast_model,
             )
             parsed = LLMClient.parse_json(response)
             if not isinstance(parsed, list):
@@ -337,6 +339,7 @@ class SwarmComposer:
                     "search for, analyze, or verify."
                 ),
                 research_id=self.session_id,
+                model=settings.llm_fast_model,
             )
             parsed = LLMClient.parse_json(response)
             if not isinstance(parsed, dict):
@@ -435,6 +438,7 @@ class SwarmComposer:
                     "Return ONLY a JSON array of tool name strings, nothing else."
                 ),
                 research_id=self.session_id,
+                model=settings.llm_cheap_model,
             )
             parsed = LLMClient.parse_json(response)
             if isinstance(parsed, list):

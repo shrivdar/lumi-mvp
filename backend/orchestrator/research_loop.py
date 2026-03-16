@@ -18,6 +18,7 @@ import structlog
 from core.audit import AuditLogger, set_request_context
 from core.exceptions import OrchestrationError
 from core.interfaces import KnowledgeGraph, YamiInterface
+from core.config import settings
 from core.llm import LLMClient
 from core.models import (
     AgentResult,
@@ -933,6 +934,7 @@ class ResearchOrchestrator:
                     "of the findings. Focus on resolving contradictions and uncertainty."
                 ),
                 research_id=self._session.id if self._session else "",
+                model=settings.llm_fast_model,
             )
             parsed = LLMClient.parse_json(response)
             if isinstance(parsed, list):
@@ -1377,6 +1379,7 @@ class ResearchOrchestrator:
                     "which tools and databases to query."
                 ),
                 research_id=self._session.id if self._session else "",
+                model=settings.llm_fast_model,
             )
             parsed = LLMClient.parse_json(response)
             if isinstance(parsed, dict) and parsed.get("hypothesis"):
