@@ -67,14 +67,14 @@ class TestZeroShotEvaluator:
 
 class TestYohasFullEvaluator:
     @pytest.mark.asyncio
-    async def test_simulated_evaluation(self, yohas_full_evaluator):
+    async def test_fails_without_orchestrator_factory(self, yohas_full_evaluator):
+        """YOHAS_FULL mode now requires an orchestrator_factory (no more simulation)."""
         inst = _make_instance()
         result = await yohas_full_evaluator.evaluate_instance(inst)
         assert result.instance_id == "test_001"
         assert result.mode == RunMode.YOHAS_FULL
-        assert result.status == InstanceStatus.COMPLETED
-        assert result.turns >= 1
-        assert len(result.tools_used) >= 0  # may have tools in simulation
+        assert result.status == InstanceStatus.FAILED
+        assert "orchestrator_factory" in result.error
 
     @pytest.mark.asyncio
     async def test_batch_with_concurrency(self):
@@ -85,15 +85,20 @@ class TestYohasFullEvaluator:
         instances = [_make_instance(instance_id=f"test_{i:03d}") for i in range(15)]
         results = await evaluator.evaluate_batch(instances)
         assert len(results) == 15
+        # All should fail without orchestrator_factory
+        assert all(r.status == InstanceStatus.FAILED for r in results)
 
+
+class TestCodeFirstEvaluator:
     @pytest.mark.asyncio
-    async def test_yohas_trajectories(self):
-        evaluator = BenchmarkEvaluator(mode=RunMode.YOHAS_FULL, collect_trajectories=True)
+    async def test_code_first_fallback_without_factory(self):
+        """CODE_FIRST falls back to dry-run simulation when no orchestrator_factory."""
+        evaluator = BenchmarkEvaluator(mode=RunMode.CODE_FIRST)
         inst = _make_instance()
-        await evaluator.evaluate_instance(inst)
-        trajectories = evaluator.trajectories
-        assert len(trajectories) == 1
-        assert len(trajectories[0].steps) >= 1
+        result = await evaluator.evaluate_instance(inst)
+        assert result.instance_id == "test_001"
+        assert result.mode == RunMode.CODE_FIRST
+        assert result.status == InstanceStatus.COMPLETED
 
 
 class TestAnswerExtraction:

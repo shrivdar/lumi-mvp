@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -174,4 +174,69 @@ class BenchmarkRunRow(Base):
     __table_args__ = (
         Index("ix_benchmark_runs_name", "benchmark_name"),
         Index("ix_benchmark_runs_started_at", "started_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# dynamic_tools — persisted dynamic tool wrappers
+# ---------------------------------------------------------------------------
+
+class DynamicToolRow(Base):
+    __tablename__ = "dynamic_tools"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    api_base_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    wrapper_code: Mapped[str] = mapped_column(Text, nullable=False)
+    test_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    category: Mapped[str] = mapped_column(String(64), nullable=False, default="dynamic")
+    capabilities: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    example_tasks: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    parameters: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="REGISTERED")
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    usage_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    success_rate: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_dynamic_tools_name", "name"),
+        Index("ix_dynamic_tools_category", "category"),
+        Index("ix_dynamic_tools_success_rate", "success_rate"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# strategy_templates — persisted strategy/memory templates
+# ---------------------------------------------------------------------------
+
+class StrategyTemplateRow(Base):
+    __tablename__ = "strategy_templates"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(256), nullable=False, unique=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    strategy_type: Mapped[str] = mapped_column(String(64), nullable=False, default="general")
+    template_data: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    avg_info_gain: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    tags: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_strategy_templates_name", "name"),
+        Index("ix_strategy_templates_type", "strategy_type"),
     )

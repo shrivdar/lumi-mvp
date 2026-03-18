@@ -33,7 +33,7 @@ class KnowHowRetriever:
     def __init__(self, *, max_docs: int = 3) -> None:
         self.max_docs = max_docs
         self._index = self._load_index()
-        self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self._client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     @staticmethod
     def _load_index() -> list[dict[str, Any]]:
@@ -93,7 +93,7 @@ class KnowHowRetriever:
         )
 
         try:
-            response = self._client.messages.create(
+            response = await self._client.messages.create(
                 model=_RETRIEVER_MODEL,
                 max_tokens=_RETRIEVER_MAX_TOKENS,
                 messages=[{"role": "user", "content": prompt}],

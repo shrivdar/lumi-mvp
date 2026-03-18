@@ -88,15 +88,15 @@ class TestLABBenchAdapters:
 
     def test_dbqa_full_count(self, labench_dbqa_adapter):
         instances = labench_dbqa_adapter.load_instances()
-        assert len(instances) == 100
+        assert len(instances) >= 100  # 100 synthetic or 520 real
 
     def test_seqqa_full_count(self, labench_seqqa_adapter):
         instances = labench_seqqa_adapter.load_instances()
-        assert len(instances) == 100
+        assert len(instances) >= 100  # 100 synthetic or 600 real
 
     def test_litqa2_full_count(self, labench_litqa2_adapter):
         instances = labench_litqa2_adapter.load_instances()
-        assert len(instances) == 100
+        assert len(instances) >= 100  # 100 synthetic or 199 real
 
 
 class TestAdapterRegistry:

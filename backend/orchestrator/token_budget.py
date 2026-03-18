@@ -134,10 +134,13 @@ class TokenBudgetManager:
         # Also cap by session remaining
         available = min(hyp_remaining, self.remaining)
 
-        # Per-agent share
-        per_agent = min(available // max(agent_count, 1), config.agent_token_budget)
-        # Ensure at least a minimum viable budget (5000 tokens)
-        per_agent = max(per_agent, min(5_000, available))
+        # Per-agent share: fair split capped by config and session remaining
+        fair_share = available // max(agent_count, 1)
+        per_agent = min(fair_share, config.agent_token_budget)
+        # Ensure at least a minimum viable budget (5000 tokens),
+        # but never exceed fair share or config cap.
+        per_agent = max(per_agent, min(5_000, fair_share))
+        per_agent = min(per_agent, fair_share, config.agent_token_budget)
 
         constraints_list = []
         for _ in range(agent_count):

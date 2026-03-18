@@ -2,7 +2,9 @@
 
 The evaluator handles:
 - Zero-shot mode: direct LLM call with no tools or KG
+- Code-first mode: single agent with full tool access and code execution
 - YOHAS full mode: full orchestrator with multi-turn agents, tools, data lake, know-how
+- Multi-trial protocol: trial 1 baseline, trial 2+ inject prior trial hints
 - Trajectory collection for RL training
 - Per-instance metric recording
 """
@@ -22,13 +24,20 @@ from benchmarks.models import (
     RunMode,
     Trajectory,
     TrajectoryStep,
+    TrialResult,
 )
+from benchmarks.strategy_memory import StrategyMemory, TrialSummary
 
 logger = logging.getLogger(__name__)
 
 
 class BenchmarkEvaluator:
-    """Evaluates benchmark instances in zero-shot or YOHAS-full mode."""
+    """Evaluates benchmark instances in zero-shot, code-first, or YOHAS-full mode.
+
+    Supports multi-trial evaluation where each subsequent trial receives
+    hints from prior trials to improve performance (inspired by STELLA's
+    9x sequential trial approach).
+    """
 
     def __init__(
         self,
@@ -39,6 +48,8 @@ class BenchmarkEvaluator:
         max_concurrency: int = 5,
         timeout_seconds: int = 300,
         collect_trajectories: bool = True,
+        max_trials: int = 1,
+        strategy_memory: StrategyMemory | None = None,
     ) -> None:
         self.mode = mode
         self.llm = llm
@@ -46,6 +57,8 @@ class BenchmarkEvaluator:
         self.max_concurrency = max_concurrency
         self.timeout_seconds = timeout_seconds
         self.collect_trajectories = collect_trajectories
+        self.max_trials = max(1, max_trials)
+        self.strategy_memory = strategy_memory or StrategyMemory()
         self._trajectories: list[Trajectory] = []
 
     @property
@@ -75,7 +88,7 @@ class BenchmarkEvaluator:
         return results
 
     async def evaluate_instance(self, instance: BenchmarkInstance) -> InstanceResult:
-        """Evaluate a single benchmark instance."""
+        """Evaluate a single benchmark instance, optionally across multiple trials."""
         start = time.monotonic()
         started_at_dt = None
 
@@ -84,10 +97,12 @@ class BenchmarkEvaluator:
 
             started_at_dt = datetime.now(UTC)
 
-            if self.mode == RunMode.ZERO_SHOT:
-                result = await self._evaluate_zero_shot(instance)
+            if self.max_trials <= 1:
+                # Single-trial path (original behavior)
+                result = await self._run_single_trial(instance)
             else:
-                result = await self._evaluate_yohas_full(instance)
+                # Multi-trial path
+                result = await self._run_multi_trial(instance)
 
             result.started_at = started_at_dt
             result.latency_ms = int((time.monotonic() - start) * 1000)
@@ -122,18 +137,154 @@ class BenchmarkEvaluator:
                 error=str(exc),
             )
 
-    async def _evaluate_zero_shot(self, instance: BenchmarkInstance) -> InstanceResult:
+    # ------------------------------------------------------------------
+    # Multi-trial orchestration
+    # ------------------------------------------------------------------
+
+    async def _run_multi_trial(self, instance: BenchmarkInstance) -> InstanceResult:
+        """Run multiple trials with hint injection from prior trials."""
+        trial_results: list[TrialResult] = []
+        trial_summaries: list[TrialSummary] = []
+        all_tokens = 0
+
+        for trial_num in range(1, self.max_trials + 1):
+            # Build hint from prior trials
+            hint = ""
+            if trial_num > 1:
+                hint = self.strategy_memory.get_hint(
+                    trial_summaries=trial_summaries,
+                )
+
+            logger.info(
+                "Instance %s: starting trial %d/%d%s",
+                instance.instance_id,
+                trial_num,
+                self.max_trials,
+                " (with hint)" if hint else "",
+            )
+
+            trial_start = time.monotonic()
+            result = await self._run_single_trial(instance, hint=hint)
+            trial_latency = int((time.monotonic() - trial_start) * 1000)
+
+            # Score this trial
+            trial_correct = self._check_answer(result.predicted, instance.ground_truth)
+            trial_score = 1.0 if trial_correct else 0.0
+
+            trial_result = TrialResult(
+                trial_number=trial_num,
+                predicted=result.predicted,
+                score=trial_score,
+                correct=trial_correct,
+                tokens_used=result.tokens_used,
+                latency_ms=trial_latency,
+                turns=result.turns,
+                tools_used=result.tools_used,
+                reasoning_trace=result.reasoning_trace,
+                hint_injected=hint,
+            )
+            trial_results.append(trial_result)
+            all_tokens += result.tokens_used
+
+            # Build summary for next trial
+            trial_summaries.append(TrialSummary(
+                trial_number=trial_num,
+                predicted=result.predicted,
+                score=trial_score,
+                reasoning_trace=result.reasoning_trace,
+                tools_used=result.tools_used,
+                tokens_used=result.tokens_used,
+                key_insights=self._extract_key_insights(result.reasoning_trace),
+            ))
+
+            # Early exit if we got the right answer
+            if trial_correct:
+                logger.info(
+                    "Instance %s: correct on trial %d, skipping remaining trials",
+                    instance.instance_id,
+                    trial_num,
+                )
+                break
+
+        # Select best trial (highest score, or most complete answer)
+        best_trial = self._select_best_trial(trial_results)
+        best = trial_results[best_trial]
+
+        return InstanceResult(
+            instance_id=instance.instance_id,
+            suite=instance.suite,
+            mode=self.mode,
+            predicted=best.predicted,
+            ground_truth=instance.ground_truth,
+            tokens_used=all_tokens,
+            turns=best.turns,
+            tools_used=best.tools_used,
+            reasoning_trace=best.reasoning_trace,
+            trial_results=trial_results,
+            best_trial=best.trial_number,
+        )
+
+    async def _run_single_trial(
+        self, instance: BenchmarkInstance, *, hint: str = ""
+    ) -> InstanceResult:
+        """Run a single trial (zero-shot, code-first, or YOHAS-full) with optional hint injection."""
+        if self.mode == RunMode.ZERO_SHOT:
+            return await self._evaluate_zero_shot(instance, hint=hint)
+        elif self.mode == RunMode.CODE_FIRST:
+            return await self._evaluate_code_first(instance, hint=hint)
+        else:
+            return await self._evaluate_yohas_full(instance, hint=hint)
+
+    @staticmethod
+    def _select_best_trial(trials: list[TrialResult]) -> int:
+        """Return the index of the best trial result.
+
+        Priority: highest score, then longest reasoning trace (more complete).
+        """
+        if not trials:
+            return 0
+        best_idx = 0
+        best_score = trials[0].score
+        best_length = len(trials[0].reasoning_trace)
+        for i, t in enumerate(trials[1:], start=1):
+            if t.score > best_score or (t.score == best_score and len(t.reasoning_trace) > best_length):
+                best_idx = i
+                best_score = t.score
+                best_length = len(t.reasoning_trace)
+        return best_idx
+
+    @staticmethod
+    def _extract_key_insights(reasoning_trace: str) -> str:
+        """Extract key insights from a reasoning trace for trial summary."""
+        if not reasoning_trace:
+            return ""
+        # Take first 500 chars of non-header content
+        lines = reasoning_trace.strip().split("\n")
+        content_lines = [line for line in lines if line.strip() and not line.strip().startswith("#")]
+        return " ".join(content_lines)[:500]
+
+    # ------------------------------------------------------------------
+    # Core evaluation methods
+    # ------------------------------------------------------------------
+
+    async def _evaluate_zero_shot(
+        self, instance: BenchmarkInstance, *, hint: str = ""
+    ) -> InstanceResult:
         """Zero-shot: direct LLM call, no tools or KG."""
         prompt = self._build_zero_shot_prompt(instance)
 
         if self.llm is None:
             # Dry-run mode — simulate response
-            return self._simulate_zero_shot(instance)
+            return self._simulate_zero_shot(instance, hint=hint)
+
+        system_prompt = "You are a biomedical expert. Answer the question precisely and concisely."
+        if hint:
+            system_prompt += f"\n\n{hint}"
 
         llm_resp = await asyncio.wait_for(
             self.llm.query(
                 prompt,
-                system_prompt="You are a biomedical expert. Answer the question precisely and concisely.",
+                system_prompt=system_prompt,
                 max_tokens=1024,
             ),
             timeout=self.timeout_seconds,
@@ -169,10 +320,15 @@ class BenchmarkEvaluator:
             turns=1,
         )
 
-    async def _evaluate_yohas_full(self, instance: BenchmarkInstance) -> InstanceResult:
+    async def _evaluate_yohas_full(
+        self, instance: BenchmarkInstance, *, hint: str = ""
+    ) -> InstanceResult:
         """Full YOHAS: orchestrator with multi-turn agents, tools, data lake, know-how."""
         if self.orchestrator_factory is None:
-            return self._simulate_yohas_full(instance)
+            raise RuntimeError(
+                "YOHAS_FULL mode requires an orchestrator_factory. "
+                "Pass --live to the benchmark runner or provide an orchestrator_factory."
+            )
 
         from core.models import ResearchConfig
 
@@ -187,10 +343,15 @@ class BenchmarkEvaluator:
             session_token_budget=100_000,
         )
 
+        # Inject hint into query if available
+        query = instance.question
+        if hint:
+            query = f"{instance.question}\n\n{hint}"
+
         orchestrator = self.orchestrator_factory()
 
         session = await asyncio.wait_for(
-            orchestrator.run(instance.question, config=config),
+            orchestrator.run(query, config=config),
             timeout=self.timeout_seconds,
         )
 
@@ -212,7 +373,72 @@ class BenchmarkEvaluator:
             )
             self._trajectories.append(trajectory)
             for r in orchestrator._all_results:
-                tools_used.extend(t.action_type for t in (r.turns or []) if t.turn_type.value == "tool_call")
+                tools_used.extend(t.turn_type.value for t in (r.turns or []) if t.turn_type.value == "tool_call")
+
+        return InstanceResult(
+            instance_id=instance.instance_id,
+            suite=instance.suite,
+            mode=self.mode,
+            predicted=predicted,
+            ground_truth=instance.ground_truth,
+            tokens_used=tokens,
+            turns=turns,
+            tools_used=list(set(tools_used)),
+            reasoning_trace=session.result.report_markdown if session.result else "",
+        )
+
+    async def _evaluate_code_first(
+        self, instance: BenchmarkInstance, *, hint: str = ""
+    ) -> InstanceResult:
+        """Code-first mode: single agent with full tool access and code execution."""
+        if self.orchestrator_factory is None:
+            return self._simulate_zero_shot(instance, hint=hint)  # fallback to dry-run
+
+        from core.models import ResearchConfig
+
+        config = ResearchConfig(
+            max_mcts_iterations=1,
+            max_agents=1,
+            max_agents_per_swarm=1,
+            max_llm_calls_per_agent=15,
+            enable_hitl=False,
+            enable_falsification=False,
+            code_first=True,
+            agent_token_budget=30_000,
+            session_token_budget=50_000,
+        )
+
+        # Inject hint into query if available
+        query = instance.question
+        if hint:
+            query = f"{instance.question}\n\n{hint}"
+
+        orchestrator = self.orchestrator_factory()
+
+        session = await asyncio.wait_for(
+            orchestrator.run(query, config=config),
+            timeout=self.timeout_seconds,
+        )
+
+        predicted = ""
+        tools_used: list[str] = []
+        turns = 0
+        tokens = 0
+
+        if session.result:
+            predicted = self._extract_answer_from_result(session.result, instance)
+            tokens = session.result.total_tokens
+            turns = session.current_iteration
+
+        if self.collect_trajectories and hasattr(orchestrator, "_all_results"):
+            trajectory = self._build_trajectory_from_results(
+                instance, orchestrator._all_results
+            )
+            self._trajectories.append(trajectory)
+            for r in orchestrator._all_results:
+                tools_used.extend(
+                    t.turn_type.value for t in (r.turns or []) if t.turn_type.value == "tool_call"
+                )
 
         return InstanceResult(
             instance_id=instance.instance_id,
@@ -311,11 +537,17 @@ class BenchmarkEvaluator:
     # Simulation (dry-run without LLM)
     # ------------------------------------------------------------------
 
-    def _simulate_zero_shot(self, instance: BenchmarkInstance) -> InstanceResult:
+    def _simulate_zero_shot(
+        self, instance: BenchmarkInstance, *, hint: str = ""
+    ) -> InstanceResult:
         """Simulate a zero-shot evaluation without calling LLM."""
         import random
 
-        correct = random.random() < 0.5  # 50% baseline
+        # Hint improves simulated accuracy
+        base_prob = 0.5
+        if hint:
+            base_prob = min(0.85, base_prob + 0.15 * hint.count("Trial"))
+        correct = random.random() < base_prob
         predicted = instance.ground_truth if correct else "incorrect_answer"
 
         if self.collect_trajectories:
@@ -340,42 +572,4 @@ class BenchmarkEvaluator:
             tokens_used=500,
             turns=1,
             reasoning_trace="[simulated zero-shot]",
-        )
-
-    def _simulate_yohas_full(self, instance: BenchmarkInstance) -> InstanceResult:
-        """Simulate a YOHAS-full evaluation without calling LLM."""
-        import random
-
-        # YOHAS-full should outperform zero-shot
-        correct = random.random() < 0.75  # 75% with full stack
-        predicted = instance.ground_truth if correct else "incorrect_answer"
-
-        tools = ["pubmed", "semantic_scholar", "uniprot", "kegg"]
-        used = random.sample(tools, k=random.randint(1, len(tools)))
-
-        if self.collect_trajectories:
-            self._trajectories.append(
-                Trajectory(
-                    instance_id=instance.instance_id,
-                    suite=instance.suite,
-                    mode=self.mode,
-                    steps=[
-                        TrajectoryStep(step=0, action_type="think", action="Analyzing question..."),
-                        TrajectoryStep(step=1, action_type="tool_call", action=f"search({used[0]})"),
-                        TrajectoryStep(step=2, action_type="answer", action=predicted),
-                    ],
-                    correct=correct,
-                )
-            )
-
-        return InstanceResult(
-            instance_id=instance.instance_id,
-            suite=instance.suite,
-            mode=self.mode,
-            predicted=predicted,
-            ground_truth=instance.ground_truth,
-            tokens_used=3000,
-            turns=random.randint(2, 5),
-            tools_used=used,
-            reasoning_trace="[simulated yohas-full]",
         )

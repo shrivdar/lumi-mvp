@@ -29,6 +29,26 @@ from benchmarks.trajectory_store import TrajectoryStore
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+
+def _build_tool_instances() -> dict:
+    """Import and instantiate tool classes for live orchestrator."""
+    tools: dict = {}
+    _tool_defs = [
+        ("pubmed", "integrations.pubmed", "PubMedTool"),
+        ("uniprot", "integrations.uniprot", "UniProtTool"),
+        ("clinicaltrials", "integrations.clinicaltrials", "ClinicalTrialsTool"),
+        ("python_repl", "integrations.python_repl", "PythonREPLTool"),
+    ]
+    for name, module_path, class_name in _tool_defs:
+        try:
+            import importlib
+
+            mod = importlib.import_module(module_path)
+            tools[name] = getattr(mod, class_name)()
+        except Exception:
+            pass
+    return tools
+
 RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
 
 
@@ -56,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", type=str, default=None, help="Output path for markdown report")
     p.add_argument("--trajectories-dir", type=str, default=None, help="Trajectory output directory")
     p.add_argument("--no-trajectories", action="store_true", help="Disable trajectory collection")
+    p.add_argument("--max-trials", type=int, default=1, help="Number of trials per instance (multi-trial protocol)")
+    p.add_argument("--strategy-dir", type=str, default=None, help="Directory for strategy template storage")
     p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     return p.parse_args()
 
@@ -84,9 +106,30 @@ async def run_benchmark(args: argparse.Namespace) -> None:
         from core.llm import LLMClient
 
         llm = LLMClient()
-        # orchestrator_factory would be set up here with full YOHAS stack
+
+        def make_orchestrator():
+            from agents.factory import create_agent
+            from integrations.tool_catalog import get_catalog
+            from orchestrator.research_loop import ResearchOrchestrator
+            from world_model.knowledge_graph import InMemoryKnowledgeGraph
+
+            kg = InMemoryKnowledgeGraph()
+            tool_entries = get_catalog()
+            tool_instances = _build_tool_instances()
+            return ResearchOrchestrator(
+                llm=llm,
+                kg=kg,
+                agent_factory=create_agent,
+                tool_entries=tool_entries,
+                tool_instances=tool_instances,
+            )
+
+        orchestrator_factory = make_orchestrator
+
+    from benchmarks.strategy_memory import StrategyMemory
 
     trajectory_store = TrajectoryStore(args.trajectories_dir) if not args.no_trajectories else None
+    strategy_memory = StrategyMemory(storage_dir=args.strategy_dir) if args.strategy_dir else StrategyMemory()
     all_suite_results: list[SuiteResults] = []
 
     for suite in suites:
@@ -99,11 +142,13 @@ async def run_benchmark(args: argparse.Namespace) -> None:
 
             evaluator = BenchmarkEvaluator(
                 mode=mode,
-                llm=llm if mode == RunMode.ZERO_SHOT or mode == RunMode.YOHAS_FULL else None,
-                orchestrator_factory=orchestrator_factory if mode == RunMode.YOHAS_FULL else None,
+                llm=llm,
+                orchestrator_factory=orchestrator_factory if mode in (RunMode.YOHAS_FULL, RunMode.CODE_FIRST) else None,
                 max_concurrency=args.concurrency,
                 timeout_seconds=args.timeout,
                 collect_trajectories=not args.no_trajectories,
+                max_trials=args.max_trials,
+                strategy_memory=strategy_memory,
             )
 
             def _progress(done: int, total: int, result: InstanceResult) -> None:

@@ -38,9 +38,12 @@ from core.models import (
     TaskStatus,
     ToolRegistryEntry,
 )
+from agents.tool_retriever import ToolRetriever
 from integrations.biosecurity import BiosecurityScreener
+from integrations.dynamic.registry import DynamicToolRegistry
 from integrations.living_document import LivingDocument
 from orchestrator.hypothesis_tree import HypothesisTree
+from orchestrator.strategy_memory import StrategyMemory
 from orchestrator.swarm_composer import SwarmComposer
 from orchestrator.token_budget import TokenBudgetManager
 from orchestrator.uncertainty import UncertaintyAggregator
@@ -68,6 +71,8 @@ class ResearchOrchestrator:
         tool_instances: dict[str, Any] | None = None,  # name → BaseTool for dynamic assignment
         slack_tool: Any = None,  # SlackTool instance for HITL
         checkpoint_callback: Any = None,  # async callable(session_id, iteration, orchestrator) for DB persistence
+        dynamic_registry: DynamicToolRegistry | None = None,
+        strategy_memory: StrategyMemory | None = None,
     ) -> None:
         self.llm = llm
         self.kg = kg
@@ -84,6 +89,8 @@ class ResearchOrchestrator:
         self._living_doc: LivingDocument | None = None
         self._trajectory_collector: TrajectoryCollector | None = None
         self._token_budget: TokenBudgetManager | None = None
+        self._dynamic_registry = dynamic_registry or DynamicToolRegistry()
+        self._strategy_memory = strategy_memory or StrategyMemory()
 
         self._session: ResearchSession | None = None
         self._tree: HypothesisTree | None = None
@@ -93,6 +100,41 @@ class ResearchOrchestrator:
         self._events: list[ResearchEvent] = []
         self._total_agents_spawned: int = 0
         self._session_tokens_used: int = 0
+        self._counters_lock = asyncio.Lock()
+
+        # Compacted summaries from pruned _all_results entries
+        self._compacted_llm_calls: int = 0
+        self._compacted_tokens: int = 0
+        self._compacted_edges: list[KGEdge] = []
+        self._compacted_experiment_recs: list[str] = []
+        self._max_recent_results: int = 200
+
+    def _compact_results(self) -> None:
+        """Prune ``_all_results`` to keep at most ``_max_recent_results``.
+
+        Older results are summarized into running counters so that
+        ``_compile_result`` still produces accurate totals.
+        """
+        overflow = len(self._all_results) - self._max_recent_results
+        if overflow <= 0:
+            return
+
+        to_compact = self._all_results[:overflow]
+        self._all_results = self._all_results[overflow:]
+
+        for r in to_compact:
+            self._compacted_llm_calls += r.llm_calls
+            self._compacted_tokens += r.llm_tokens_used
+            self._compacted_edges.extend(r.edges_added)
+            if r.agent_type == AgentType.EXPERIMENT_DESIGNER and r.summary:
+                self._compacted_experiment_recs.append(r.summary)
+
+        # Keep compacted edges bounded to top-confidence entries
+        if len(self._compacted_edges) > self._max_recent_results:
+            self._compacted_edges.sort(
+                key=lambda e: e.confidence.overall, reverse=True,
+            )
+            self._compacted_edges = self._compacted_edges[: self._max_recent_results]
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -124,7 +166,25 @@ class ResearchOrchestrator:
                 title=f"Research: {query[:80]}",
             )
             self._living_doc.attach(self.kg)
-            self._trajectory_collector = TrajectoryCollector(benchmark_run_id=session.id)
+            from rl.training.reward import TrajectoryContext, compute_reward
+
+            def _reward_fn(task: AgentTask, result: AgentResult) -> float:
+                ctx = TrajectoryContext(
+                    evaluator_score=1.0 if result.success else 0.0,
+                )
+                breakdown = compute_reward(result, ctx)
+                return breakdown.total
+
+            self._trajectory_collector = TrajectoryCollector(
+                benchmark_run_id=session.id,
+                reward_fn=_reward_fn,
+            )
+
+            # Phase 0b: Load strategy templates from disk
+            try:
+                self._strategy_memory.load_from_file("data/strategy_templates.json")
+            except Exception:
+                pass  # first run or missing file is fine
 
             # Phase 1: Initialize
             session.status = SessionStatus.RUNNING
@@ -137,7 +197,7 @@ class ResearchOrchestrator:
                     self._mcts_loop(query, config, session),
                     timeout=config.session_timeout_seconds,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "session_timeout",
                     session_id=session.id,
@@ -169,6 +229,22 @@ class ResearchOrchestrator:
 
             session.result = result
             session.status = SessionStatus.COMPLETED
+
+            # Phase 5: Extract strategy template from this session
+            try:
+                agent_dicts = [r.model_dump() if hasattr(r, "model_dump") else {} for r in self._all_results]
+                tree_dict = self._tree.to_dict() if self._tree and hasattr(self._tree, "to_dict") else None
+                template = StrategyMemory.extract_template(
+                    query=query,
+                    session_id=session.id,
+                    agent_results=agent_dicts,
+                    hypothesis_tree=tree_dict,
+                    reward_score=1.0 if result.key_findings else 0.3,
+                )
+                self._strategy_memory.add_template(template)
+                self._strategy_memory.save_to_file("data/strategy_templates.json")
+            except Exception as strat_exc:
+                logger.warning("strategy_extraction_failed", error=str(strat_exc))
 
         except Exception as exc:
             session.status = SessionStatus.FAILED
@@ -220,6 +296,8 @@ class ResearchOrchestrator:
             llm=self.llm,
             tool_registry_entries=self.tool_entries,
             session_id=session_id,
+            tool_retriever=ToolRetriever(llm=self.llm, tool_entries=self.tool_entries),
+            dynamic_registry=self._dynamic_registry,
         )
         self._uncertainty = UncertaintyAggregator(session_id=session_id)
         self._token_budget = TokenBudgetManager(
@@ -263,6 +341,15 @@ class ResearchOrchestrator:
         Per LAB-Bench optimization: generate hypotheses covering different
         reasoning paths, not just variations of the same idea.
         """
+        # Inject strategy context from previous sessions
+        strategy_hint = ""
+        relevant = self._strategy_memory.retrieve_relevant(query)
+        if relevant:
+            strategy_hint = (
+                "\n\n" + self._strategy_memory.format_for_injection(relevant) + "\n\n"
+                "Incorporate insights from these previous strategies when forming hypotheses.\n"
+            )
+
         prompt = (
             f"Research query: {query}\n\n"
             f"Generate 3-5 competing hypotheses that could answer this query. "
@@ -272,6 +359,7 @@ class ResearchOrchestrator:
             f'- "hypothesis": A clear, testable statement\n'
             f'- "rationale": Why this is a plausible direction (2-3 sentences)\n\n'
             f"Return a JSON array of objects."
+            f"{strategy_hint}"
         )
 
         try:
@@ -479,6 +567,13 @@ class ResearchOrchestrator:
                             r.llm_tokens_used,
                         )
 
+                # Auto-trigger ToolCreatorAgent on tool-related failures
+                failed_results = [r for r in results if not r.success]
+                if failed_results:
+                    await self._maybe_trigger_tool_creator(
+                        failed_results, hypothesis, query,
+                    )
+
                 # Skip backpropagation when ALL agents failed — avoids poisoning
                 # the hypothesis tree with 0.0 info_gain from crashes/budget kills
                 all_failed = all(not r.success for r in results) if results else True
@@ -550,6 +645,7 @@ class ResearchOrchestrator:
 
             # 6. AUTO-PRUNE + memory cleanup between iterations
             del all_swarm_coros, swarm_results_list
+            self._compact_results()
             gc.collect()
             self._tree.auto_prune(min_visits=5, min_avg_gain=0.05)
 
@@ -606,7 +702,8 @@ class ResearchOrchestrator:
         async def _run_single(task: AgentTask) -> AgentResult | None:
             async with semaphore:
                 # Check per-agent token budget will be tracked post-execution
-                self._total_agents_spawned += 1
+                async with self._counters_lock:
+                    self._total_agents_spawned += 1
 
                 try:
                     if self.agent_factory is None:
@@ -737,7 +834,8 @@ class ResearchOrchestrator:
 
         async def _run_spec(spec: AgentSpec, task: AgentTask) -> AgentResult | None:
             async with semaphore:
-                self._total_agents_spawned += 1
+                async with self._counters_lock:
+                    self._total_agents_spawned += 1
                 try:
                     from agents.factory import create_agent_from_spec
 
@@ -842,6 +940,108 @@ class ResearchOrchestrator:
         coros = [_run_spec(spec, task) for spec, task in paired]
         raw_results = await asyncio.gather(*coros)
         return [r for r in raw_results if r is not None]
+
+    # ------------------------------------------------------------------
+    # Auto-trigger ToolCreatorAgent
+    # ------------------------------------------------------------------
+
+    async def _maybe_trigger_tool_creator(
+        self,
+        results: list[AgentResult],
+        hypothesis: HypothesisNode,
+        query: str,
+    ) -> None:
+        """Check if any agent tool calls failed and trigger ToolCreatorAgent if so.
+
+        When an agent's result contains tool errors, this method spawns a
+        ToolCreatorAgent to generalize a reusable tool, then registers it
+        in the DynamicToolRegistry so other agents in the session can use it.
+        """
+        # Collect tool-related errors from failed agents
+        tool_errors: list[str] = []
+        for r in results:
+            if not r.success and r.errors:
+                for err in r.errors:
+                    if any(kw in err.lower() for kw in ("tool", "api", "fetch", "request", "timeout", "404", "500")):
+                        tool_errors.append(err)
+
+        if not tool_errors:
+            return
+
+        # Don't trigger if we already have many dynamic tools (avoid runaway creation)
+        if self._dynamic_registry.tool_count >= 10:
+            logger.info("tool_creator_skipped", reason="max_dynamic_tools_reached")
+            return
+
+        try:
+            from agents.factory import create_agent
+            from agents.tool_creator import ToolCreatorAgent
+            from core.tool_registry import InMemoryToolRegistry
+
+            task = AgentTask(
+                research_id=self._session.id if self._session else "",
+                agent_type=AgentType.TOOL_CREATOR,
+                hypothesis_branch=hypothesis.id,
+                instruction=(
+                    f"Research query: {query}\n"
+                    f"Hypothesis: {hypothesis.hypothesis}\n\n"
+                    f"The following tool errors occurred during agent execution:\n"
+                    + "\n".join(f"- {e}" for e in tool_errors[:5])
+                    + "\n\nDiscover and create a tool wrapper that could help resolve "
+                    "these data access issues. Check the known API catalog first."
+                ),
+                context={"query": query, "tool_errors": tool_errors[:5]},
+            )
+
+            # Create a temporary registry for the tool creator to register into
+            temp_registry = InMemoryToolRegistry()
+            agent_tools = {
+                n: t for n, t in self._tool_instances.items()
+                if n in ("pubmed_search", "pubmed", "python_repl")
+            }
+
+            agent = create_agent(
+                agent_type=AgentType.TOOL_CREATOR,
+                llm=self.llm,
+                kg=self.kg,
+                yami=self.yami,
+                tools=agent_tools,
+            )
+
+            assert isinstance(agent, ToolCreatorAgent)
+            repl_tool = self._tool_instances.get("python_repl")
+            specs = await agent.create_and_register_tools(
+                task, temp_registry, repl_tool=repl_tool,
+            )
+
+            # Register validated tools in the session's dynamic registry
+            for spec in specs:
+                from integrations.dynamic.dynamic_tool import DynamicTool
+
+                tool = DynamicTool(spec=spec, repl_tool=repl_tool)
+                self._dynamic_registry.register(tool)
+                # Also add to tool_instances so agents can use them immediately
+                from integrations.dynamic.registry import DYN_PREFIX
+                prefixed_name = f"{DYN_PREFIX}{spec.name}" if not spec.name.startswith(DYN_PREFIX) else spec.name
+                self._tool_instances[prefixed_name] = tool
+
+                self._emit(
+                    "dynamic_tool_created",
+                    tool_name=prefixed_name,
+                    category=spec.category,
+                    capabilities=spec.capabilities,
+                    triggered_by="tool_error_auto_recovery",
+                )
+
+            if specs:
+                logger.info(
+                    "tool_creator_auto_triggered",
+                    tools_created=len(specs),
+                    tool_names=[s.name for s in specs],
+                )
+
+        except Exception as exc:
+            logger.warning("tool_creator_auto_trigger_failed", error=str(exc))
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -1013,11 +1213,23 @@ class ResearchOrchestrator:
                 message=message,
             )
 
-            # Wait for response (with timeout)
-            response = await self.slack_tool.execute(
-                action="wait_for_response",
-                timeout_seconds=config.hitl_timeout_seconds,
-            )
+            # Wait for response (with timeout to prevent indefinite hang)
+            try:
+                response = await asyncio.wait_for(
+                    self.slack_tool.execute(
+                        action="wait_for_response",
+                        timeout_seconds=config.hitl_timeout_seconds,
+                    ),
+                    timeout=300,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "hitl_timeout",
+                    hypothesis_id=hypothesis.id,
+                    timeout_seconds=300,
+                )
+                self._emit("hitl_timeout", hypothesis_id=hypothesis.id)
+                response = {"received": False, "auto_proceed": True}
 
             if response.get("received"):
                 self._uncertainty.record_hitl_response(response)
@@ -1043,8 +1255,8 @@ class ResearchOrchestrator:
         best = self._tree.get_best_hypothesis()
         ranking = self._tree.get_ranking()
 
-        # Gather key findings (high-confidence edges)
-        all_edges_added: list[KGEdge] = []
+        # Gather key findings (high-confidence edges) — include compacted edges
+        all_edges_added: list[KGEdge] = list(self._compacted_edges)
         for r in self._all_results:
             all_edges_added.extend(r.edges_added)
 
@@ -1068,15 +1280,15 @@ class ResearchOrchestrator:
         # Gather uncertainties
         uncertainties = self._uncertainty._history if self._uncertainty else []
 
-        # Gather experiment recommendations
-        recommended_experiments: list[str] = []
+        # Gather experiment recommendations — include compacted recs
+        recommended_experiments: list[str] = list(self._compacted_experiment_recs)
         for r in self._all_results:
             if r.agent_type == AgentType.EXPERIMENT_DESIGNER and r.summary:
                 recommended_experiments.append(r.summary)
 
-        # Token usage
-        total_llm_calls = sum(r.llm_calls for r in self._all_results)
-        total_tokens = sum(r.llm_tokens_used for r in self._all_results)
+        # Token usage — include compacted totals
+        total_llm_calls = self._compacted_llm_calls + sum(r.llm_calls for r in self._all_results)
+        total_tokens = self._compacted_tokens + sum(r.llm_tokens_used for r in self._all_results)
 
         duration_ms = int(time.monotonic() * 1000) - start_ms
 
@@ -1258,6 +1470,8 @@ class ResearchOrchestrator:
                 llm=self.llm,
                 tool_registry_entries=self.tool_entries,
                 session_id=session.id,
+                tool_retriever=ToolRetriever(llm=self.llm, tool_entries=self.tool_entries),
+                dynamic_registry=self._dynamic_registry,
             )
             self._uncertainty = UncertaintyAggregator(session_id=session.id)
             self._token_budget = TokenBudgetManager(

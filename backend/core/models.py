@@ -528,11 +528,13 @@ class ResearchConfig(BaseModel):
     enable_hitl: bool = True
     slack_channel_id: str | None = None
 
+    code_first: bool = False  # Single-agent mode with full tool + code execution access
+
     # --- Scaled orchestration (per-hypothesis swarms) ---
     max_concurrent_agents: int = 100  # Global concurrency limit (semaphore)
     max_total_agents: int = 10_000  # Hard cap across entire session
     max_hypothesis_breadth: int = 50  # Max competing hypotheses per tree level
-    agent_token_budget: int = 200_000  # Per-agent token limit
+    agent_token_budget: int = 300_000  # Per-agent token limit (increased from 200K to prevent token starvation)
     session_token_budget: int = 10_000_000  # Total session token limit
     session_timeout_seconds: int = 1800  # Wall-clock timeout (default 30 min)
 

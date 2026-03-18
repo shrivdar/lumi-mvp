@@ -9,6 +9,8 @@ import pytest
 from agents.base import BaseAgentImpl
 from agents.templates import get_template
 from core.models import (
+    AgentConstraints,
+    AgentSpec,
     AgentType,
     TurnType,
 )
@@ -417,19 +419,15 @@ class TestMultiTurnLoop:
         )
 
         template = get_template(AgentType.LITERATURE_ANALYST)
+        spec = AgentSpec(
+            role="literature_analyst",
+            instructions="Test",
+            constraints=AgentConstraints(token_budget=50_000, max_turns=50),
+        )
         agent = MultiTurnStubAgent(
-            template=template, llm=llm, kg=agent_kg, tools={},
+            template=template, llm=llm, kg=agent_kg, tools={}, spec=spec,
         )
 
-        async def budget_investigate(task, kg_context):
-            return await agent._multi_turn_investigate(
-                task, kg_context,
-                max_turns=50,
-                token_budget=50_000,
-                investigation_focus="Test",
-            )
-
-        agent._investigate = budget_investigate
         result = await agent.execute(sample_task)
 
         # Soft budget stop: agent compiles from observations, still succeeds

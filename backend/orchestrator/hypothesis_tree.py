@@ -214,7 +214,20 @@ class HypothesisTree:
                 candidates.append(node)
 
         if not candidates:
-            # Fall back to regular select
+            # Return least-visited leaf nodes instead of root
+            all_leaves = [
+                n for n in self._nodes.values()
+                if n.id != self._root_id
+                and n.status not in (HypothesisStatus.PRUNED, HypothesisStatus.REFUTED)
+            ]
+            if all_leaves:
+                all_leaves.sort(key=lambda n: n.visit_count)
+                selected_fallback = all_leaves[:max_leaves]
+                for node in selected_fallback:
+                    node.status = HypothesisStatus.EXPLORING
+                    node.updated_at = datetime.now(UTC)
+                return selected_fallback
+            # Absolute fallback: use regular select (may return root)
             return [self.select()]
 
         # Score by UCB1 using root visit count as parent proxy

@@ -93,6 +93,36 @@ class TokenBucketRateLimiter:
         return result == 1
 
 
+class InMemoryRateLimiter:
+    """In-process token-bucket rate limiter used when Redis is unavailable."""
+
+    def __init__(self, rate: float, burst: int | None = None) -> None:
+        self._rate = rate  # tokens per second
+        self._burst = burst or max(int(rate * 2), 1)
+        self._tokens = float(self._burst)
+        self._last = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, timeout: float = 30.0) -> None:
+        """Block until a token is available, or raise after *timeout* seconds."""
+        deadline = time.monotonic() + timeout
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last
+                self._tokens = min(self._burst, self._tokens + elapsed * self._rate)
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+            if time.monotonic() >= deadline:
+                raise ToolError(
+                    "Rate limit timeout — could not acquire token",
+                    error_code="RATE_LIMIT_TIMEOUT",
+                )
+            await asyncio.sleep(1.0 / self._rate)
+
+
 # ---------------------------------------------------------------------------
 # BaseTool concrete implementation
 # ---------------------------------------------------------------------------
@@ -135,11 +165,13 @@ class BaseTool(BaseToolABC):
             follow_redirects=True,
         )
         self._owns_http = http_client is None
-        self._rate_limiter: TokenBucketRateLimiter | None = None
+        self._rate_limiter: TokenBucketRateLimiter | InMemoryRateLimiter
         if self._redis is not None:
             self._rate_limiter = TokenBucketRateLimiter(
                 self._redis, self.tool_id, self.rate_limit
             )
+        else:
+            self._rate_limiter = InMemoryRateLimiter(rate=self.rate_limit)
         # Auto-register with the registry if provided
         if registry is not None:
             self._register(registry)
@@ -193,6 +225,14 @@ class BaseTool(BaseToolABC):
                 last_err = exc
                 if exc.response.status_code in (429, 500, 502, 503, 504):
                     backoff = self.retry_backoff[min(attempt, len(self.retry_backoff) - 1)]
+                    # Respect Retry-After header on 429 responses
+                    if exc.response.status_code == 429:
+                        retry_after = exc.response.headers.get("Retry-After")
+                        if retry_after is not None:
+                            try:
+                                backoff = max(float(retry_after), backoff)
+                            except (ValueError, OverflowError):
+                                pass  # Non-numeric Retry-After (e.g. HTTP-date); use default backoff
                     audit.log(
                         "tool_retry",
                         tool=self.name,
@@ -249,8 +289,8 @@ class BaseTool(BaseToolABC):
             data = await self._redis.get(key)
             if data is not None:
                 return json.loads(data)
-        except Exception:
-            logger.debug("cache_get_error", key=key)
+        except Exception as exc:
+            logger.warning("cache_get_error", key=key, error=str(exc))
         return None
 
     async def _cache_set(self, key: str, value: Any, ttl: int | None = None) -> None:
@@ -258,12 +298,11 @@ class BaseTool(BaseToolABC):
             return
         try:
             await self._redis.set(key, json.dumps(value, default=str), ex=ttl or self.cache_ttl)
-        except Exception:
-            logger.debug("cache_set_error", key=key)
+        except Exception as exc:
+            logger.warning("cache_set_error", key=key, error=str(exc))
 
     async def _rate_limit_acquire(self) -> None:
-        if self._rate_limiter is not None:
-            await self._rate_limiter.acquire()
+        await self._rate_limiter.acquire()
 
     # ------------------------------------------------------------------
     # Lifecycle

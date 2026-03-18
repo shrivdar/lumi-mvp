@@ -449,17 +449,35 @@ class InMemoryKnowledgeGraph:
         Includes: temporal metadata, auto-clustering, visual weight, edge animation
         hints, and hypothesis-branch coloring.
         """
-        clusters = self._compute_clusters()
+        # Snapshot shared dicts under lock for thread safety
+        with self._lock:
+            nodes_snapshot = dict(self._nodes)
+            edges_snapshot = dict(self._edges)
+            outgoing_snapshot = dict(self._outgoing)
+            incoming_snapshot = dict(self._incoming)
+
+            # Pre-compute branch colors while holding the lock to avoid
+            # racy writes to self._branch_colors / self._next_color_idx
+            branch_color_map: dict[str | None, str] = {}
+            for node in nodes_snapshot.values():
+                if node.hypothesis_branch not in branch_color_map:
+                    branch_color_map[node.hypothesis_branch] = self._get_branch_color(node.hypothesis_branch)
+            for edge in edges_snapshot.values():
+                if edge.hypothesis_branch not in branch_color_map:
+                    branch_color_map[edge.hypothesis_branch] = self._get_branch_color(edge.hypothesis_branch)
+            branch_colors_snapshot = dict(self._branch_colors)
+
+        clusters = self._compute_clusters(nodes_snapshot, edges_snapshot, outgoing_snapshot, incoming_snapshot)
         now = datetime.now(UTC)
         elements: list[dict[str, Any]] = []
 
-        for node in self._nodes.values():
-            out_degree = len(self._outgoing.get(node.id, []))
-            in_degree = len(self._incoming.get(node.id, []))
+        for node in nodes_snapshot.values():
+            out_degree = len(outgoing_snapshot.get(node.id, []))
+            in_degree = len(incoming_snapshot.get(node.id, []))
             degree = out_degree + in_degree
-            importance = min(1.0, 0.2 + (degree / max(len(self._edges), 1)) * 3.0)
+            importance = min(1.0, 0.2 + (degree / max(len(edges_snapshot), 1)) * 3.0)
 
-            branch_color = self._get_branch_color(node.hypothesis_branch)
+            branch_color = branch_color_map.get(node.hypothesis_branch, "#94a3b8")
             type_color = _NODE_TYPE_COLORS.get(node.type, "#94a3b8")
 
             age_seconds = (now - node.created_at).total_seconds()
@@ -493,8 +511,8 @@ class InMemoryKnowledgeGraph:
                 },
             })
 
-        for edge in self._edges.values():
-            branch_color = self._get_branch_color(edge.hypothesis_branch)
+        for edge in edges_snapshot.values():
+            branch_color = branch_color_map.get(edge.hypothesis_branch, "#94a3b8")
             evidence_strength = edge.confidence.overall
             age_seconds = (now - edge.created_at).total_seconds()
             is_recent = age_seconds < 60
@@ -537,50 +555,66 @@ class InMemoryKnowledgeGraph:
             "elements": elements,
             "metadata": {
                 "graph_id": self.graph_id,
-                "node_count": len(self._nodes),
-                "edge_count": len(self._edges),
-                "branch_colors": dict(self._branch_colors),
+                "node_count": len(nodes_snapshot),
+                "edge_count": len(edges_snapshot),
+                "branch_colors": branch_colors_snapshot,
                 "cluster_count": len(set(clusters.values())) if clusters else 0,
                 "snapshot_at": now.isoformat(),
             },
         }
 
     def to_json(self) -> dict[str, Any]:
+        with self._lock:
+            nodes_snapshot = dict(self._nodes)
+            edges_snapshot = dict(self._edges)
+            branch_colors_snapshot = dict(self._branch_colors)
         return {
             "graph_id": self.graph_id,
-            "nodes": [n.model_dump(mode="json") for n in self._nodes.values()],
-            "edges": [e.model_dump(mode="json") for e in self._edges.values()],
+            "nodes": [n.model_dump(mode="json") for n in nodes_snapshot.values()],
+            "edges": [e.model_dump(mode="json") for e in edges_snapshot.values()],
             "metadata": {
-                "node_count": len(self._nodes),
-                "edge_count": len(self._edges),
-                "avg_confidence": self.avg_confidence(),
-                "branch_colors": dict(self._branch_colors),
+                "node_count": len(nodes_snapshot),
+                "edge_count": len(edges_snapshot),
+                "avg_confidence": (
+                    sum(e.confidence.overall for e in edges_snapshot.values()) / len(edges_snapshot)
+                    if edges_snapshot else 0.0
+                ),
+                "branch_colors": branch_colors_snapshot,
             },
         }
 
     def to_markdown_summary(self) -> str:
+        with self._lock:
+            nodes_snapshot = dict(self._nodes)
+            edges_snapshot = dict(self._edges)
+            type_index_snapshot = {k: set(v) for k, v in self._type_index.items()}
+
+        avg_conf = (
+            sum(e.confidence.overall for e in edges_snapshot.values()) / len(edges_snapshot)
+            if edges_snapshot else 0.0
+        )
         lines = [
             "# Knowledge Graph Summary",
             "",
-            f"- **Nodes:** {len(self._nodes)}",
-            f"- **Edges:** {len(self._edges)}",
-            f"- **Avg confidence:** {self.avg_confidence():.3f}",
+            f"- **Nodes:** {len(nodes_snapshot)}",
+            f"- **Edges:** {len(edges_snapshot)}",
+            f"- **Avg confidence:** {avg_conf:.3f}",
             "",
         ]
 
         # Node type breakdown
         lines.append("## Nodes by Type")
-        for ntype, nids in sorted(self._type_index.items(), key=lambda x: -len(x[1])):
+        for ntype, nids in sorted(type_index_snapshot.items(), key=lambda x: -len(x[1])):
             lines.append(f"- {ntype.value}: {len(nids)}")
 
         # Top confidence edges
-        if self._edges:
+        if edges_snapshot:
             lines.append("")
             lines.append("## Top Edges (by confidence)")
-            top = sorted(self._edges.values(), key=lambda e: e.confidence.overall, reverse=True)[:10]
+            top = sorted(edges_snapshot.values(), key=lambda e: e.confidence.overall, reverse=True)[:10]
             for edge in top:
-                src = self._nodes.get(edge.source_id)
-                tgt = self._nodes.get(edge.target_id)
+                src = nodes_snapshot.get(edge.source_id)
+                tgt = nodes_snapshot.get(edge.target_id)
                 src_name = src.name if src else edge.source_id
                 tgt_name = tgt.name if tgt else edge.target_id
                 lines.append(
@@ -590,25 +624,25 @@ class InMemoryKnowledgeGraph:
                 )
 
         # Contradictions
-        contradictions = [e for e in self._edges.values() if e.is_contradiction]
+        contradictions = [e for e in edges_snapshot.values() if e.is_contradiction]
         if contradictions:
             lines.append("")
             lines.append("## Contradictions")
             for edge in contradictions:
-                src = self._nodes.get(edge.source_id)
-                tgt = self._nodes.get(edge.target_id)
+                src = nodes_snapshot.get(edge.source_id)
+                tgt = nodes_snapshot.get(edge.target_id)
                 src_name = src.name if src else edge.source_id
                 tgt_name = tgt.name if tgt else edge.target_id
                 lines.append(f"- {src_name} --[{edge.relation.value}]--> {tgt_name}")
 
         # Falsified edges
-        falsified = [e for e in self._edges.values() if e.falsified]
+        falsified = [e for e in edges_snapshot.values() if e.falsified]
         if falsified:
             lines.append("")
             lines.append("## Falsified Edges")
             for edge in falsified:
-                src = self._nodes.get(edge.source_id)
-                tgt = self._nodes.get(edge.target_id)
+                src = nodes_snapshot.get(edge.source_id)
+                tgt = nodes_snapshot.get(edge.target_id)
                 src_name = src.name if src else edge.source_id
                 tgt_name = tgt.name if tgt else edge.target_id
                 lines.append(f"- ~~{src_name} --[{edge.relation.value}]--> {tgt_name}~~")
@@ -761,29 +795,35 @@ class InMemoryKnowledgeGraph:
             "edges": [self._edges[eid].model_dump(mode="json") for eid in visited_edges if eid in self._edges],
         }
 
-    def _compute_clusters(self) -> dict[str, str]:
+    def _compute_clusters(
+        self,
+        nodes_snapshot: dict[str, KGNode],
+        edges_snapshot: dict[str, KGEdge],
+        outgoing_snapshot: dict[str, list[str]],
+        incoming_snapshot: dict[str, list[str]],
+    ) -> dict[str, str]:
         """Auto-cluster nodes by type and connectivity using label propagation."""
-        if not self._nodes:
+        if not nodes_snapshot:
             return {}
 
         # Start with type-based clusters
         labels: dict[str, str] = {}
-        for nid, node in self._nodes.items():
+        for nid, node in nodes_snapshot.items():
             labels[nid] = f"type_{node.type.value}"
 
         # Refine with a few rounds of label propagation on the undirected graph
         for _ in range(3):
             new_labels: dict[str, str] = {}
-            for nid in self._nodes:
+            for nid in nodes_snapshot:
                 neighbor_labels: dict[str, int] = defaultdict(int)
                 neighbor_labels[labels[nid]] = 1  # self-vote
 
-                for eid in self._outgoing.get(nid, []):
-                    edge = self._edges.get(eid)
+                for eid in outgoing_snapshot.get(nid, []):
+                    edge = edges_snapshot.get(eid)
                     if edge and edge.target_id in labels:
                         neighbor_labels[labels[edge.target_id]] += 1
-                for eid in self._incoming.get(nid, []):
-                    edge = self._edges.get(eid)
+                for eid in incoming_snapshot.get(nid, []):
+                    edge = edges_snapshot.get(eid)
                     if edge and edge.source_id in labels:
                         neighbor_labels[labels[edge.source_id]] += 1
 

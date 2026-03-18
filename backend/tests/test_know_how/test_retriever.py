@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -154,7 +154,7 @@ class TestLLMRetrieval:
         mock_response = MagicMock()
         mock_response.content = [MagicMock(text='["gwas_analysis", "pathway_analysis", "pandas_bio_recipes"]')]
 
-        with patch.object(retriever._client.messages, "create", return_value=mock_response):
+        with patch.object(retriever._client.messages, "create", new_callable=AsyncMock, return_value=mock_response):
             docs = await retriever.retrieve("Interpret GWAS hits and run pathway enrichment")
 
         ids = [d["id"] for d in docs]
@@ -167,6 +167,7 @@ class TestLLMRetrieval:
 
         with patch.object(
             retriever._client.messages, "create",
+            new_callable=AsyncMock,
             side_effect=Exception("API error"),
         ):
             docs = await retriever.retrieve(
@@ -185,7 +186,7 @@ class TestLLMRetrieval:
         mock_response = MagicMock()
         mock_response.content = [MagicMock(text="I think the best documents are gwas and pathway")]
 
-        with patch.object(retriever._client.messages, "create", return_value=mock_response):
+        with patch.object(retriever._client.messages, "create", new_callable=AsyncMock, return_value=mock_response):
             docs = await retriever.retrieve(
                 "Analyze GWAS data and identify enriched pathways"
             )
@@ -201,7 +202,7 @@ class TestLLMRetrieval:
         mock_response = MagicMock()
         mock_response.content = [MagicMock(text='["gwas_analysis", "nonexistent_doc", "pathway_analysis"]')]
 
-        with patch.object(retriever._client.messages, "create", return_value=mock_response):
+        with patch.object(retriever._client.messages, "create", new_callable=AsyncMock, return_value=mock_response):
             docs = await retriever.retrieve("GWAS and pathway analysis")
 
         ids = [d["id"] for d in docs]

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import gc
 import json
 import os
@@ -293,6 +294,8 @@ async def run_live(args: argparse.Namespace) -> int:
     # Checkpoint callback — saves KG + metrics after each MCTS iteration
     async def _checkpoint(session_id: str, iteration: int, orch: Any) -> None:
         try:
+            # Save hypothesis tree state
+            tree_dict = orch.tree.to_dict() if hasattr(orch, "tree") and orch.tree else {}
             ckpt = {
                 "session_id": session_id,
                 "iteration": iteration,
@@ -300,6 +303,7 @@ async def run_live(args: argparse.Namespace) -> int:
                 "kg_nodes": kg.node_count(),
                 "kg_edges": kg.edge_count(),
                 "agents_completed": len(_metrics.agent_results),
+                "hypothesis_tree": tree_dict,
             }
             # Save incremental checkpoint
             with open(run_dir / "checkpoint.json", "w") as f:
@@ -328,6 +332,31 @@ async def run_live(args: argparse.Namespace) -> int:
     print("    Orchestrator ready")
     print(f"    Output dir: {run_dir}")
     print()
+
+    # Emergency checkpoint on unexpected exit (e.g. OOM, unhandled signal)
+    orch = orchestrator  # alias for atexit closure
+
+    def _save_checkpoint_on_exit() -> None:
+        try:
+            ckpt = {
+                "emergency": True,
+                "timestamp": time.monotonic() - _metrics.start_time if _metrics.start_time else 0,
+                "kg_nodes": kg.node_count(),
+                "kg_edges": kg.edge_count(),
+                "agents_completed": len(_metrics.agent_results),
+                "hypothesis_tree": orch.tree.to_dict() if orch and hasattr(orch, "tree") and orch.tree else None,
+            }
+            with open(run_dir / "emergency_checkpoint.json", "w") as f:
+                json.dump(ckpt, f, indent=2, default=str)
+            with open(run_dir / "knowledge_graph.json", "w") as f:
+                json.dump(kg.to_json(), f, indent=2, default=str)
+            with open(run_dir / "agent_results.json", "w") as f:
+                json.dump(_metrics.agent_results, f, indent=2, default=str)
+            print("  [emergency checkpoint saved]")
+        except Exception:
+            pass  # best-effort on exit
+
+    atexit.register(_save_checkpoint_on_exit)
 
     # --- Run ---
     print("=" * 72)

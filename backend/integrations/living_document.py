@@ -59,9 +59,18 @@ class LivingDocument:
         print(doc.render())
     """
 
-    def __init__(self, session_id: str, title: str = "Research Report") -> None:
+    # Default cap for unbounded tracking lists to prevent memory leaks
+    DEFAULT_MAX_ENTRIES: int = 500
+
+    def __init__(
+        self,
+        session_id: str,
+        title: str = "Research Report",
+        max_entries: int = DEFAULT_MAX_ENTRIES,
+    ) -> None:
         self.session_id = session_id
         self.title = title
+        self._max_entries = max_entries
 
         # Internal state rebuilt from KG events
         self._nodes: dict[str, KGNode] = {}
@@ -102,6 +111,13 @@ class LivingDocument:
             self._callback = None
             audit.log("living_doc_detached", session_id=self.session_id)
 
+    # ── Internal helpers ────────────────────────────────────────────
+
+    def _trim_list(self, lst: list[str]) -> None:
+        """Keep only the most recent ``max_entries`` items in *lst*."""
+        if len(lst) > self._max_entries:
+            del lst[: len(lst) - self._max_entries]
+
     # ── KG event handler ──────────────────────────────────────────────
 
     def _on_kg_event(self, event_type: str, data: dict[str, Any]) -> None:
@@ -127,10 +143,13 @@ class LivingDocument:
                     branch = data.get("hypothesis_branch") or edge.hypothesis_branch
                     if branch:
                         self._hypotheses[branch].append(edge.id)
+                        self._trim_list(self._hypotheses[branch])
                     if data.get("is_contradiction") or edge.is_contradiction:
                         self._contradictions.append(edge.id)
+                        self._trim_list(self._contradictions)
                     if edge.confidence.overall < 0.5:
                         self._uncertainties.append(edge.id)
+                        self._trim_list(self._uncertainties)
             elif event_type == "node_updated":
                 node_id = data.get("node_id", "")
                 node = self._kg.get_node(node_id)
@@ -143,10 +162,12 @@ class LivingDocument:
                     self._edges[edge_id].confidence.overall = new_confidence
                     if new_confidence < 0.5 and edge_id not in self._uncertainties:
                         self._uncertainties.append(edge_id)
+                        self._trim_list(self._uncertainties)
             elif event_type == "edge_falsified":
                 edge_id = data.get("edge_id", "")
                 if edge_id and edge_id not in self._falsified:
                     self._falsified.append(edge_id)
+                    self._trim_list(self._falsified)
             else:
                 return  # unknown event, skip rebuild
 
@@ -181,6 +202,9 @@ class LivingDocument:
             diff=diff,
         )
         self._versions.append(version)
+        # Keep version history bounded to prevent memory leaks
+        if len(self._versions) > self._max_entries:
+            self._versions = self._versions[-self._max_entries:]
         self._current_content = new_content
         self._update_count += 1
 

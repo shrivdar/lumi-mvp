@@ -175,6 +175,7 @@ def run_research(self, research_id: str, query: str, config_dict: dict | None = 
     except Exception:
         logger.info("slack_not_configured", research_id=research_id)
 
+    orchestrator: ResearchOrchestrator | None = None
     orchestrator = ResearchOrchestrator(
         llm=llm,
         kg=kg,
@@ -239,8 +240,8 @@ def run_research(self, research_id: str, query: str, config_dict: dict | None = 
         _run_async(_persist_session_end(
             research_id,
             str(SessionStatus.FAILED),
-            total_tokens=orchestrator._session_tokens_used,
-            total_agents=orchestrator._total_agents_spawned,
+            total_tokens=orchestrator._session_tokens_used if orchestrator is not None else 0,
+            total_agents=orchestrator._total_agents_spawned if orchestrator is not None else 0,
         ))
 
         try:

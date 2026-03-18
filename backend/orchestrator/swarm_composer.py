@@ -30,6 +30,7 @@ from core.models import (
 
 if TYPE_CHECKING:
     from agents.tool_retriever import ToolRetriever
+    from integrations.dynamic.registry import DynamicToolRegistry
 
 logger = structlog.get_logger(__name__)
 
@@ -49,6 +50,7 @@ class SwarmComposer:
         tool_registry_entries: list[ToolRegistryEntry] | None = None,
         session_id: str = "",
         tool_retriever: ToolRetriever | None = None,
+        dynamic_registry: DynamicToolRegistry | None = None,
     ) -> None:
         self.llm = llm
         self._tool_entries = tool_registry_entries or []
@@ -56,6 +58,37 @@ class SwarmComposer:
         self.audit = AuditLogger("swarm_composer")
         self._events: list[ResearchEvent] = []
         self._tool_retriever = tool_retriever
+        self._dynamic_registry = dynamic_registry
+
+    # ------------------------------------------------------------------
+    # Tool entry helpers
+    # ------------------------------------------------------------------
+
+    def _get_all_tool_entries(self) -> list[ToolRegistryEntry]:
+        """Return all tool entries including dynamic tools from the registry."""
+        entries = list(self._tool_entries)
+        if self._dynamic_registry:
+            entries.extend(self._dynamic_registry.get_registry_entries())
+        return entries
+
+    # ------------------------------------------------------------------
+    # Code-first mode
+    # ------------------------------------------------------------------
+
+    CODE_FIRST_DIRECTIVE = (
+        "\n\n## Code-First Investigation Mode\n"
+        "You have a Python REPL (`python_repl` tool) as your PRIMARY investigation tool. "
+        "Prefer writing Python code over calling API tools whenever possible.\n"
+        "Available libraries: pandas, numpy, scipy, biopython, requests, matplotlib, "
+        "seaborn, scikit-learn, networkx, rdkit.\n"
+        "Use code to:\n"
+        "- Fetch and parse data from public APIs (PubMed, UniProt, KEGG, etc.)\n"
+        "- Run statistical tests (t-test, chi-squared, Fisher's exact, enrichment)\n"
+        "- Analyze sequences, structures, pathways computationally\n"
+        "- Build and query graphs, compute network metrics\n"
+        "- Generate quantitative evidence for or against hypotheses\n"
+        "Write clear, well-commented code. Print results so they appear in the output."
+    )
 
     # ------------------------------------------------------------------
     # Main entry point — dynamic AgentSpec generation
@@ -88,9 +121,10 @@ class SwarmComposer:
         """
         available_types = config.agent_types or list(AgentType)
 
-        # Build available tools summary
+        # Build available tools summary (native + MCP + dynamic)
+        all_entries = self._get_all_tool_entries()
         tool_catalog = []
-        for entry in self._tool_entries:
+        for entry in all_entries:
             if entry.enabled:
                 tool_catalog.append(f"{entry.name} [{entry.category}]")
 
@@ -116,18 +150,20 @@ class SwarmComposer:
             if not isinstance(parsed, list):
                 parsed = parsed.get("agents", []) if isinstance(parsed, dict) else []
 
-            for i, raw_spec in enumerate(parsed):
+            filtered_idx = 0
+            for raw_spec in parsed:
                 if not isinstance(raw_spec, dict):
                     continue
-                spec = self._parse_agent_spec(
+                spec = await self._parse_agent_spec(
                     raw_spec, hypothesis,
                     constraint_override=(
-                        agent_constraints[i] if agent_constraints and i < len(agent_constraints)
+                        agent_constraints[filtered_idx] if agent_constraints and filtered_idx < len(agent_constraints)
                         else None
                     ),
                 )
                 if spec:
                     specs.append(spec)
+                    filtered_idx += 1
 
         except Exception as exc:
             logger.warning("spec_composition_llm_failed", error=str(exc))
@@ -180,6 +216,13 @@ class SwarmComposer:
                 agent_type_hint=AgentType.SCIENTIFIC_CRITIC,
                 falsification_protocol="Search for contradicting evidence in PubMed and Semantic Scholar.",
             ))
+
+        # Inject code-first directive when enabled
+        if config.code_first:
+            for spec in specs:
+                spec.system_prompt = (spec.system_prompt or "") + self.CODE_FIRST_DIRECTIVE
+                if "python_repl" not in spec.tools:
+                    spec.tools.append("python_repl")
 
         # Cap at max agents per swarm
         specs = specs[:config.max_agents_per_swarm]
@@ -253,7 +296,7 @@ class SwarmComposer:
         ])
         return "\n".join(lines)
 
-    def _parse_agent_spec(
+    async def _parse_agent_spec(
         self,
         raw: dict[str, Any],
         hypothesis: HypothesisNode,
@@ -265,6 +308,9 @@ class SwarmComposer:
         protocol) from the template library when the LLM response doesn't
         provide them. This ensures spec-composed agents retain the domain
         expertise encoded in templates.
+
+        When a ToolRetriever is configured, dynamically selects tools via LLM
+        and merges them with any tools explicitly requested in the spec.
         """
         role = raw.get("role", "")
         instructions = raw.get("instructions", "")
@@ -280,10 +326,31 @@ class SwarmComposer:
                     agent_type_hint = at
                     break
 
-        # Parse tools — validate against catalog
+        # Parse tools — validate against catalog (native + dynamic)
         raw_tools = raw.get("tools", [])
-        valid_tool_names = {e.name for e in self._tool_entries if e.enabled}
+        valid_tool_names = {e.name for e in self._get_all_tool_entries() if e.enabled}
         tools = [str(t) for t in raw_tools if str(t) in valid_tool_names]
+
+        # Dynamically select tools via ToolRetriever when available
+        if self._tool_retriever is not None:
+            try:
+                dynamic_tools = await self.select_tools_dynamic(
+                    task_instruction=instructions,
+                    hypothesis=hypothesis.hypothesis,
+                    agent_type=agent_type_hint,
+                )
+                # Merge: keep spec-requested tools, add LLM-selected ones
+                seen = set(tools)
+                for t in dynamic_tools:
+                    if t not in seen:
+                        tools.append(t)
+                        seen.add(t)
+            except Exception as exc:
+                logger.warning(
+                    "dynamic_tool_selection_failed_in_spec",
+                    error=str(exc),
+                    agent_type=str(agent_type_hint),
+                )
 
         constraints = constraint_override or AgentConstraints()
 
@@ -403,9 +470,10 @@ class SwarmComposer:
         template = AGENT_TEMPLATES.get(agent_type)
         default_tools = template.tools if template else []
 
-        # Build compact catalog for LLM
+        # Build compact catalog for LLM (native + dynamic)
+        all_entries = self._get_all_tool_entries()
         catalog_lines = []
-        for entry in self._tool_entries:
+        for entry in all_entries:
             if not entry.enabled:
                 continue
             caps = ", ".join(entry.capabilities[:4]) if entry.capabilities else ""
@@ -419,7 +487,7 @@ class SwarmComposer:
             f"Hypothesis: {task.context.get('hypothesis', '')}\n"
             f"Research query: {task.context.get('query', '')}\n\n"
             f"Default tools for this agent type: {default_tools}\n\n"
-            f"Available tools ({len(self._tool_entries)} total):\n"
+            f"Available tools ({len(all_entries)} total):\n"
             + "\n".join(catalog_lines[:80])  # cap prompt size
             + "\n\n"
             f"Select the {max_tools} most relevant tools for this specific task. "
@@ -440,10 +508,10 @@ class SwarmComposer:
                 research_id=self.session_id,
                 model=settings.llm_cheap_model,
             )
-            parsed = LLMClient.parse_json(response)
+            parsed = LLMClient.parse_json(response.text)
             if isinstance(parsed, list):
-                # Validate names against catalog
-                valid_names = {e.name for e in self._tool_entries if e.enabled}
+                # Validate names against catalog (native + dynamic)
+                valid_names = {e.name for e in self._get_all_tool_entries() if e.enabled}
                 selected = [str(n) for n in parsed if str(n) in valid_names]
                 if selected:
                     self.audit.log(

@@ -347,5 +347,5 @@ class TestResearchConfigDefaults:
 
     def test_agent_token_budget(self):
         config = ResearchConfig()
-        assert config.agent_token_budget == 200_000
+        assert config.agent_token_budget == 300_000
         assert config.session_token_budget == 10_000_000

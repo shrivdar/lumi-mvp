@@ -29,6 +29,7 @@ class BenchmarkSuite(enum.StrEnum):
 class RunMode(enum.StrEnum):
     ZERO_SHOT = "zero_shot"
     YOHAS_FULL = "yohas_full"
+    CODE_FIRST = "code_first"
 
 
 class InstanceStatus(enum.StrEnum):
@@ -53,6 +54,21 @@ class BenchmarkInstance(BaseModel):
     category: str = ""  # sub-category within the benchmark
 
 
+class TrialResult(BaseModel):
+    """Result of a single trial within a multi-trial evaluation."""
+
+    trial_number: int
+    predicted: str = ""
+    correct: bool = False
+    score: float = 0.0
+    tokens_used: int = 0
+    latency_ms: int = 0
+    turns: int = 0
+    tools_used: list[str] = Field(default_factory=list)
+    reasoning_trace: str = ""
+    hint_injected: str = ""
+
+
 class InstanceResult(BaseModel):
     """Result of running a single benchmark instance."""
 
@@ -72,6 +88,9 @@ class InstanceResult(BaseModel):
     status: InstanceStatus = InstanceStatus.COMPLETED
     started_at: datetime = Field(default_factory=_utcnow)
     completed_at: datetime | None = None
+    # Multi-trial fields
+    trial_results: list[TrialResult] = Field(default_factory=list)
+    best_trial: int = 0  # 0 = single trial, 1-indexed for multi-trial
 
 
 class TrajectoryStep(BaseModel):

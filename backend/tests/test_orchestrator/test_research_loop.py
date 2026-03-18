@@ -321,7 +321,7 @@ class TestScaledOrchestration:
         assert config.max_concurrent_agents == 100
         assert config.max_total_agents == 10_000
         assert config.max_hypothesis_breadth == 50
-        assert config.agent_token_budget == 200_000
+        assert config.agent_token_budget == 300_000
         assert config.session_token_budget == 10_000_000
 
 

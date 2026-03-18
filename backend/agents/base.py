@@ -105,6 +105,7 @@ class BaseAgentImpl:
         self._current_task: AgentTask | None = None  # set during execute() for virtual tools
         self._llm_calls: int = 0
         self._llm_tokens: int = 0
+        self._know_how_injected: bool = False
         self._errors: list[str] = []
         self._sub_agent_results: list[AgentResult] = []
         self._sub_agents_spawned: int = 0
@@ -225,17 +226,57 @@ class BaseAgentImpl:
                 # Know-how injection is non-critical — do not fail the agent
                 self.audit.error("agent_knowhow_failed", agent_id=self.agent_id, error=str(exc))
 
-            # 2. Investigate (subclass hook)
-            investigation = await self._investigate(task, kg_context)
+            # 2. Investigate (subclass hook) — with timeout enforcement
+            timeout = self.effective_constraints.timeout_seconds
+            try:
+                investigation = await asyncio.wait_for(
+                    self._investigate(task, kg_context),
+                    timeout=timeout if timeout and timeout > 0 else None,
+                )
+            except TimeoutError:
+                duration_ms = int(time.monotonic() * 1000) - start_ms
+                self.audit.log(
+                    "agent_timeout",
+                    agent_id=self.agent_id,
+                    task_id=task.task_id,
+                    timeout_seconds=timeout,
+                )
+                result = AgentResult(
+                    task_id=task.task_id,
+                    agent_id=self.agent_id,
+                    agent_type=self.agent_type,
+                    hypothesis_id=task.hypothesis_branch or "",
+                    parent_agent_id=self.parent_agent_id,
+                    depth=self.depth,
+                    nodes_added=self._nodes_added,
+                    edges_added=self._edges_added,
+                    nodes_updated=self._nodes_updated,
+                    edges_updated=self._edges_updated,
+                    uncertainty=self.get_uncertainty(),
+                    summary=f"Agent timed out after {timeout}s ({self._llm_calls} LLM calls made)",
+                    sub_agent_results=self._sub_agent_results,
+                    duration_ms=duration_ms,
+                    llm_calls=self._llm_calls,
+                    llm_tokens_used=self._llm_tokens,
+                    success=False,
+                    errors=[*self._errors, f"TIMEOUT: agent exceeded {timeout}s limit"],
+                )
+                self._record_trajectory(task, result)
+                return result
 
-            # 3. Write results to KG
+            # 3. Write results to KG (skip nodes/edges already written incrementally)
             nodes = investigation.get("nodes", [])
             edges = investigation.get("edges", [])
 
+            incremental_node_ids = {n.id for n in self._incremental_nodes}
+            incremental_edge_ids = {e.id for e in self._incremental_edges}
+
             for node in nodes:
-                self.write_node(node, task.hypothesis_branch)
+                if node.id not in incremental_node_ids:
+                    self.write_node(node, task.hypothesis_branch)
             for edge in edges:
-                self.write_edge(edge, task.hypothesis_branch)
+                if edge.id not in incremental_edge_ids:
+                    self.write_edge(edge, task.hypothesis_branch)
 
             # 4. Self-falsification
             falsification_results: list[FalsificationResult] = []
@@ -454,14 +495,15 @@ class BaseAgentImpl:
                 default Opus model.  ``None`` keeps the LLMClient default.
         """
         sys_prompt = system_prompt or self.effective_system_prompt
-        # Inject domain know-how only on first LLM call to save token budget
-        if self._current_know_how and not self._know_how_injected:
-            sys_prompt = sys_prompt + "\n\n" + self._current_know_how
+        # Inject domain know-how and data lake context only on first LLM call
+        # to save token budget — these are static reference materials
+        if not self._know_how_injected:
+            if self._current_know_how:
+                sys_prompt = sys_prompt + "\n\n" + self._current_know_how
+            dl_ctx = data_lake_context()
+            if dl_ctx:
+                sys_prompt = sys_prompt + "\n\n" + dl_ctx
             self._know_how_injected = True
-        # Inject data lake context so agents know what local datasets are available
-        dl_ctx = data_lake_context()
-        if dl_ctx:
-            sys_prompt = sys_prompt + "\n\n" + dl_ctx
 
         self.audit.log(
             "agent_llm_call",
@@ -642,9 +684,14 @@ class BaseAgentImpl:
                     )
                     eval_parsed = self.llm.parse_json(eval_response)
                     is_counter = eval_parsed.get("contradicts", False)
-                except Exception:
-                    # If LLM eval fails, fall back to treating it as potential counter-evidence
-                    is_counter = True
+                except Exception as exc:
+                    # Parse failure is inconclusive — do NOT treat as counter-evidence
+                    logger.warning(
+                        "falsification.llm_eval_parse_failed",
+                        edge_id=edge.id,
+                        error=str(exc),
+                    )
+                    is_counter = False
 
                 if is_counter:
                     counter_evidence.append(
@@ -1191,7 +1238,6 @@ class BaseAgentImpl:
         kg_context: dict[str, Any],
         *,
         max_turns: int | None = None,
-        token_budget: int = 0,
         investigation_focus: str = "",
     ) -> dict[str, Any]:
         """Multi-turn investigation loop: Plan → Generate → Execute → Observe → Repeat.
@@ -1205,8 +1251,6 @@ class BaseAgentImpl:
         Args:
             max_turns: Maximum number of turns before forcing an answer.
                 If None, resolved from spec constraints then default (20).
-            token_budget: Per-agent token budget. When exceeded the agent
-                is forced to answer on the next turn. 0 means no limit.
             investigation_focus: Steering string for the LLM.
         """
         # Resolve turn budget from spec constraints, then fallback to default
@@ -1257,13 +1301,27 @@ class BaseAgentImpl:
 
         # ---- Phase 2: Multi-turn execution loop ----
         for turn_num in range(1, max_turns + 1):
+            # max_llm_calls enforcement
+            if (
+                constraints.max_llm_calls
+                and self._llm_calls >= constraints.max_llm_calls
+            ):
+                logger.info(
+                    "agent_max_llm_calls_reached",
+                    agent_id=self.agent_id,
+                    llm_calls=self._llm_calls,
+                    max_llm_calls=constraints.max_llm_calls,
+                )
+                break
+
             # Compress observations if they've grown large
             if len(observations) > 15:
                 observations = await self._compress_observations(observations)
 
             # Token budget enforcement — force answer if budget exhausted
             budget_exhausted = (
-                token_budget > 0 and self._llm_tokens >= token_budget
+                constraints.token_budget > 0
+                and self._llm_tokens >= constraints.token_budget
             )
 
             obs_text = "\n\n".join(observations[-10:])
@@ -1409,7 +1467,7 @@ class BaseAgentImpl:
                     "agent_token_budget_stop",
                     agent_id=self.agent_id,
                     tokens_used=self._llm_tokens,
-                    budget=token_budget,
+                    budget=constraints.token_budget,
                     turn=turn_num,
                 )
                 return self._compile_from_observations(turns, observations, task)
@@ -1858,4 +1916,16 @@ class BaseAgentImpl:
             )
             for t in tasks
         ]
-        return list(await asyncio.gather(*coros, return_exceptions=False))
+        raw_results = await asyncio.gather(*coros, return_exceptions=True)
+        results: list[AgentResult] = []
+        for i, r in enumerate(raw_results):
+            if isinstance(r, BaseException):
+                logger.warning(
+                    "sub_agent_failed",
+                    task_index=i,
+                    task_description=tasks[i].get("task_description", ""),
+                    error=str(r),
+                )
+            else:
+                results.append(r)
+        return results
