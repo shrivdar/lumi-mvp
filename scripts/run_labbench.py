@@ -43,6 +43,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from benchmark_strategy import (
+    BenchmarkStrategyTracker,
+    QuestionOutcome,
+    detect_databases_from_text,
+    detect_question_type,
+)
+
 # ---------------------------------------------------------------------------
 # Path setup — must happen before any backend imports
 # ---------------------------------------------------------------------------
@@ -434,9 +441,17 @@ def _get_subtask_hint(question: BenchQuestion) -> str:
     )
 
 
-def build_prompt(question: BenchQuestion, choices: list[str]) -> str:
+def build_prompt(
+    question: BenchQuestion,
+    choices: list[str],
+    strategy_injection: str = "",
+) -> str:
     """Build the LLM prompt for a benchmark question."""
     parts = []
+
+    # Inject learned strategy before the question if available
+    if strategy_injection:
+        parts.append(strategy_injection)
 
     if question.context:
         parts.append(f"Context:\n{question.context}")
@@ -1029,12 +1044,17 @@ def build_agentic_turn_prompt(
     history: list[dict[str, str]],
     turn: int,
     hint: str = "",
+    strategy_injection: str = "",
 ) -> str:
     """Build the prompt for a single turn in the agentic loop."""
     is_seqqa = question.bench_subtask == "seqqa"
     parts: list[str] = []
 
     if turn == 0:
+        # Inject learned strategy at the start of the first turn
+        if strategy_injection:
+            parts.append(strategy_injection)
+
         # First turn: present the full question
         if question.context:
             parts.append(f"Context:\n{question.context}")
@@ -1178,6 +1198,7 @@ async def evaluate_question_agentic(
     timeout_seconds: int = 300,
     trial_hint: str = "",
     temperature: float | None = None,
+    strategy_injection: str = "",
 ) -> tuple[ScoredResult, str]:
     """Evaluate using multi-turn agentic reasoning with code execution.
 
@@ -1233,7 +1254,8 @@ async def evaluate_question_agentic(
                 break
 
             prompt = build_agentic_turn_prompt(
-                question, choices, history, turn, hint=trial_hint
+                question, choices, history, turn, hint=trial_hint,
+                strategy_injection=strategy_injection,
             )
 
             remaining_time = timeout_seconds - elapsed
@@ -1459,6 +1481,7 @@ async def evaluate_question_multitrial(
     agentic: bool = True,
     max_turns: int = 8,
     timeout_seconds: int = 300,
+    strategy_injection: str = "",
 ) -> tuple[ScoredResult, list[dict[str, Any]]]:
     """Evaluate with multiple trials, injecting hints from previous attempts.
 
@@ -1489,12 +1512,14 @@ async def evaluate_question_multitrial(
                 max_turns=max_turns,
                 timeout_seconds=timeout_seconds,
                 trial_hint=trial_hint,
+                strategy_injection=strategy_injection,
             )
         else:
             # Zero-shot with hint injection for trial > 0
             result = await evaluate_question_live(
                 question, llm, model=model, timeout_seconds=timeout_seconds,
                 trial_hint=trial_hint,
+                strategy_injection=strategy_injection,
             )
             reasoning = result.reasoning
 
@@ -1648,11 +1673,12 @@ async def evaluate_question_live(
     timeout_seconds: int = 300,
     trial_hint: str = "",
     temperature: float | None = None,
+    strategy_injection: str = "",
 ) -> ScoredResult:
     """Evaluate a single question using the LLM (zero-shot)."""
     start = time.monotonic()
     choices, correct_letter, refuse_letter = build_choices(question)
-    prompt = build_prompt(question, choices)
+    prompt = build_prompt(question, choices, strategy_injection=strategy_injection)
     if trial_hint:
         prompt += f"\n\nAdditional guidance from a previous attempt:\n{trial_hint}"
 
@@ -2000,6 +2026,24 @@ async def run_evaluation(
             ", ".join(k.upper() for k in subtask_keys),
         )
 
+    # 4b. Set up strategy tracker for within-run learning
+    strategy_persist_path = RESULTS_DIR / f"{run_id}_strategy.json"
+    strategy_tracker = BenchmarkStrategyTracker(
+        persist_path=strategy_persist_path,
+        rebuild_interval=10,
+    )
+    # Seed tracker with outcomes from resumed checkpoint results
+    for prev_r in results:
+        strategy_tracker.record(QuestionOutcome(
+            subtask=prev_r.subtask or prev_r.bench_subtask,
+            question_type=prev_r.subtask or "unknown",
+            predicted=prev_r.predicted,
+            correct=prev_r.correct_answer,
+            is_correct=prev_r.is_correct,
+            reasoning_summary="(resumed from checkpoint)",
+            code_executed=False,
+        ))
+
     # 5. Evaluate
     total = len(questions)
     remaining = [q for q in questions if q.id not in completed_ids]
@@ -2016,9 +2060,14 @@ async def run_evaluation(
     start_time = time.monotonic()
     sem = asyncio.Semaphore(concurrency)
 
+    use_yohas = mode == "yohas"
     use_agentic = mode == "agentic"
     use_multitrial = trials > 1
     use_voting = replicas > 1
+
+    # Lazy-import YOHAS evaluator only when needed
+    if use_yohas:
+        from yohas_bench_eval import evaluate_mcq_with_yohas
 
     for idx, question in enumerate(remaining):
         question_num = len(results) + 1
@@ -2032,8 +2081,59 @@ async def run_evaluation(
         async with sem:
             trial_details: list[dict[str, Any]] | None = None
 
+            # Get strategy injection for this question
+            current_strategy = strategy_tracker.get_strategy_injection()
+
+            # Check if strategy tracker recommends escalation/de-escalation
+            q_subtask = question.subtask or question.bench_subtask
+            effective_agentic = use_agentic
+            if not dry_run and strategy_tracker.get_outcome_count() >= 10:
+                if strategy_tracker.should_escalate(q_subtask) and not use_agentic:
+                    logger.info(
+                        "Strategy escalation: switching to agentic for subtask %s (acc < 30%%)",
+                        q_subtask,
+                    )
+                    effective_agentic = True
+                elif strategy_tracker.should_use_zero_shot(q_subtask) and use_agentic:
+                    logger.info(
+                        "Strategy de-escalation: using zero-shot for subtask %s (acc > 60%%)",
+                        q_subtask,
+                    )
+                    effective_agentic = False
+
             if dry_run:
                 result = evaluate_question_dry(question)
+            elif use_yohas:
+                # Full YOHAS 4-phase pipeline (hypothesize -> investigate -> synthesize -> falsify)
+                choices_list, correct_letter_y, refuse_letter_y = build_choices(question)
+                yohas_result = await evaluate_mcq_with_yohas(
+                    question_text=question.question,
+                    correct_answer_text=question.correct_answer,
+                    distractor_texts=list(question.distractors),
+                    correct_letter=correct_letter_y,
+                    choices_formatted=choices_list,
+                    llm=llm,
+                    model=model_name or None,
+                    subtask=question.subtask or question.bench_subtask,
+                    enable_falsification=True,
+                    timeout_seconds=timeout_seconds,
+                )
+                # Convert YOHASBenchResult -> ScoredResult
+                result = ScoredResult(
+                    question_id=question.id,
+                    subtask=question.subtask,
+                    predicted=yohas_result.predicted,
+                    predicted_text=_get_choice_text(choices_list, yohas_result.predicted),
+                    correct_answer=correct_letter_y,
+                    correct_text=question.correct_answer,
+                    is_correct=yohas_result.predicted == correct_letter_y,
+                    is_refused=yohas_result.predicted == refuse_letter_y,
+                    reasoning=yohas_result.reasoning,
+                    tokens_used=yohas_result.tokens_used,
+                    latency_ms=yohas_result.duration_ms,
+                    error=None if yohas_result.predicted else "no_answer",
+                    bench_subtask=question.bench_subtask,
+                )
             elif use_voting:
                 # Majority voting mode
                 result = await evaluate_with_voting(
@@ -2051,17 +2151,19 @@ async def run_evaluation(
                     llm,
                     model=model_name,
                     max_trials=trials,
-                    agentic=use_agentic,
+                    agentic=effective_agentic,
                     max_turns=max_turns,
                     timeout_seconds=timeout_seconds,
+                    strategy_injection=current_strategy,
                 )
-            elif use_agentic:
+            elif effective_agentic:
                 result, _reasoning = await evaluate_question_agentic(
                     question,
                     llm,
                     model=model_name,
                     max_turns=max_turns,
                     timeout_seconds=timeout_seconds,
+                    strategy_injection=current_strategy,
                 )
             else:
                 result = await evaluate_question_live(
@@ -2069,6 +2171,7 @@ async def run_evaluation(
                     llm,
                     model=model_name,
                     timeout_seconds=timeout_seconds,
+                    strategy_injection=current_strategy,
                 )
 
         # Two-pass verification (--verify)
@@ -2087,6 +2190,20 @@ async def run_evaluation(
 
         results.append(result)
         checkpoint.save_result(result, trial_details=trial_details)
+
+        # Record outcome for strategy learning
+        reasoning_text = getattr(result, "reasoning", "") or ""
+        strategy_tracker.record(QuestionOutcome(
+            subtask=result.subtask or result.bench_subtask,
+            question_type=detect_question_type(question.question, result.subtask),
+            predicted=result.predicted,
+            correct=result.correct_answer,
+            is_correct=result.is_correct,
+            reasoning_summary=reasoning_text[:300],
+            tools_used=[],
+            databases_queried=detect_databases_from_text(reasoning_text),
+            code_executed="[Code" in reasoning_text or "<execute>" in reasoning_text,
+        ))
 
         if result.is_correct:
             correct_so_far += 1
@@ -2156,6 +2273,11 @@ async def run_evaluation(
             "verify": verify,
         },
         "metrics": metrics,
+        "strategy_evolution": {
+            "final_strategy": strategy_tracker.strategy_text,
+            "subtask_accuracy": strategy_tracker.subtask_accuracy,
+            "total_outcomes_tracked": strategy_tracker.get_outcome_count(),
+        },
         "competitor_baselines": {
             "STELLA": 0.54,
             "Biomni_Lab": 0.78,
@@ -2273,6 +2395,7 @@ def main() -> None:
             "  python scripts/run_labbench.py --subtask litqa2 --limit 5 --mode agentic\n"
             "  python scripts/run_labbench.py --subtask all --limit 10 --dry-run\n"
             "  python scripts/run_labbench.py --subtask dbqa --replicas 3 --limit 5\n"
+            "  python scripts/run_labbench.py --subtask dbqa --mode yohas --model opus --limit 5\n"
         ),
     )
     parser.add_argument(
@@ -2285,8 +2408,8 @@ def main() -> None:
         "--mode",
         type=str,
         default="zero-shot",
-        choices=["zero-shot", "agentic"],
-        help="Evaluation mode: zero-shot (single LLM call) or agentic (multi-turn with code execution)",
+        choices=["zero-shot", "agentic", "yohas"],
+        help="Evaluation mode: zero-shot (single LLM call), agentic (multi-turn with code execution), or yohas (full YOHAS 4-phase pipeline)",
     )
     parser.add_argument(
         "--model",

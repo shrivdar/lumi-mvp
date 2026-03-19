@@ -45,6 +45,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from benchmark_strategy import (
+    BenchmarkStrategyTracker,
+    QuestionOutcome,
+    detect_databases_from_text,
+    detect_question_type,
+)
+
 # ---------------------------------------------------------------------------
 # Path setup — ensure backend is importable
 # ---------------------------------------------------------------------------
@@ -1001,6 +1008,7 @@ async def evaluate_question_agentic(
     prev_answer: str | None = None,
     prev_reason: str | None = None,
     model: str | None = None,
+    strategy_injection: str = "",
 ) -> dict[str, Any]:
     """Evaluate a question using the agentic multi-turn code execution loop."""
     start = time.monotonic()
@@ -1011,7 +1019,7 @@ async def evaluate_question_agentic(
         # If no capsule, fall back to zero-shot open mode
         if capsule_path is None:
             logger.warning("No capsule for %s, falling back to zero-shot", qid)
-            result = await evaluate_question(question_row, llm, mode="open", timeout_seconds=timeout_seconds, model=model)
+            result = await evaluate_question(question_row, llm, mode="open", timeout_seconds=timeout_seconds, model=model, strategy_injection=strategy_injection)
             result["mode"] = "agentic-fallback"
             return result
 
@@ -1019,13 +1027,16 @@ async def evaluate_question_agentic(
         capsule_files = list_capsule_files(capsule_path)
         if not capsule_files:
             logger.warning("Empty capsule for %s, falling back to zero-shot", qid)
-            result = await evaluate_question(question_row, llm, mode="open", timeout_seconds=timeout_seconds, model=model)
+            result = await evaluate_question(question_row, llm, mode="open", timeout_seconds=timeout_seconds, model=model, strategy_injection=strategy_injection)
             result["mode"] = "agentic-fallback"
             return result
 
         # Build initial prompt
         initial_prompt = _build_agentic_prompt(question_row, capsule_files)
         system_prompt = _build_agentic_system_prompt()
+        # Inject strategy into agentic system prompt
+        if strategy_injection:
+            system_prompt = system_prompt + strategy_injection
 
         # Conversation history for multi-turn
         conversation: list[str] = [initial_prompt]
@@ -1225,11 +1236,17 @@ async def evaluate_question(
     mode: str = "open",
     timeout_seconds: int = 300,
     model: str | None = None,
+    strategy_injection: str = "",
 ) -> dict[str, Any]:
     """Evaluate a single BixBench question and return result dict."""
     start = time.monotonic()
     qid = question_row.get("question_id", question_row.get("id", ""))
     tokens_used = 0
+
+    # Prepend strategy to the system prompt if available
+    system_prompt = _build_system_prompt()
+    if strategy_injection:
+        system_prompt = system_prompt + strategy_injection
 
     try:
         if mode == "mcq":
@@ -1237,7 +1254,7 @@ async def evaluate_question(
             resp = await asyncio.wait_for(
                 llm.query(
                     prompt,
-                    system_prompt=_build_system_prompt(),
+                    system_prompt=system_prompt,
                     max_tokens=1024,
                     model=model,
                 ),
@@ -1251,7 +1268,7 @@ async def evaluate_question(
             resp = await asyncio.wait_for(
                 llm.query(
                     prompt,
-                    system_prompt=_build_system_prompt(),
+                    system_prompt=system_prompt,
                     max_tokens=2048,
                     model=model,
                 ),
@@ -1568,6 +1585,27 @@ async def run_pipeline(args: argparse.Namespace) -> None:
 
     results = list(prev_results)
 
+    # 2b. Set up strategy tracker for within-run learning
+    strategy_persist_path = RESULTS_DIR / "bixbench_strategy.json"
+    strategy_tracker = BenchmarkStrategyTracker(
+        persist_path=strategy_persist_path,
+        rebuild_interval=10,
+    )
+    # Seed tracker with outcomes from resumed checkpoint results
+    for prev_r in prev_results:
+        strategy_tracker.record(QuestionOutcome(
+            subtask=prev_r.get("categories", "unknown"),
+            question_type=detect_question_type(
+                prev_r.get("question", ""),
+                prev_r.get("categories", ""),
+            ),
+            predicted=prev_r.get("predicted", ""),
+            correct=prev_r.get("ideal", ""),
+            is_correct=prev_r.get("correct", False),
+            reasoning_summary="(resumed from checkpoint)",
+            code_executed=prev_r.get("mode", "") == "agentic",
+        ))
+
     # 3. Initialize LLM
     from core.llm import LLMClient
     llm = LLMClient()
@@ -1611,6 +1649,9 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         q_text = q["question"][:80].replace("\n", " ")
         print(f"  {prefix}: {qid} — {q_text}...")
 
+        # Get strategy injection for this question
+        current_strategy = strategy_tracker.get_strategy_injection()
+
         if num_replicas > 1:
             # Majority voting mode — run N replicas and take consensus
             capsule_path = ensure_capsule(q, dataset=dataset_variant) if args.mode == "agentic" else None
@@ -1627,6 +1668,62 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                 verbose=args.verbose,
                 model=resolved_model,
             )
+            results.append(result)
+        elif args.mode == "yohas":
+            # Full YOHAS 4-phase pipeline (hypothesize -> investigate -> synthesize -> falsify)
+            from yohas_bench_eval import evaluate_with_yohas as _yohas_eval
+
+            distractors_raw = q.get("distractors", [])
+            ideal_val = str(q.get("ideal", ""))
+            if distractors_raw:
+                import random as _rng_mod
+                all_opts = [ideal_val] + [str(d) for d in distractors_raw]
+                _rng = _rng_mod.Random(hash(qid))
+                _rng.shuffle(all_opts)
+                _letters = "ABCDEFGH"
+                yohas_choices = [(_letters[j], opt) for j, opt in enumerate(all_opts)]
+                correct_yohas = next(
+                    (_letters[j] for j, opt in enumerate(all_opts) if opt == ideal_val), "A"
+                )
+            else:
+                yohas_choices = [("A", ideal_val)]
+                correct_yohas = "A"
+
+            yohas_result = await _yohas_eval(
+                question=q["question"],
+                choices=yohas_choices,
+                correct_letter=correct_yohas,
+                llm=llm,
+                model=resolved_model,
+                subtask=q.get("categories", ""),
+                enable_falsification=True,
+                timeout_seconds=args.timeout,
+            )
+
+            predicted_value = ""
+            for _ltr, _txt in yohas_choices:
+                if _ltr == yohas_result.predicted:
+                    predicted_value = _txt
+                    break
+
+            correct = await grade_answer(predicted_value, q, llm=llm)
+            result = {
+                "question_id": qid,
+                "question": q["question"][:200],
+                "hypothesis": q.get("hypothesis", "")[:200],
+                "ideal": ideal_val,
+                "predicted": predicted_value,
+                "correct": correct,
+                "eval_mode": q.get("eval_mode", "str_verifier"),
+                "categories": q.get("categories", ""),
+                "tokens_used": yohas_result.tokens_used,
+                "duration_ms": yohas_result.duration_ms,
+                "mode": "yohas",
+                "phases": yohas_result.phases_completed,
+                "confidence": yohas_result.confidence,
+                "raw_response": yohas_result.reasoning[:500],
+                "error": None if yohas_result.predicted else "no_answer",
+            }
             results.append(result)
         elif args.mode == "agentic":
             # Download/extract capsule
@@ -1658,19 +1755,38 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                     prev_answer=prev_answer,
                     prev_reason=prev_reason,
                     model=resolved_model,
+                    strategy_injection=current_strategy,
                 )
 
             results.append(result)  # type: ignore[arg-type]
         else:
             # Zero-shot modes (open / mcq)
             result = await evaluate_question(
-                q, llm, mode=args.mode, timeout_seconds=args.timeout, model=resolved_model
+                q, llm, mode=args.mode, timeout_seconds=args.timeout,
+                model=resolved_model, strategy_injection=current_strategy,
             )
             results.append(result)
 
         running_total += 1
         if result["correct"]:  # type: ignore[index]
             running_correct += 1
+
+        # Record outcome for strategy learning
+        raw_response = result.get("raw_response", "") or ""  # type: ignore[union-attr]
+        strategy_tracker.record(QuestionOutcome(
+            subtask=result.get("categories", "unknown") or "unknown",  # type: ignore[union-attr]
+            question_type=detect_question_type(
+                q.get("question", ""),
+                result.get("categories", ""),  # type: ignore[union-attr]
+            ),
+            predicted=result.get("predicted", "") or "",  # type: ignore[union-attr]
+            correct=result.get("ideal", "") or "",  # type: ignore[union-attr]
+            is_correct=result.get("correct", False),  # type: ignore[union-attr]
+            reasoning_summary=raw_response[:300],
+            tools_used=[],
+            databases_queried=detect_databases_from_text(raw_response),
+            code_executed=result.get("mode", "") == "agentic",  # type: ignore[union-attr]
+        ))
 
         # Print result
         status = "CORRECT" if result["correct"] else "WRONG"  # type: ignore[index]
@@ -1732,6 +1848,11 @@ async def run_pipeline(args: argparse.Namespace) -> None:
             "replicas": num_replicas,
             "max_turns": getattr(args, "max_turns", None),
             "partial": False,
+            "strategy_evolution": {
+                "final_strategy": strategy_tracker.strategy_text,
+                "subtask_accuracy": strategy_tracker.subtask_accuracy,
+                "total_outcomes_tracked": strategy_tracker.get_outcome_count(),
+            },
         },
     )
 
@@ -1832,9 +1953,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--mode",
-        choices=["open", "mcq", "agentic"],
+        choices=["open", "mcq", "agentic", "yohas"],
         default="agentic",
-        help="Answer mode: 'open' (free-form), 'mcq' (multiple choice), or 'agentic' (code execution). Default: agentic",
+        help="Answer mode: 'open' (free-form), 'mcq' (multiple choice), 'agentic' (code execution), or 'yohas' (full YOHAS 4-phase pipeline). Default: agentic",
     )
     p.add_argument(
         "--model",
