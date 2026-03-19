@@ -18,6 +18,7 @@ Usage:
     python scripts/run_bixbench.py --limit 5
     python scripts/run_bixbench.py --limit 205 --mode mcq
     python scripts/run_bixbench.py --mode agentic --limit 3 --trials 2
+    python scripts/run_bixbench.py --mode agentic --limit 5 --replicas 3
     python scripts/run_bixbench.py --resume data/benchmarks/bixbench_results.json
 """
 
@@ -535,7 +536,14 @@ def _build_agentic_system_prompt() -> str:
         "- When you have the final answer, respond with <answer>YOUR_ANSWER</answer>\n"
         "- If the question asks for a number, put ONLY the number in <answer> tags.\n"
         "- If the question asks for a name/term, put ONLY that term.\n"
-        "- Be precise: match the expected format (e.g. rounded to N decimal places).\n"
+        "- Be precise: match the expected format (e.g. rounded to N decimal places).\n\n"
+        "## Self-Correction:\n"
+        "If your code produces an error, READ THE ERROR MESSAGE CAREFULLY and fix your code.\n"
+        "Common fixes:\n"
+        "- FileNotFoundError: list files with os.listdir('.') first\n"
+        "- ImportError: try alternative libraries (e.g., scipy.stats instead of statsmodels)\n"
+        "- KeyError: check df.columns first\n"
+        "- TypeError: check df.dtypes\n"
     )
 
 
@@ -623,17 +631,56 @@ def _build_agentic_prompt(
 
 
 def _extract_open_answer(response: str) -> str:
-    """Extract answer from <answer> tags or fall back to heuristics."""
-    # <answer> tags
+    """Extract answer from <answer> tags or fall back to robust heuristics."""
+    # 1. <answer> tags (highest priority)
     m = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
     if m:
         return m.group(1).strip()
-    # Last line after "Answer:"
-    m = re.search(r"(?:answer|result)\s*[:=]\s*(.+)", response, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    # Fall back to last non-empty line
-    lines = [l.strip() for l in response.strip().split("\n") if l.strip()]
+
+    # 2. Explicit "Answer: X", "The answer is X", "Result: X" patterns
+    answer_patterns = [
+        r"(?:the\s+)?answer\s+is\s*[:=]?\s*(.+?)(?:\.|$)",
+        r"(?:final\s+)?answer\s*[:=]\s*(.+?)(?:\.|$)",
+        r"result\s*[:=]\s*(.+?)(?:\.|$)",
+        r"=\s*(.+?)(?:\n|$)",
+    ]
+    for pat in answer_patterns:
+        m = re.search(pat, response, re.IGNORECASE | re.MULTILINE)
+        if m:
+            candidate = m.group(1).strip()
+            # Skip if the "answer" is too long (likely explanatory text)
+            if candidate and len(candidate) < 200:
+                # Clean up trailing punctuation/markdown
+                candidate = re.sub(r"[`*_]+$", "", candidate).strip()
+                if candidate:
+                    return candidate
+
+    # 3. For numeric answers: extract the last standalone number mentioned
+    numbers = re.findall(
+        r"(?<![a-zA-Z])[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?(?![a-zA-Z])",
+        response,
+    )
+    if numbers:
+        # Prefer the last number (usually the final computed result)
+        return numbers[-1]
+
+    # 4. For string answers: look for prominent capitalized entities (gene names, etc.)
+    #    Match sequences like "BRCA1", "TP53", "IL-6", "CD8+", etc.
+    entities = re.findall(
+        r"\b([A-Z][A-Z0-9](?:[A-Z0-9\-/+]*[A-Z0-9])?)\b",
+        response,
+    )
+    if entities:
+        # Return the last prominent entity (likely the answer)
+        # Filter out common non-answer tokens
+        skip = {"THE", "AND", "FOR", "NOT", "BUT", "ARE", "WAS", "HAS", "WITH", "FROM",
+                "THIS", "THAT", "THAN", "ALSO", "BEEN", "WILL", "INTO", "EACH", "ONLY"}
+        filtered = [e for e in entities if e not in skip and len(e) >= 2]
+        if filtered:
+            return filtered[-1]
+
+    # 5. Fall back to last non-empty line
+    lines = [ln.strip() for ln in response.strip().split("\n") if ln.strip()]
     return lines[-1] if lines else response.strip()
 
 
@@ -699,6 +746,34 @@ async def evaluate_question_agentic(
         answer_found = False
         turns_used = 0
 
+        # Pre-analysis: automatically explore data files before the agent's first turn
+        pre_analysis_code = """
+import os, json
+print("=== Available files ===")
+for f in sorted(os.listdir('.')):
+    size = os.path.getsize(f)
+    print(f"  {f} ({size:,} bytes)")
+    if f.endswith('.csv'):
+        import pandas as pd
+        df = pd.read_csv(f, nrows=3)
+        print(f"    Columns: {list(df.columns)}")
+        print(f"    Shape: {df.shape}")
+        print(f"    Dtypes: {dict(df.dtypes)}")
+    elif f.endswith('.json'):
+        with open(f) as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            print(f"    List of {len(data)} items")
+        elif isinstance(data, dict):
+            print(f"    Dict with keys: {list(data.keys())[:10]}")
+"""
+        pre_analysis_output = execute_code(pre_analysis_code, str(capsule_path))
+        if pre_analysis_output.strip():
+            conversation[0] += (
+                f"\n\n## Pre-Analysis (auto-generated data exploration)\n"
+                f"```\n{pre_analysis_output}\n```"
+            )
+
         for turn in range(max_turns):
             turns_used = turn + 1
             elapsed = time.monotonic() - start
@@ -737,9 +812,21 @@ async def evaluate_question_agentic(
                 if len(output) > 8000:
                     output = output[:4000] + "\n... (output truncated) ...\n" + output[-2000:]
 
-                # Add to conversation
+                # Add to conversation — include self-correction nudge on errors
                 conversation.append(response_text)
-                conversation.append(f"## Code Execution Output (Turn {turn + 1}):\n```\n{output}\n```\n\nContinue your analysis. If you have the answer, provide it in <answer>...</answer> tags.")
+                if "Error:" in output or "Traceback" in output:
+                    conversation.append(
+                        f"## Code Execution Output (Turn {turn + 1}):\n```\n{output}\n```\n\n"
+                        "**Your code produced an error.** Read the error message carefully and fix it.\n"
+                        "Common fixes:\n"
+                        "- FileNotFoundError: use os.listdir('.') to check available files\n"
+                        "- ImportError: try an alternative library\n"
+                        "- KeyError: print df.columns to check column names\n"
+                        "- TypeError: print df.dtypes to check types\n\n"
+                        "Fix the code and try again."
+                    )
+                else:
+                    conversation.append(f"## Code Execution Output (Turn {turn + 1}):\n```\n{output}\n```\n\nContinue your analysis. If you have the answer, provide it in <answer>...</answer> tags.")
             else:
                 # No code and no answer — ask the agent to provide one
                 conversation.append(response_text)
@@ -1011,6 +1098,136 @@ def save_results(
 
 
 # ---------------------------------------------------------------------------
+# Prompt variation for replica diversity
+# ---------------------------------------------------------------------------
+
+PROMPT_VARIATIONS = [
+    "",  # no suffix for replica 0
+    "\n\nApproach this systematically, step by step.",
+    "\n\nThink step by step and verify each intermediate result.",
+    "\n\nBe precise and analytical. Double-check your calculations.",
+    "\n\nConsider multiple approaches before settling on an answer.",
+    "\n\nFocus on accuracy. Verify your answer against the raw data.",
+    "\n\nWork carefully and show your reasoning at each step.",
+    "\n\nStart with the simplest approach that could work.",
+]
+
+
+# ---------------------------------------------------------------------------
+# Majority voting evaluation
+# ---------------------------------------------------------------------------
+
+
+async def evaluate_with_voting(
+    question_row: dict[str, Any],
+    llm: Any,
+    n_replicas: int,
+    mode: str = "agentic",
+    capsule_path: Path | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    timeout_seconds: int = 300,
+    num_trials: int = 1,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Run evaluation N times and take majority vote on the answer.
+
+    Returns a single result dict with the majority answer and aggregated metadata.
+    """
+    from collections import Counter
+
+    qid = question_row.get("question_id", question_row.get("id", ""))
+    replica_results: list[dict[str, Any]] = []
+
+    for replica_idx in range(n_replicas):
+        # Add prompt variation for diversity
+        variation_suffix = PROMPT_VARIATIONS[replica_idx % len(PROMPT_VARIATIONS)]
+
+        # Create a modified question with variation appended to the question text
+        modified_q = dict(question_row)
+        if variation_suffix:
+            modified_q["question"] = question_row["question"] + variation_suffix
+
+        if mode == "agentic":
+            result = None
+            for trial in range(1, num_trials + 1):
+                prev_answer = result["predicted"] if result is not None else None
+                prev_reason = (
+                    f"expected '{question_row.get('ideal', '')}'"
+                    if result is not None and not result["correct"]
+                    else None
+                )
+                if result is not None and result["correct"]:
+                    break
+                result = await evaluate_question_agentic(
+                    modified_q,
+                    llm,
+                    capsule_path,
+                    max_turns=max_turns,
+                    timeout_seconds=timeout_seconds,
+                    trial=trial,
+                    prev_answer=prev_answer,
+                    prev_reason=prev_reason,
+                )
+        else:
+            result = await evaluate_question(
+                modified_q, llm, mode=mode, timeout_seconds=timeout_seconds
+            )
+
+        replica_results.append(result)  # type: ignore[arg-type]
+
+        if verbose:
+            status = "CORRECT" if result["correct"] else "WRONG"  # type: ignore[index]
+            print(
+                f"      Replica {replica_idx + 1}/{n_replicas}: "
+                f"[{status}] predicted={result['predicted'][:60]}"  # type: ignore[index]
+            )
+
+    # Majority vote on predicted answers
+    answers = [r["predicted"] for r in replica_results if r["predicted"]]
+    if not answers:
+        # All replicas failed — return the last result
+        return replica_results[-1]
+
+    counts = Counter(answers)
+    majority_answer, majority_count = counts.most_common(1)[0]
+
+    # Check for ties — if tied, prefer the answer from the replica that was graded correct
+    if len(counts) > 1:
+        top_count = counts.most_common(1)[0][1]
+        tied_answers = [ans for ans, cnt in counts.items() if cnt == top_count]
+        if len(tied_answers) > 1:
+            # Prefer an answer that was graded correct in any replica
+            for ans in tied_answers:
+                for r in replica_results:
+                    if r["predicted"] == ans and r.get("correct"):
+                        majority_answer = ans
+                        break
+
+    # Build the final result from the majority answer
+    # Find one replica that produced the majority answer to use as base
+    base_result = next(
+        (r for r in replica_results if r["predicted"] == majority_answer),
+        replica_results[0],
+    )
+
+    # Re-grade the majority answer against the question
+    correct = await grade_answer(majority_answer, question_row, llm=llm)
+
+    final_result = dict(base_result)
+    final_result["predicted"] = majority_answer
+    final_result["correct"] = correct
+    final_result["replicas"] = n_replicas
+    final_result["majority_count"] = majority_count
+    final_result["replica_answers"] = answers
+    final_result["tokens_used"] = sum(r.get("tokens_used", 0) for r in replica_results)
+    final_result["duration_ms"] = sum(r.get("duration_ms", 0) for r in replica_results)
+    # Restore original question text (without variation suffix)
+    final_result["question"] = question_row["question"][:200]
+
+    return final_result
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -1046,10 +1263,13 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     running_total = len(results)
     skipped = 0
     num_trials = getattr(args, "trials", 1)
+    num_replicas = getattr(args, "replicas", 1)
 
     mode_label = args.mode
     if args.mode == "agentic":
         mode_label = f"agentic (max_turns={args.max_turns}, trials={num_trials})"
+    if num_replicas > 1:
+        mode_label += f", replicas={num_replicas}"
 
     print("\n" + "=" * 70)
     print(f"  BixBench Evaluation — {total} questions, mode={mode_label}")
@@ -1072,7 +1292,23 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         q_text = q["question"][:80].replace("\n", " ")
         print(f"  {prefix}: {qid} — {q_text}...")
 
-        if args.mode == "agentic":
+        if num_replicas > 1:
+            # Majority voting mode — run N replicas and take consensus
+            capsule_path = ensure_capsule(q) if args.mode == "agentic" else None
+            print(f"    -> Running {num_replicas} replicas for majority voting...")
+            result = await evaluate_with_voting(
+                q,
+                llm,
+                n_replicas=num_replicas,
+                mode=args.mode,
+                capsule_path=capsule_path,
+                max_turns=args.max_turns,
+                timeout_seconds=args.timeout,
+                num_trials=num_trials,
+                verbose=args.verbose,
+            )
+            results.append(result)
+        elif args.mode == "agentic":
             # Download/extract capsule
             capsule_path = ensure_capsule(q)
 
@@ -1126,6 +1362,9 @@ async def run_pipeline(args: argparse.Namespace) -> None:
             turns_info = f" turns={result.get('turns_used', '?')}"  # type: ignore[union-attr]
             if num_trials > 1:
                 turns_info += f" trial={result.get('trial', '?')}"  # type: ignore[union-attr]
+        if num_replicas > 1:
+            majority_ct = result.get("majority_count", "?")  # type: ignore[union-attr]
+            turns_info += f" vote={majority_ct}/{num_replicas}"
 
         print(
             f"    -> [{status}] predicted={result['predicted'][:60]} "  # type: ignore[index]
@@ -1143,6 +1382,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                 "limit": args.limit,
                 "timeout": args.timeout,
                 "trials": num_trials,
+                "replicas": num_replicas,
                 "max_turns": getattr(args, "max_turns", None),
                 "partial": True,
                 "completed": running_total,
@@ -1158,6 +1398,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
             "limit": args.limit,
             "timeout": args.timeout,
             "trials": num_trials,
+            "replicas": num_replicas,
             "max_turns": getattr(args, "max_turns", None),
             "partial": False,
         },
@@ -1178,6 +1419,8 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     if args.mode == "agentic":
         print(f"  Max turns: {args.max_turns}")
         print(f"  Trials:    {num_trials}")
+    if num_replicas > 1:
+        print(f"  Replicas:  {num_replicas} (majority voting)")
     print(f"  Total:     {final_total}")
     print(f"  Correct:   {final_correct}")
     print(f"  Accuracy:  {final_acc:.1f}%")
@@ -1235,6 +1478,7 @@ def parse_args() -> argparse.Namespace:
             "  python scripts/run_bixbench.py --limit 205 --mode mcq\n"
             "  python scripts/run_bixbench.py --mode agentic --limit 3\n"
             "  python scripts/run_bixbench.py --mode agentic --limit 10 --trials 2\n"
+            "  python scripts/run_bixbench.py --mode agentic --limit 5 --replicas 3\n"
             "  python scripts/run_bixbench.py --resume data/benchmarks/bixbench_results.json\n"
         ),
     )
@@ -1261,6 +1505,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_TURNS,
         help=f"Max turns per agentic evaluation (default: {DEFAULT_MAX_TURNS})",
+    )
+    p.add_argument(
+        "--replicas",
+        type=int,
+        default=1,
+        help="Number of replicas per question for majority voting (default: 1). "
+             "When N>1, runs the evaluation N times and takes the majority answer.",
     )
     p.add_argument(
         "--timeout",

@@ -36,6 +36,7 @@ from core.models import (
     KGEdge,
     KGNode,
     NodeType,
+    ResearchMode,
     TurnType,
     UncertaintyVector,
 )
@@ -207,24 +208,27 @@ class BaseAgentImpl:
             kg_context = self._build_kg_context(task)
 
             # 1b. Retrieve domain know-how for injection into LLM calls
+            # Skip in fast mode to save ~17K tokens per agent
             self._current_know_how = ""
-            try:
-                know_how = await self._know_how_retriever.get_context_for_task(
-                    task_instruction=task.instruction,
-                    agent_type=str(self.agent_type),
-                    context=task.context.get("query", ""),
-                )
-                if know_how:
-                    self._current_know_how = know_how
-                    self.audit.log(
-                        "agent_knowhow_injected",
-                        agent_id=self.agent_id,
-                        task_id=task.task_id,
-                        know_how_len=len(know_how),
+            _is_fast = task.context.get("research_mode") == ResearchMode.FAST
+            if not _is_fast:
+                try:
+                    know_how = await self._know_how_retriever.get_context_for_task(
+                        task_instruction=task.instruction,
+                        agent_type=str(self.agent_type),
+                        context=task.context.get("query", ""),
                     )
-            except Exception as exc:
-                # Know-how injection is non-critical — do not fail the agent
-                self.audit.error("agent_knowhow_failed", agent_id=self.agent_id, error=str(exc))
+                    if know_how:
+                        self._current_know_how = know_how
+                        self.audit.log(
+                            "agent_knowhow_injected",
+                            agent_id=self.agent_id,
+                            task_id=task.task_id,
+                            know_how_len=len(know_how),
+                        )
+                except Exception as exc:
+                    # Know-how injection is non-critical — do not fail the agent
+                    self.audit.error("agent_knowhow_failed", agent_id=self.agent_id, error=str(exc))
 
             # 2. Investigate (subclass hook) — with timeout enforcement
             timeout = self.effective_constraints.timeout_seconds
@@ -1311,6 +1315,17 @@ class BaseAgentImpl:
         if max_turns is None:
             max_turns = constraints.max_turns
 
+        # Detect research mode from the task context (set by orchestrator)
+        research_mode_str = task.context.get("research_mode", "")
+        is_fast_mode = research_mode_str == ResearchMode.FAST
+
+        # Fast mode overrides: fewer turns, cheap model
+        if is_fast_mode:
+            max_turns = min(max_turns, 10)
+            fast_model = settings.llm_cheap_model
+        else:
+            fast_model = None  # use default model routing
+
         turns: list[AgentTurn] = []
         observations: list[str] = []
 
@@ -1354,7 +1369,8 @@ class BaseAgentImpl:
         )
 
         plan_response = await self.query_llm(
-            plan_prompt, kg_context=kg_context, model=settings.llm_fast_model,
+            plan_prompt, kg_context=kg_context,
+            model=fast_model or settings.llm_fast_model,
         )
         plan_think = self._extract_tag(plan_response, "think") or plan_response
 
@@ -1483,7 +1499,7 @@ class BaseAgentImpl:
             answer_max_tokens = 8192 if remaining <= 5 else None
             response = await self.query_llm(
                 turn_prompt, kg_context=kg_context, max_tokens=answer_max_tokens,
-                model=settings.llm_fast_model,
+                model=fast_model or settings.llm_fast_model,
             )
             duration = int(time.monotonic() * 1000) - start_ms
 

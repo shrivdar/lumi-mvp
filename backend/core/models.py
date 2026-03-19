@@ -181,6 +181,14 @@ class ScreeningTier(enum.StrEnum):
     BLOCKED = "BLOCKED"    # Refuse to present results
 
 
+class ResearchMode(enum.StrEnum):
+    """Research session speed/depth mode."""
+
+    FAST = "fast"          # Single agent, code-first, Haiku, 60s
+    STANDARD = "standard"  # Small swarm, Sonnet, 10 min
+    DEEP = "deep"          # Full MCTS, Sonnet, 30 min
+
+
 class ToolSourceType(enum.StrEnum):
     """How a tool is provided to the system."""
 
@@ -515,6 +523,8 @@ AgentResult.model_rebuild()
 class ResearchConfig(BaseModel):
     """Configuration for a specific research session."""
 
+    research_mode: ResearchMode = ResearchMode.DEEP  # fast / standard / deep
+
     max_hypothesis_depth: int = 5
     max_mcts_iterations: int = 30
     max_agents: int = 8
@@ -528,7 +538,7 @@ class ResearchConfig(BaseModel):
     enable_hitl: bool = True
     slack_channel_id: str | None = None
 
-    code_first: bool = False  # Single-agent mode with full tool + code execution access
+    code_first: bool = True  # Changed from False — code-first is now the default
 
     # --- Scaled orchestration (per-hypothesis swarms) ---
     max_concurrent_agents: int = 100  # Global concurrency limit (semaphore)

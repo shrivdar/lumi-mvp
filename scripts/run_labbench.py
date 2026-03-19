@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Standalone LAB-Bench DbQA benchmark pipeline for YOHAS 3.0.
+"""Standalone LAB-Bench benchmark pipeline for YOHAS 3.0.
 
-Downloads (if needed), loads, and evaluates YOHAS on the LAB-Bench DbQA subset
-(520 multiple-choice questions testing ability to query biological databases).
+Downloads (if needed), loads, and evaluates YOHAS on LAB-Bench subtasks:
+  - DbQA:   520 MCQs testing ability to query biological databases
+  - SeqQA:  MCQs testing DNA/protein sequence manipulation
+  - LitQA2: MCQs testing literature recall and reasoning (RAG)
 
 Competitor to beat: STELLA at 54% on DbQA.  Target: Biomni Lab at 78%.
 
@@ -10,9 +12,13 @@ Usage:
     python scripts/run_labbench.py --limit 5
     python scripts/run_labbench.py --limit 50 --mode zero-shot
     python scripts/run_labbench.py --mode agentic --trials 3 --limit 10
-    python scripts/run_labbench.py                           # all 520 questions
+    python scripts/run_labbench.py                           # all DbQA questions
     python scripts/run_labbench.py --resume                  # resume from checkpoint
     python scripts/run_labbench.py --dry-run                 # no LLM calls, test pipeline
+    python scripts/run_labbench.py --subtask seqqa --limit 3 --mode agentic
+    python scripts/run_labbench.py --subtask litqa2 --limit 5 --mode agentic
+    python scripts/run_labbench.py --subtask all --limit 10
+    python scripts/run_labbench.py --subtask dbqa --replicas 3 --limit 5
 
 Requires: ANTHROPIC_API_KEY in .env or environment.
 """
@@ -32,6 +38,7 @@ import signal
 import sys
 import time
 import traceback
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -62,14 +69,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("labbench")
 
+# ---------------------------------------------------------------------------
+# Valid subtask identifiers
+# ---------------------------------------------------------------------------
+
+VALID_SUBTASKS = ("dbqa", "seqqa", "litqa2", "all")
+
+# Map CLI subtask name -> HuggingFace config name
+HF_CONFIG_MAP: dict[str, str] = {
+    "dbqa": "DbQA",
+    "seqqa": "SeqQA",
+    "litqa2": "LitQA2",
+}
 
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
 
-class DbQAQuestion(NamedTuple):
-    """A single DbQA question parsed from the JSONL dataset."""
+class BenchQuestion(NamedTuple):
+    """A single benchmark question parsed from the JSONL dataset."""
 
     id: str
     question: str
@@ -77,6 +96,7 @@ class DbQAQuestion(NamedTuple):
     distractors: list[str]  # wrong answer texts
     subtask: str
     context: str
+    bench_subtask: str  # top-level subtask: dbqa, seqqa, litqa2
 
 
 class ScoredResult(NamedTuple):
@@ -94,6 +114,7 @@ class ScoredResult(NamedTuple):
     tokens_used: int
     latency_ms: int
     error: str | None
+    bench_subtask: str  # top-level subtask: dbqa, seqqa, litqa2
 
 
 # ---------------------------------------------------------------------------
@@ -103,30 +124,37 @@ class ScoredResult(NamedTuple):
 REFUSE_CHOICE = "Insufficient information to answer the question"
 
 
-def download_dbqa_dataset() -> Path:
-    """Download DbQA dataset from HuggingFace if not already present.
+def _download_subtask_dataset(subtask_key: str) -> Path:
+    """Download a LAB-Bench subtask dataset from HuggingFace if not already present.
+
+    Args:
+        subtask_key: one of 'dbqa', 'seqqa', 'litqa2'
 
     Returns path to the JSONL file.
     """
-    # Check if we already have the converted JSONL in the lab_bench dir
-    legacy_path = PROJECT_ROOT / "data" / "benchmarks" / "lab_bench" / "dbqa.jsonl"
-    if legacy_path.exists():
-        logger.info("Using existing DbQA dataset at %s", legacy_path)
-        return legacy_path
+    hf_config = HF_CONFIG_MAP[subtask_key]
+    filename = f"{subtask_key}.jsonl"
+
+    # Check legacy path for dbqa
+    if subtask_key == "dbqa":
+        legacy_path = PROJECT_ROOT / "data" / "benchmarks" / "lab_bench" / "dbqa.jsonl"
+        if legacy_path.exists():
+            logger.info("Using existing %s dataset at %s", hf_config, legacy_path)
+            return legacy_path
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    jsonl_path = DATA_DIR / "dbqa.jsonl"
+    jsonl_path = DATA_DIR / filename
 
     if jsonl_path.exists():
-        logger.info("Using existing DbQA dataset at %s", jsonl_path)
+        logger.info("Using existing %s dataset at %s", hf_config, jsonl_path)
         return jsonl_path
 
-    logger.info("Downloading LAB-Bench DbQA from HuggingFace...")
+    logger.info("Downloading LAB-Bench %s from HuggingFace...", hf_config)
 
     try:
         from datasets import load_dataset
 
-        ds = load_dataset("futurehouse/lab-bench", "DbQA", split="train")
+        ds = load_dataset("futurehouse/lab-bench", hf_config, split="train")
         with open(jsonl_path, "w") as f:
             for row in ds:
                 record = {
@@ -134,6 +162,7 @@ def download_dbqa_dataset() -> Path:
                     "question": row["question"],
                     "answer": row["ideal"],
                     "choices": row["distractors"],
+                    "bench_subtask": subtask_key,
                     "metadata": {
                         "canary": row.get("canary", ""),
                         "source": row.get("source"),
@@ -141,7 +170,7 @@ def download_dbqa_dataset() -> Path:
                     },
                 }
                 f.write(json.dumps(record) + "\n")
-        logger.info("Downloaded %d DbQA questions to %s", len(ds), jsonl_path)
+        logger.info("Downloaded %d %s questions to %s", len(ds), hf_config, jsonl_path)
         return jsonl_path
 
     except ImportError:
@@ -150,10 +179,10 @@ def download_dbqa_dataset() -> Path:
         import urllib.request
 
         parquet_url = (
-            "https://huggingface.co/datasets/futurehouse/lab-bench/"
-            "resolve/refs%2Fconvert%2Fparquet/DbQA/train/0000.parquet"
+            f"https://huggingface.co/datasets/futurehouse/lab-bench/"
+            f"resolve/refs%2Fconvert%2Fparquet/{hf_config}/train/0000.parquet"
         )
-        parquet_path = DATA_DIR / "dbqa.parquet"
+        parquet_path = DATA_DIR / f"{subtask_key}.parquet"
         urllib.request.urlretrieve(parquet_url, parquet_path)
 
         import pyarrow.parquet as pq
@@ -168,6 +197,7 @@ def download_dbqa_dataset() -> Path:
                     "question": row["question"],
                     "answer": row["ideal"],
                     "choices": list(row["distractors"]),
+                    "bench_subtask": subtask_key,
                     "metadata": {
                         "canary": row.get("canary", ""),
                         "source": row.get("source"),
@@ -176,13 +206,35 @@ def download_dbqa_dataset() -> Path:
                 }
                 f.write(json.dumps(record) + "\n")
 
-        logger.info("Downloaded %d DbQA questions to %s", len(df), jsonl_path)
+        logger.info("Downloaded %d %s questions to %s", len(df), hf_config, jsonl_path)
         return jsonl_path
 
 
-def load_dbqa_questions(path: Path, limit: int | None = None) -> list[DbQAQuestion]:
-    """Load DbQA questions from JSONL file."""
-    questions: list[DbQAQuestion] = []
+def download_dbqa_dataset() -> Path:
+    """Download DbQA dataset from HuggingFace if not already present.
+
+    Returns path to the JSONL file.  (Kept for backward-compatibility.)
+    """
+    return _download_subtask_dataset("dbqa")
+
+
+def download_seqqa_dataset() -> Path:
+    """Download SeqQA dataset from HuggingFace if not already present."""
+    return _download_subtask_dataset("seqqa")
+
+
+def download_litqa2_dataset() -> Path:
+    """Download LitQA2 dataset from HuggingFace if not already present."""
+    return _download_subtask_dataset("litqa2")
+
+
+def _load_questions_from_jsonl(
+    path: Path,
+    bench_subtask: str,
+    limit: int | None = None,
+) -> list[BenchQuestion]:
+    """Load questions from a JSONL file."""
+    questions: list[BenchQuestion] = []
     with open(path) as f:
         for i, line in enumerate(f):
             if limit and i >= limit:
@@ -192,19 +244,58 @@ def load_dbqa_questions(path: Path, limit: int | None = None) -> list[DbQAQuesti
                 continue
             row = json.loads(line)
             questions.append(
-                DbQAQuestion(
+                BenchQuestion(
                     id=row["id"],
                     question=row["question"],
                     correct_answer=row["answer"],
                     distractors=row.get("choices", []),
                     subtask=row.get("metadata", {}).get("subtask", "unknown"),
                     context=row.get("context", ""),
+                    bench_subtask=row.get("bench_subtask", bench_subtask),
                 )
             )
     return questions
 
 
-def build_choices(question: DbQAQuestion, seed: int | None = None) -> tuple[list[str], str, str]:
+def load_dbqa_questions(path: Path, limit: int | None = None) -> list[BenchQuestion]:
+    """Load DbQA questions from JSONL file."""
+    return _load_questions_from_jsonl(path, "dbqa", limit)
+
+
+def load_subtask_questions(
+    subtask_key: str,
+    limit: int | None = None,
+) -> list[BenchQuestion]:
+    """Download (if needed) and load questions for a given subtask.
+
+    Args:
+        subtask_key: one of 'dbqa', 'seqqa', 'litqa2'
+        limit: max questions to load
+
+    Returns list of BenchQuestion.
+    """
+    path = _download_subtask_dataset(subtask_key)
+    return _load_questions_from_jsonl(path, subtask_key, limit)
+
+
+def load_all_subtask_questions(
+    subtask_keys: list[str],
+    limit: int | None = None,
+) -> list[BenchQuestion]:
+    """Load questions for multiple subtasks.
+
+    If limit is set, it applies *per subtask* (so --limit 5 --subtask all
+    loads 5 per subtask = 15 total).
+    """
+    all_questions: list[BenchQuestion] = []
+    for key in subtask_keys:
+        qs = load_subtask_questions(key, limit=limit)
+        logger.info("Loaded %d %s questions", len(qs), key.upper())
+        all_questions.extend(qs)
+    return all_questions
+
+
+def build_choices(question: BenchQuestion, seed: int | None = None) -> tuple[list[str], str, str]:
     """Build shuffled multiple-choice list from correct + distractors + refuse.
 
     Returns:
@@ -277,16 +368,29 @@ SUBTASK_HINTS: dict[str, str] = {
 }
 
 
-def _get_subtask_hint(subtask: str) -> str:
+def _get_subtask_hint(question: BenchQuestion) -> str:
     """Get a hint for the subtask, matching on prefix."""
+    # For DbQA questions, check the narrow subtask field
     for key, hint in SUBTASK_HINTS.items():
-        if key in subtask:
+        if key in question.subtask:
             return hint
+    # Fallback hints by bench_subtask
+    if question.bench_subtask == "seqqa":
+        return (
+            "This is a sequence manipulation question. Use BioPython to work "
+            "with DNA/RNA/protein sequences. Think carefully about reverse "
+            "complements, translations, restriction sites, and codon tables."
+        )
+    if question.bench_subtask == "litqa2":
+        return (
+            "This is a literature-based question. Think about which published "
+            "studies are relevant and what their key findings were."
+        )
     return "Use biological databases to look up the answer."
 
 
-def build_prompt(question: DbQAQuestion, choices: list[str]) -> str:
-    """Build the LLM prompt for a DbQA question."""
+def build_prompt(question: BenchQuestion, choices: list[str]) -> str:
+    """Build the LLM prompt for a benchmark question."""
     parts = []
 
     if question.context:
@@ -295,7 +399,7 @@ def build_prompt(question: DbQAQuestion, choices: list[str]) -> str:
     parts.append(f"Question: {question.question}")
     parts.append("Choices:\n" + "\n".join(f"  {c}" for c in choices))
 
-    hint = _get_subtask_hint(question.subtask)
+    hint = _get_subtask_hint(question)
     parts.append(f"\nHint: {hint}")
 
     parts.append(
@@ -346,10 +450,10 @@ def extract_answer_letter(response: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Agentic mode: multi-turn reasoning with code execution
+# Subtask-specific agentic system prompts
 # ---------------------------------------------------------------------------
 
-AGENTIC_SYSTEM_PROMPT = (
+AGENTIC_SYSTEM_PROMPT_DBQA = (
     "You are a biomedical database expert answering a multiple-choice question "
     "about biological databases. You have deep knowledge of databases including: "
     "DisGeNET, OMIM, ClinVar, UniProt, KEGG, Reactome, ChEMBL, MSigDB, GTRD, "
@@ -362,6 +466,9 @@ AGENTIC_SYSTEM_PROMPT = (
     "data = r.json()\n"
     "print(data['results'][0]['primaryAccession'])\n"
     "</execute>\n\n"
+    "Write Python code to query biological databases. Use `requests` to call "
+    "REST APIs (UniProt, NCBI, KEGG). Parse JSON responses. Verify your answer "
+    "with a second database.\n\n"
     "Available libraries: pandas, numpy, scipy, requests, json, re, math, "
     "collections, itertools, Bio (biopython).\n\n"
     "Rules:\n"
@@ -374,6 +481,88 @@ AGENTIC_SYSTEM_PROMPT = (
     "5. Validate your answer with computation when possible.\n"
     "6. Only choose 'Insufficient information' if databases truly cannot answer this."
 )
+
+AGENTIC_SYSTEM_PROMPT_SEQQA = (
+    "You are a molecular biology expert answering a multiple-choice question "
+    "about DNA, RNA, and protein sequences. You are an expert in sequence "
+    "manipulation, restriction enzymes, codon tables, and bioinformatics.\n\n"
+    "You can reason step-by-step AND write Python code to manipulate sequences. "
+    "To execute code, wrap it in <execute> tags:\n\n"
+    "<execute>\n"
+    "from Bio.Seq import Seq\n"
+    "seq = Seq('ATCGATCG')\n"
+    "print(seq.reverse_complement())\n"
+    "</execute>\n\n"
+    "Write Python code using BioPython to manipulate DNA/protein sequences. "
+    "Use `from Bio.Seq import Seq` for sequence operations. "
+    "Use `from Bio import SeqIO` for file parsing. "
+    "Use `from Bio.Restriction import *` for restriction enzyme analysis. "
+    "Use `from Bio.Data.CodonTable import standard_dna_table` for codon lookups.\n\n"
+    "Available libraries: pandas, numpy, scipy, requests, json, re, math, "
+    "collections, itertools, Bio (biopython).\n\n"
+    "Rules:\n"
+    "1. Reason step-by-step before answering.\n"
+    "2. ALWAYS use code to compute sequence operations — do NOT try to do them "
+    "   in your head. Reverse complements, translations, restriction sites etc. "
+    "   are error-prone without code.\n"
+    "3. You can execute multiple code blocks across turns.\n"
+    "4. When you are confident in your answer, state it on the LAST line as:\n"
+    "   Answer: X\n"
+    "   where X is a single letter (A, B, C, D, or E).\n"
+    "5. Double-check your code output before answering.\n"
+    "6. Only choose 'Insufficient information' if you truly cannot determine the answer."
+)
+
+AGENTIC_SYSTEM_PROMPT_LITQA2 = (
+    "You are a biomedical literature expert answering a multiple-choice question "
+    "that requires knowledge of published scientific papers and their findings.\n\n"
+    "You can reason step-by-step AND write Python code to search for papers. "
+    "To execute code, wrap it in <execute> tags:\n\n"
+    "<execute>\n"
+    "import requests\n"
+    "r = requests.get(\n"
+    "    'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi',\n"
+    "    params={'db': 'pubmed', 'term': 'BRCA1 breast cancer therapy', 'retmode': 'json', 'retmax': 5}\n"
+    ")\n"
+    "data = r.json()\n"
+    "ids = data['esearchresult']['idlist']\n"
+    "print('PubMed IDs:', ids)\n"
+    "</execute>\n\n"
+    "Search PubMed and Semantic Scholar for relevant papers. Use:\n"
+    "- PubMed E-utilities: `requests.get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=...')`\n"
+    "- PubMed fetch: `requests.get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id=...&rettype=abstract')`\n"
+    "- Semantic Scholar: `requests.get('https://api.semanticscholar.org/graph/v1/paper/search?query=...')`\n"
+    "Read abstracts to find the answer. Extract specific claims from papers.\n\n"
+    "Available libraries: pandas, numpy, scipy, requests, json, re, math, "
+    "collections, itertools, Bio (biopython).\n\n"
+    "Rules:\n"
+    "1. Reason step-by-step before answering.\n"
+    "2. Use code to search for relevant papers when the question references "
+    "   specific findings, authors, or studies.\n"
+    "3. You can execute multiple code blocks across turns.\n"
+    "4. When you are confident in your answer, state it on the LAST line as:\n"
+    "   Answer: X\n"
+    "   where X is a single letter (A, B, C, D, or E).\n"
+    "5. Prefer evidence from paper abstracts over guessing.\n"
+    "6. Only choose 'Insufficient information' if you truly cannot find the answer."
+)
+
+# Legacy alias — kept for backward-compatibility with any external callers
+AGENTIC_SYSTEM_PROMPT = AGENTIC_SYSTEM_PROMPT_DBQA
+
+
+def _get_agentic_system_prompt(bench_subtask: str) -> str:
+    """Return the appropriate agentic system prompt for a bench subtask."""
+    if bench_subtask == "seqqa":
+        return AGENTIC_SYSTEM_PROMPT_SEQQA
+    if bench_subtask == "litqa2":
+        return AGENTIC_SYSTEM_PROMPT_LITQA2
+    return AGENTIC_SYSTEM_PROMPT_DBQA
+
+
+# ---------------------------------------------------------------------------
+# Agentic mode: multi-turn reasoning with code execution
+# ---------------------------------------------------------------------------
 
 
 def execute_code_safely(code: str, timeout: int = 30) -> str:
@@ -418,6 +607,13 @@ def execute_code_safely(code: str, timeout: int = 30) -> str:
         namespace["stats"] = scipy_stats
         namespace["scipy"] = __import__("scipy")
 
+    # Always make Bio available for SeqQA
+    try:
+        import Bio
+        namespace["Bio"] = Bio
+    except ImportError:
+        pass
+
     f = io.StringIO()
 
     # Use signal-based timeout on Unix; skip on Windows
@@ -459,7 +655,7 @@ def has_final_answer(response: str) -> bool:
 
 
 def build_agentic_turn_prompt(
-    question: DbQAQuestion,
+    question: BenchQuestion,
     choices: list[str],
     history: list[dict[str, str]],
     turn: int,
@@ -475,7 +671,7 @@ def build_agentic_turn_prompt(
         parts.append(f"Question: {question.question}")
         parts.append("Choices:\n" + "\n".join(f"  {c}" for c in choices))
 
-        subtask_hint = _get_subtask_hint(question.subtask)
+        subtask_hint = _get_subtask_hint(question)
         parts.append(f"\nDatabase hint: {subtask_hint}")
 
         if hint:
@@ -519,23 +715,39 @@ RETRY_HINTS: dict[str, str] = {
     "viral_ppi_task": "Query IntAct or VirHostNet for viral PPIs",
 }
 
+# Retry hints keyed by bench_subtask
+BENCH_SUBTASK_RETRY_HINTS: dict[str, str] = {
+    "seqqa": (
+        "Re-check your sequence operations. Try using BioPython code to verify "
+        "reverse complements, translations, or restriction sites."
+    ),
+    "litqa2": (
+        "Try searching with different keywords or a different database "
+        "(PubMed vs Semantic Scholar). Look at the abstract more carefully."
+    ),
+}
 
-def _get_retry_hint(subtask: str) -> str:
+
+def _get_retry_hint(question: BenchQuestion) -> str:
     """Get a retry-specific hint for the subtask."""
     for key, hint in RETRY_HINTS.items():
-        if key in subtask:
+        if key in question.subtask:
             return hint
+    # Fall back to bench_subtask-level hint
+    if question.bench_subtask in BENCH_SUBTASK_RETRY_HINTS:
+        return BENCH_SUBTASK_RETRY_HINTS[question.bench_subtask]
     return "Try a different analytical approach or database query."
 
 
 async def evaluate_question_agentic(
-    question: DbQAQuestion,
+    question: BenchQuestion,
     llm: Any,
     *,
     model: str = "",
     max_turns: int = 8,
     timeout_seconds: int = 300,
     trial_hint: str = "",
+    temperature: float | None = None,
 ) -> tuple[ScoredResult, str]:
     """Evaluate using multi-turn agentic reasoning with code execution.
 
@@ -544,10 +756,16 @@ async def evaluate_question_agentic(
     """
     start = time.monotonic()
     choices, correct_letter, refuse_letter = build_choices(question)
+    system_prompt = _get_agentic_system_prompt(question.bench_subtask)
 
     history: list[dict[str, str]] = []
     total_tokens = 0
     full_reasoning: list[str] = []
+
+    # Build extra kwargs for temperature if provided
+    extra_kwargs: dict[str, Any] = {}
+    if temperature is not None:
+        extra_kwargs["temperature"] = temperature
 
     try:
         for turn in range(max_turns):
@@ -565,9 +783,10 @@ async def evaluate_question_agentic(
             resp = await asyncio.wait_for(
                 llm.query(
                     prompt,
-                    system_prompt=AGENTIC_SYSTEM_PROMPT,
+                    system_prompt=system_prompt,
                     max_tokens=4096,
                     model=model or None,
+                    **extra_kwargs,
                 ),
                 timeout=max(remaining_time, 10),
             )
@@ -603,6 +822,7 @@ async def evaluate_question_agentic(
                         tokens_used=total_tokens,
                         latency_ms=int((time.monotonic() - start) * 1000),
                         error=None,
+                        bench_subtask=question.bench_subtask,
                     ), reasoning
 
             elif has_final_answer(response_text):
@@ -623,6 +843,7 @@ async def evaluate_question_agentic(
                     tokens_used=total_tokens,
                     latency_ms=int((time.monotonic() - start) * 1000),
                     error=None,
+                    bench_subtask=question.bench_subtask,
                 ), reasoning
 
             else:
@@ -647,6 +868,7 @@ async def evaluate_question_agentic(
             tokens_used=total_tokens,
             latency_ms=int((time.monotonic() - start) * 1000),
             error="max_turns_exhausted" if not predicted else None,
+            bench_subtask=question.bench_subtask,
         ), reasoning
 
     except TimeoutError:
@@ -664,6 +886,7 @@ async def evaluate_question_agentic(
             tokens_used=total_tokens,
             latency_ms=int((time.monotonic() - start) * 1000),
             error="Timeout",
+            bench_subtask=question.bench_subtask,
         ), reasoning
 
     except Exception as exc:
@@ -681,11 +904,12 @@ async def evaluate_question_agentic(
             tokens_used=total_tokens,
             latency_ms=int((time.monotonic() - start) * 1000),
             error=traceback.format_exc(),
+            bench_subtask=question.bench_subtask,
         ), reasoning
 
 
 async def evaluate_question_multitrial(
-    question: DbQAQuestion,
+    question: BenchQuestion,
     llm: Any,
     *,
     model: str = "",
@@ -707,7 +931,7 @@ async def evaluate_question_multitrial(
         trial_hint = ""
         if trial > 0 and prev_predicted:
             # Build hint from previous trial
-            category_hint = _get_retry_hint(question.subtask)
+            category_hint = _get_retry_hint(question)
             trial_hint = (
                 f"On your previous attempt, you chose ({prev_predicted}) but "
                 f"the correct answer was different. Your reasoning was:\n"
@@ -782,8 +1006,91 @@ async def evaluate_question_multitrial(
         tokens_used=total_tokens,
         latency_ms=total_latency,
         error=best_result.error,
+        bench_subtask=best_result.bench_subtask,
     )
     return aggregated, trial_details
+
+
+# ---------------------------------------------------------------------------
+# Majority voting (--replicas N)
+# ---------------------------------------------------------------------------
+
+
+async def evaluate_with_voting(
+    question: BenchQuestion,
+    llm: Any,
+    *,
+    n_replicas: int = 3,
+    model: str = "",
+    mode: str = "zero-shot",
+    max_turns: int = 8,
+    timeout_seconds: int = 300,
+    temperature: float = 0.3,
+) -> ScoredResult:
+    """Run N replicas per question and take the majority-voted answer.
+
+    Each replica uses temperature > 0 for diversity. The final answer is
+    the most common predicted letter across replicas.
+    """
+    start = time.monotonic()
+    choices, correct_letter, refuse_letter = build_choices(question)
+
+    answers: list[str] = []
+    total_tokens = 0
+    all_reasoning: list[str] = []
+
+    for i in range(n_replicas):
+        if mode == "agentic":
+            result, reasoning = await evaluate_question_agentic(
+                question,
+                llm,
+                model=model,
+                max_turns=max_turns,
+                timeout_seconds=timeout_seconds,
+                temperature=temperature,
+            )
+        else:
+            result = await evaluate_question_live(
+                question,
+                llm,
+                model=model,
+                timeout_seconds=timeout_seconds,
+                temperature=temperature,
+            )
+            reasoning = result.reasoning
+
+        if result.predicted:
+            answers.append(result.predicted)
+        total_tokens += result.tokens_used
+        all_reasoning.append(f"[Replica {i + 1}]: predicted={result.predicted}")
+
+    # Majority vote
+    if answers:
+        majority_answer = Counter(answers).most_common(1)[0][0]
+    else:
+        majority_answer = ""
+
+    vote_summary = dict(Counter(answers))
+    all_reasoning.append(f"[Vote tally]: {vote_summary} -> majority={majority_answer}")
+
+    is_correct = majority_answer == correct_letter
+    is_refused = majority_answer == refuse_letter
+
+    return ScoredResult(
+        question_id=question.id,
+        subtask=question.subtask,
+        predicted=majority_answer,
+        predicted_text=_get_choice_text(choices, majority_answer),
+        correct_answer=correct_letter,
+        correct_text=question.correct_answer,
+        is_correct=is_correct,
+        is_refused=is_refused,
+        reasoning="\n".join(all_reasoning),
+        tokens_used=total_tokens,
+        latency_ms=int((time.monotonic() - start) * 1000),
+        error=None,
+        bench_subtask=question.bench_subtask,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -792,19 +1099,24 @@ async def evaluate_question_multitrial(
 
 
 async def evaluate_question_live(
-    question: DbQAQuestion,
+    question: BenchQuestion,
     llm: Any,
     *,
     model: str = "",
     timeout_seconds: int = 300,
     trial_hint: str = "",
+    temperature: float | None = None,
 ) -> ScoredResult:
-    """Evaluate a single DbQA question using the LLM."""
+    """Evaluate a single question using the LLM (zero-shot)."""
     start = time.monotonic()
     choices, correct_letter, refuse_letter = build_choices(question)
     prompt = build_prompt(question, choices)
     if trial_hint:
         prompt += f"\n\nAdditional guidance from a previous attempt:\n{trial_hint}"
+
+    extra_kwargs: dict[str, Any] = {}
+    if temperature is not None:
+        extra_kwargs["temperature"] = temperature
 
     try:
         resp = await asyncio.wait_for(
@@ -813,6 +1125,7 @@ async def evaluate_question_live(
                 system_prompt=SYSTEM_PROMPT,
                 max_tokens=2048,
                 model=model or None,
+                **extra_kwargs,
             ),
             timeout=timeout_seconds,
         )
@@ -836,6 +1149,7 @@ async def evaluate_question_live(
             tokens_used=tokens,
             latency_ms=int((time.monotonic() - start) * 1000),
             error=None,
+            bench_subtask=question.bench_subtask,
         )
 
     except TimeoutError:
@@ -852,6 +1166,7 @@ async def evaluate_question_live(
             tokens_used=0,
             latency_ms=int((time.monotonic() - start) * 1000),
             error="Timeout",
+            bench_subtask=question.bench_subtask,
         )
     except Exception as exc:
         return ScoredResult(
@@ -867,10 +1182,11 @@ async def evaluate_question_live(
             tokens_used=0,
             latency_ms=int((time.monotonic() - start) * 1000),
             error=traceback.format_exc(),
+            bench_subtask=question.bench_subtask,
         )
 
 
-def evaluate_question_dry(question: DbQAQuestion) -> ScoredResult:
+def evaluate_question_dry(question: BenchQuestion) -> ScoredResult:
     """Dry-run evaluation — no LLM, random answer for pipeline testing."""
     start = time.monotonic()
     choices, correct_letter, refuse_letter = build_choices(question)
@@ -891,6 +1207,7 @@ def evaluate_question_dry(question: DbQAQuestion) -> ScoredResult:
         tokens_used=0,
         latency_ms=int((time.monotonic() - start) * 1000),
         error=None,
+        bench_subtask=question.bench_subtask,
     )
 
 
@@ -927,7 +1244,7 @@ def compute_metrics(results: list[ScoredResult]) -> dict[str, Any]:
     total_tokens = sum(r.tokens_used for r in results)
     total_latency = sum(r.latency_ms for r in results)
 
-    # Per-subtask breakdown
+    # Per-subtask breakdown (narrow subtask field)
     subtask_results: dict[str, list[ScoredResult]] = {}
     for r in results:
         subtask_results.setdefault(r.subtask, []).append(r)
@@ -939,6 +1256,25 @@ def compute_metrics(results: list[ScoredResult]) -> dict[str, Any]:
         sub_refused = sum(1 for r in sub_results if r.is_refused)
         sub_confident = sub_total - sub_refused
         per_subtask[subtask] = {
+            "total": sub_total,
+            "correct": sub_correct,
+            "accuracy": sub_correct / sub_total if sub_total > 0 else 0.0,
+            "precision": sub_correct / sub_confident if sub_confident > 0 else 0.0,
+            "coverage": sub_confident / sub_total if sub_total > 0 else 0.0,
+        }
+
+    # Per bench_subtask breakdown (top-level: dbqa, seqqa, litqa2)
+    bench_subtask_results: dict[str, list[ScoredResult]] = {}
+    for r in results:
+        bench_subtask_results.setdefault(r.bench_subtask, []).append(r)
+
+    per_bench_subtask = {}
+    for bs, sub_results in sorted(bench_subtask_results.items()):
+        sub_total = len(sub_results)
+        sub_correct = sum(1 for r in sub_results if r.is_correct)
+        sub_refused = sum(1 for r in sub_results if r.is_refused)
+        sub_confident = sub_total - sub_refused
+        per_bench_subtask[bs] = {
             "total": sub_total,
             "correct": sub_correct,
             "accuracy": sub_correct / sub_total if sub_total > 0 else 0.0,
@@ -959,6 +1295,7 @@ def compute_metrics(results: list[ScoredResult]) -> dict[str, Any]:
         "total_latency_ms": total_latency,
         "avg_latency_ms": total_latency / total if total > 0 else 0,
         "per_subtask": per_subtask,
+        "per_bench_subtask": per_bench_subtask,
     }
 
 
@@ -985,6 +1322,7 @@ class CheckpointManager:
         record: dict[str, Any] = {
             "question_id": result.question_id,
             "subtask": result.subtask,
+            "bench_subtask": result.bench_subtask,
             "predicted": result.predicted,
             "predicted_text": result.predicted_text,
             "correct_answer": result.correct_answer,
@@ -1027,6 +1365,7 @@ class CheckpointManager:
                     tokens_used=record.get("tokens_used", 0),
                     latency_ms=record.get("latency_ms", 0),
                     error=record.get("error"),
+                    bench_subtask=record.get("bench_subtask", "dbqa"),
                 )
             )
         logger.info("Loaded %d completed results from checkpoint", len(completed))
@@ -1049,11 +1388,13 @@ async def run_evaluation(
     concurrency: int = 1,
     trials: int = 1,
     max_turns: int = 8,
+    subtask: str = "dbqa",
+    replicas: int = 1,
 ) -> dict[str, Any]:
-    """Run the full LAB-Bench DbQA evaluation pipeline.
+    """Run the full LAB-Bench evaluation pipeline.
 
     Args:
-        limit: Max questions to evaluate (None = all 520).
+        limit: Max questions to evaluate per subtask (None = all).
         mode: Evaluation mode — "zero-shot" or "agentic".
         model_tier: Model to use — "sonnet", "opus", "haiku".
         dry_run: Skip LLM calls, random answers.
@@ -1062,17 +1403,29 @@ async def run_evaluation(
         concurrency: Max concurrent LLM calls.
         trials: Number of trials per question (1-5). Multi-trial injects hints.
         max_turns: Max turns for agentic mode (default 8).
+        subtask: Which subtask(s) to evaluate — "dbqa", "seqqa", "litqa2", "all".
+        replicas: Number of replicas for majority voting (1 = disabled).
 
     Returns:
         Full results dict with metrics and per-question results.
     """
-    # 1. Download / locate dataset
-    dataset_path = download_dbqa_dataset()
-    questions = load_dbqa_questions(dataset_path, limit=limit)
-    logger.info("Loaded %d DbQA questions", len(questions))
+    # 1. Determine which subtasks to run
+    if subtask == "all":
+        subtask_keys = ["dbqa", "seqqa", "litqa2"]
+    else:
+        subtask_keys = [subtask]
 
-    # 2. Set up checkpoint
-    run_id = f"dbqa_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    # 2. Download / locate dataset and load questions
+    questions = load_all_subtask_questions(subtask_keys, limit=limit)
+    logger.info(
+        "Loaded %d total questions across subtask(s): %s",
+        len(questions),
+        ", ".join(k.upper() for k in subtask_keys),
+    )
+
+    # 3. Set up checkpoint
+    subtask_label = subtask if subtask != "all" else "all"
+    run_id = f"{subtask_label}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     checkpoint = CheckpointManager(RESULTS_DIR, run_id)
 
@@ -1088,7 +1441,7 @@ async def run_evaluation(
             run_id = checkpoint.run_id
             completed_ids, results = checkpoint.load_completed()
 
-    # 3. Set up LLM
+    # 4. Set up LLM
     llm = None
     model_name = ""
     if not dry_run:
@@ -1104,9 +1457,13 @@ async def run_evaluation(
             model_name = settings.llm_cheap_model
         else:
             model_name = model_tier  # allow direct model name
-        logger.info("Using model: %s (mode: %s, trials: %d)", model_name, mode, trials)
+        logger.info(
+            "Using model: %s (mode: %s, trials: %d, replicas: %d, subtask: %s)",
+            model_name, mode, trials, replicas,
+            ", ".join(k.upper() for k in subtask_keys),
+        )
 
-    # 4. Evaluate
+    # 5. Evaluate
     total = len(questions)
     remaining = [q for q in questions if q.id not in completed_ids]
     correct_so_far = sum(1 for r in results if r.is_correct)
@@ -1124,15 +1481,33 @@ async def run_evaluation(
 
     use_agentic = mode == "agentic"
     use_multitrial = trials > 1
+    use_voting = replicas > 1
 
     for idx, question in enumerate(remaining):
         question_num = len(results) + 1
+
+        # Print which subtask is being evaluated
+        if idx == 0 or (idx > 0 and remaining[idx].bench_subtask != remaining[idx - 1].bench_subtask):
+            logger.info(
+                "--- Evaluating subtask: %s ---", question.bench_subtask.upper()
+            )
 
         async with sem:
             trial_details: list[dict[str, Any]] | None = None
 
             if dry_run:
                 result = evaluate_question_dry(question)
+            elif use_voting:
+                # Majority voting mode
+                result = await evaluate_with_voting(
+                    question,
+                    llm,
+                    n_replicas=replicas,
+                    model=model_name,
+                    mode=mode,
+                    max_turns=max_turns,
+                    timeout_seconds=timeout_seconds,
+                )
             elif use_multitrial:
                 result, trial_details = await evaluate_question_multitrial(
                     question,
@@ -1175,10 +1550,12 @@ async def run_evaluation(
         if trial_details:
             n_trials_used = len(trial_details)
             trial_info = f" [{n_trials_used} trial(s)]"
+        if use_voting:
+            trial_info = f" [{replicas} replicas]"
 
         running_acc = correct_so_far / question_num * 100
 
-        # Compare against baselines
+        # Compare against baselines (DbQA-specific, but shown for all)
         stella_delta = running_acc - 54.0
         biomni_delta = running_acc - 78.0
         baseline_str = (
@@ -1186,9 +1563,10 @@ async def run_evaluation(
         )
 
         logger.info(
-            "Question %d/%d: %s [%s] (acc: %.1f%% | %s)%s [%dms, %d tok]",
+            "Question %d/%d [%s]: %s [%s] (acc: %.1f%% | %s)%s [%dms, %d tok]",
             question_num,
             total,
+            question.bench_subtask.upper(),
             question.id[:12] + "...",
             status,
             running_acc,
@@ -1200,12 +1578,15 @@ async def run_evaluation(
 
     elapsed = time.monotonic() - start_time
 
-    # 5. Compute final metrics
+    # 6. Compute final metrics
     metrics = compute_metrics(results)
 
-    # 6. Build full results
+    # 7. Build full results
+    benchmark_label = (
+        f"LAB-Bench {', '.join(k.upper() for k in subtask_keys)}"
+    )
     full_results = {
-        "benchmark": "LAB-Bench DbQA",
+        "benchmark": benchmark_label,
         "run_id": run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "config": {
@@ -1217,13 +1598,16 @@ async def run_evaluation(
             "timeout_seconds": timeout_seconds,
             "total_questions": total,
             "trials": trials,
+            "replicas": replicas,
+            "subtask": subtask,
+            "subtask_keys": subtask_keys,
             "max_turns": max_turns if mode == "agentic" else None,
         },
         "metrics": metrics,
         "competitor_baselines": {
             "STELLA": 0.54,
             "Biomni_Lab": 0.78,
-            "note": "STELLA 54% (LAB-Bench paper), Biomni Lab 78% (target)",
+            "note": "STELLA 54% (LAB-Bench paper), Biomni Lab 78% (target) — DbQA only",
         },
         "delta_vs_stella": metrics["accuracy"] - 0.54,
         "delta_vs_biomni": metrics["accuracy"] - 0.78,
@@ -1232,6 +1616,7 @@ async def run_evaluation(
             {
                 "question_id": r.question_id,
                 "subtask": r.subtask,
+                "bench_subtask": r.bench_subtask,
                 "predicted": r.predicted,
                 "predicted_text": r.predicted_text,
                 "correct_answer": r.correct_answer,
@@ -1246,7 +1631,7 @@ async def run_evaluation(
         ],
     }
 
-    # 7. Save results
+    # 8. Save results
     results_path = RESULTS_DIR / "labbench_results.json"
     results_path.write_text(json.dumps(full_results, indent=2, default=str))
     logger.info("Results saved to %s", results_path)
@@ -1260,13 +1645,14 @@ async def run_evaluation(
     timestamped_path = RESULTS_DIR / f"{run_id}_results.json"
     timestamped_path.write_text(json.dumps(full_results, indent=2, default=str))
 
-    # 8. Print summary
+    # 9. Print summary
     print("\n" + "=" * 70)
-    print("LAB-Bench DbQA Results")
+    print(f"LAB-Bench Results — {', '.join(k.upper() for k in subtask_keys)}")
     print("=" * 70)
     print(f"  Mode:          {mode}")
     print(f"  Model:         {model_name or 'dry-run'}")
     print(f"  Trials:        {trials}")
+    print(f"  Replicas:      {replicas}")
     if mode == "agentic":
         print(f"  Max turns:     {max_turns}")
     print(f"  Questions:     {metrics['total']}")
@@ -1284,13 +1670,25 @@ async def run_evaluation(
     print(f"  Biomni (78%):  {full_results['delta_vs_biomni']:+.1%}")
     print()
 
+    # Per bench_subtask breakdown
+    if metrics.get("per_bench_subtask") and len(metrics["per_bench_subtask"]) > 1:
+        print("Per-subtask accuracy (top-level):")
+        print(f"  {'Subtask':<12s} {'N':>4s} {'Acc':>7s} {'Prec':>7s} {'Cov':>7s}")
+        print(f"  {'-' * 12} {'-' * 4} {'-' * 7} {'-' * 7} {'-' * 7}")
+        for bs, sm in sorted(metrics["per_bench_subtask"].items()):
+            print(
+                f"  {bs.upper():<12s} {sm['total']:>4d} "
+                f"{sm['accuracy']:>6.1%} {sm['precision']:>6.1%} {sm['coverage']:>6.1%}"
+            )
+        print()
+
     if metrics["per_subtask"]:
-        print("Per-subtask breakdown:")
+        print("Per-subtask breakdown (narrow):")
         print(f"  {'Subtask':<45s} {'N':>4s} {'Acc':>7s} {'Prec':>7s} {'Cov':>7s}")
         print(f"  {'-' * 45} {'-' * 4} {'-' * 7} {'-' * 7} {'-' * 7}")
-        for subtask, sm in sorted(metrics["per_subtask"].items()):
+        for st, sm in sorted(metrics["per_subtask"].items()):
             print(
-                f"  {subtask:<45s} {sm['total']:>4d} "
+                f"  {st:<45s} {sm['total']:>4d} "
                 f"{sm['accuracy']:>6.1%} {sm['precision']:>6.1%} {sm['coverage']:>6.1%}"
             )
         print()
@@ -1308,7 +1706,7 @@ async def run_evaluation(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run LAB-Bench DbQA benchmark for YOHAS 3.0",
+        description="Run LAB-Bench benchmark for YOHAS 3.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -1318,13 +1716,17 @@ def main() -> None:
             "  python scripts/run_labbench.py --mode agentic --model opus --limit 5\n"
             "  python scripts/run_labbench.py --dry-run --limit 10\n"
             "  python scripts/run_labbench.py --resume\n"
+            "  python scripts/run_labbench.py --subtask seqqa --limit 3 --mode agentic\n"
+            "  python scripts/run_labbench.py --subtask litqa2 --limit 5 --mode agentic\n"
+            "  python scripts/run_labbench.py --subtask all --limit 10 --dry-run\n"
+            "  python scripts/run_labbench.py --subtask dbqa --replicas 3 --limit 5\n"
         ),
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Max questions to evaluate (default: all 520)",
+        help="Max questions to evaluate per subtask (default: all)",
     )
     parser.add_argument(
         "--mode",
@@ -1347,6 +1749,28 @@ def main() -> None:
         choices=range(1, 6),
         metavar="N",
         help="Number of trials per question (1-5). Trial 2+ injects hints from prior attempts.",
+    )
+    parser.add_argument(
+        "--replicas",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of replicas for majority voting (default: 1 = disabled). "
+            "Runs each question N times with temperature=0.3 and takes the "
+            "majority-voted answer."
+        ),
+    )
+    parser.add_argument(
+        "--subtask",
+        type=str,
+        default="dbqa",
+        choices=list(VALID_SUBTASKS),
+        help=(
+            "Which LAB-Bench subtask(s) to evaluate. "
+            "'dbqa' = database QA (default), 'seqqa' = sequence manipulation, "
+            "'litqa2' = literature recall, 'all' = all three."
+        ),
     )
     parser.add_argument(
         "--max-turns",
@@ -1386,6 +1810,9 @@ def main() -> None:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    if args.replicas > 1 and args.trials > 1:
+        parser.error("--replicas and --trials are mutually exclusive. Use one or the other.")
+
     results = asyncio.run(
         run_evaluation(
             limit=args.limit,
@@ -1397,6 +1824,8 @@ def main() -> None:
             concurrency=args.concurrency,
             trials=args.trials,
             max_turns=args.max_turns,
+            subtask=args.subtask,
+            replicas=args.replicas,
         )
     )
 

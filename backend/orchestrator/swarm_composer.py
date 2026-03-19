@@ -59,6 +59,8 @@ class SwarmComposer:
         self._events: list[ResearchEvent] = []
         self._tool_retriever = tool_retriever
         self._dynamic_registry = dynamic_registry
+        # Cache: agent_type_hint -> list of tool names (same role -> same tools)
+        self._tool_selection_cache: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------
     # Tool entry helpers
@@ -342,26 +344,34 @@ class SwarmComposer:
         valid_tool_names = {e.name for e in self._get_all_tool_entries() if e.enabled}
         tools = [str(t) for t in raw_tools if str(t) in valid_tool_names]
 
-        # Dynamically select tools via ToolRetriever when available
-        if self._tool_retriever is not None:
-            try:
-                dynamic_tools = await self.select_tools_dynamic(
-                    task_instruction=instructions,
-                    hypothesis=hypothesis.hypothesis,
-                    agent_type=agent_type_hint,
-                )
-                # Merge: keep spec-requested tools, add LLM-selected ones
-                seen = set(tools)
-                for t in dynamic_tools:
-                    if t not in seen:
-                        tools.append(t)
-                        seen.add(t)
-            except Exception as exc:
-                logger.warning(
-                    "dynamic_tool_selection_failed_in_spec",
-                    error=str(exc),
-                    agent_type=str(agent_type_hint),
-                )
+        # Skip dynamic tool retrieval if the spec already has tools
+        # (saves 1 LLM call per agent). Use cache for repeat roles.
+        if not tools and self._tool_retriever is not None:
+            cache_key = str(agent_type_hint) if agent_type_hint else role
+            if cache_key in self._tool_selection_cache:
+                tools = list(self._tool_selection_cache[cache_key])
+                logger.debug("tool_selection_cache_hit", cache_key=cache_key)
+            else:
+                try:
+                    dynamic_tools = await self.select_tools_dynamic(
+                        task_instruction=instructions,
+                        hypothesis=hypothesis.hypothesis,
+                        agent_type=agent_type_hint,
+                    )
+                    # Merge: keep spec-requested tools, add LLM-selected ones
+                    seen = set(tools)
+                    for t in dynamic_tools:
+                        if t not in seen:
+                            tools.append(t)
+                            seen.add(t)
+                    # Cache for future agents with the same role
+                    self._tool_selection_cache[cache_key] = list(tools)
+                except Exception as exc:
+                    logger.warning(
+                        "dynamic_tool_selection_failed_in_spec",
+                        error=str(exc),
+                        agent_type=str(agent_type_hint),
+                    )
 
         constraints = constraint_override or AgentConstraints()
 

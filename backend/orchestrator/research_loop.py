@@ -30,6 +30,7 @@ from core.models import (
     KGEdge,
     ResearchConfig,
     ResearchEvent,
+    ResearchMode,
     ResearchResult,
     ResearchSession,
     ScreeningResult,
@@ -93,6 +94,7 @@ class ResearchOrchestrator:
         self._dynamic_registry = dynamic_registry or DynamicToolRegistry()
         self._strategy_memory = strategy_memory or StrategyMemory()
 
+        self._fast_mode_model: str | None = None  # Set by research_mode override
         self._session: ResearchSession | None = None
         self._tree: HypothesisTree | None = None
         self._composer: SwarmComposer | None = None
@@ -152,6 +154,39 @@ class ResearchOrchestrator:
         MCTS loop, and returns the completed session with results.
         """
         config = config or ResearchConfig()
+
+        # ----- Apply research_mode presets -----
+        if config.research_mode == ResearchMode.FAST:
+            config.max_mcts_iterations = 1
+            config.max_agents_per_swarm = 1
+            config.max_agents = 1
+            config.max_total_agents = 2
+            config.code_first = True
+            config.session_token_budget = 100_000
+            config.agent_token_budget = 80_000
+            config.session_timeout_seconds = 120
+            config.enable_hitl = False
+            config.max_hypothesis_depth = 1
+            # Use Haiku for agent calls (fast + cheap)
+            self._fast_mode_model = settings.llm_cheap_model
+            logger.info("research_mode_fast", timeout=120, token_budget=100_000)
+        elif config.research_mode == ResearchMode.STANDARD:
+            config.max_mcts_iterations = 5
+            config.max_agents_per_swarm = 4
+            config.max_agents = 4
+            config.max_total_agents = 20
+            config.code_first = True
+            config.session_token_budget = 500_000
+            config.agent_token_budget = 150_000
+            config.session_timeout_seconds = 600
+            config.max_hypothesis_depth = 3
+            self._fast_mode_model = None
+            logger.info("research_mode_standard", timeout=600, token_budget=500_000)
+        else:
+            # DEEP mode — keep all defaults as-is
+            self._fast_mode_model = None
+            logger.info("research_mode_deep", timeout=config.session_timeout_seconds)
+
         session = self._create_session(query, config)
         self._session = session
 
@@ -509,6 +544,9 @@ class ResearchOrchestrator:
                 tasks = await self._composer.generate_tasks(
                     query, hypothesis, agent_types, session.id,
                 )
+                # Propagate research_mode to agent task context
+                for t in tasks:
+                    t.context["research_mode"] = str(config.research_mode)
                 return hypothesis, specs, tasks
 
             compose_results = await asyncio.gather(
@@ -551,6 +589,8 @@ class ResearchOrchestrator:
                 tasks = await self._composer.generate_tasks(
                     query, selected, agent_types, session.id,
                 )
+                for t in tasks:
+                    t.context["research_mode"] = str(config.research_mode)
                 swarm_results_list = [
                     await self._execute_specs_with_semaphore(
                         specs, tasks, selected, config, semaphore,
@@ -1533,6 +1573,8 @@ class ResearchOrchestrator:
             tasks = await self._composer.generate_tasks(
                 question, target_hypothesis, agent_types, session.id,
             )
+            for t in tasks:
+                t.context["research_mode"] = str(config.research_mode)
             results = await self._execute_specs_with_semaphore(
                 specs, tasks, target_hypothesis, config, semaphore,
             )
