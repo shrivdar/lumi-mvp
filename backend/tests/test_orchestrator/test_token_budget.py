@@ -61,6 +61,34 @@ class TestTokenBudgetAllocation:
         for c in constraints:
             assert c.token_budget <= 50_000
 
+    def test_per_agent_budget_has_minimum_floor(self):
+        """When session budget is nearly exhausted, agents should still get
+        a minimum viable budget (10 000 tokens) instead of a trivially
+        small allocation like 46."""
+        mgr = TokenBudgetManager(session_budget=500_000)
+        mgr.allocate_hypothesis_budget("h1", active_hypothesis_count=3)
+        # Simulate iteration 1 consuming most of the budget
+        mgr.record_usage("h1", "a1", 490_000)
+
+        config = ResearchConfig(agent_token_budget=200_000)
+        constraints = mgr.allocate_for_swarm("h1", agent_count=4, config=config)
+        for c in constraints:
+            assert c.token_budget >= 10_000, (
+                f"Agent budget {c.token_budget} fell below minimum floor of 10 000"
+            )
+
+    def test_minimum_floor_respects_small_config_cap(self):
+        """When config.agent_token_budget is smaller than 10 000,
+        the floor should use the config cap instead."""
+        mgr = TokenBudgetManager(session_budget=500_000)
+        mgr.allocate_hypothesis_budget("h1", active_hypothesis_count=1)
+        mgr.record_usage("h1", "a1", 499_900)
+
+        config = ResearchConfig(agent_token_budget=5_000)
+        constraints = mgr.allocate_for_swarm("h1", agent_count=4, config=config)
+        for c in constraints:
+            assert c.token_budget == 5_000
+
 
 class TestTokenBudgetTracking:
     def test_record_usage(self):

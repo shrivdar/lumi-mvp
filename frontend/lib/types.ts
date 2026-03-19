@@ -266,21 +266,21 @@ export interface AgentInfo {
 // Node type to color mapping (matches tailwind.config.ts)
 export const NODE_COLORS: Record<NodeType, string> = {
   PROTEIN: "#4A90D9",
-  GENE: "#6B5CE7",
+  GENE: "#7B68EE",
   DISEASE: "#E74C3C",
-  PATHWAY: "#2ECC71",
-  DRUG: "#F39C12",
+  PATHWAY: "#F39C12",
+  DRUG: "#2ECC71",
   CELL_TYPE: "#8E44AD",
   TISSUE: "#E91E63",
   CLINICAL_TRIAL: "#1ABC9C",
-  MECHANISM: "#95A5A6",
+  MECHANISM: "#9B59B6",
   MODALITY: "#607D8B",
   SIDE_EFFECT: "#FF5722",
-  BIOMARKER: "#009688",
+  BIOMARKER: "#1ABC9C",
   ORGANISM: "#795548",
   COMPOUND: "#FF9800",
   EXPERIMENT: "#E67E22",
-  PUBLICATION: "#3F51B5",
+  PUBLICATION: "#95A5A6",
   STRUCTURE: "#00BCD4",
 };
 

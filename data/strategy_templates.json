@@ -1,0 +1,40 @@
+[
+  {
+    "id": "0300f754-7e5f-41d3-b497-fd4fde2aa8be",
+    "task_category": "target_evaluation",
+    "query_text": "Investigate B7-H3 (CD276) as an antibody-drug conjugate target in non-small cell lung cancer. Evaluate expression specificity, immune evasion mechanisms, existing clinical evidence, and propose an ADC strategy with candidate payload and linker recommendations.",
+    "description": "Used scientific_critic, literature_analyst; 10/12 agents succeeded; with MCTS hypothesis exploration",
+    "effective_agent_types": [
+      "scientific_critic",
+      "literature_analyst"
+    ],
+    "effective_tool_sequence": [],
+    "effective_code_patterns": [],
+    "mcts_insight": "Best hypothesis scored 0.00: Investigation of: Investigate B7-H3 (CD276) as an antibody-drug conjugate target in non-small cell l",
+    "falsification_insight": "",
+    "reward_score": 1.0,
+    "usage_count": 0,
+    "success_rate": 0.0,
+    "source_session_id": "55b777f3-40ce-4da2-9564-ad3d83f6e464",
+    "created_at": "2026-03-19T03:11:20.479085+00:00"
+  },
+  {
+    "id": "df577521-d66d-4417-9ecb-04039b6dcaaf",
+    "task_category": "target_evaluation",
+    "query_text": "Investigate B7-H3 (CD276) as an antibody-drug conjugate target in non-small cell lung cancer. Evaluate expression specificity, immune evasion mechanisms, existing clinical evidence, and propose an ADC strategy with candidate payload and linker recommendations.",
+    "description": "Used scientific_critic, literature_analyst; 10/12 agents succeeded; with MCTS hypothesis exploration",
+    "effective_agent_types": [
+      "scientific_critic",
+      "literature_analyst"
+    ],
+    "effective_tool_sequence": [],
+    "effective_code_patterns": [],
+    "mcts_insight": "Best hypothesis scored 0.00: Investigation of: Investigate B7-H3 (CD276) as an antibody-drug conjugate target in non-small cell l",
+    "falsification_insight": "Some counter-evidence found (4/57 edges falsified)",
+    "reward_score": 1.0,
+    "usage_count": 0,
+    "success_rate": 0.0,
+    "source_session_id": "31b54186-2dbf-45db-b5be-26165abf1935",
+    "created_at": "2026-03-19T13:09:54.380389+00:00"
+  }
+]

@@ -124,32 +124,16 @@ def create_agent_from_spec(
     """
     resolved_tools = tools or {}
 
-    # If there's a type hint, try to use the specialised subclass + its template
-    cls: type[BaseAgentImpl] | None = None
-    template = None
-    if spec.agent_type_hint:
-        cls = _AGENT_CLASS_MAP.get(spec.agent_type_hint)
-        template = AGENT_TEMPLATES.get(spec.agent_type_hint)
-
-    if cls is not None:
-        # Specialised subclass — give it both template (for backward compat) and spec
-        agent = cls(
-            template=template,
-            spec=spec,
-            llm=llm,
-            kg=kg,
-            yami=yami,
-            tools=resolved_tools,
-        )
-    else:
-        # Fully dynamic agent — no subclass, no template, just spec
-        agent = BaseAgentImpl(
-            spec=spec,
-            llm=llm,
-            kg=kg,
-            yami=yami,
-            tools=resolved_tools,
-        )
+    # All agents are created as generic BaseAgentImpl driven entirely by their spec.
+    # The spec's role, instructions, system_prompt, and permissions define behavior.
+    # No template lookup, no subclass dispatch — the orchestrator controls everything.
+    agent = BaseAgentImpl(
+        spec=spec,
+        llm=llm,
+        kg=kg,
+        yami=yami,
+        tools=resolved_tools,
+    )
 
     logger.debug(
         "agent_created_from_spec",

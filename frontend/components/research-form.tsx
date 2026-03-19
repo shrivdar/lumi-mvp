@@ -31,10 +31,13 @@ export default function ResearchForm({ onSubmit, className }: ResearchFormProps)
     setSubmitting(true);
     setError(null);
     try {
-      const session = await apiFetch<ResearchSession>("/api/v1/research", {
+      // Backend returns {research_id, status} on create, not a full session
+      const created = await apiFetch<{ research_id: string; status: string }>("/api/v1/research", {
         method: "POST",
         body: JSON.stringify({ query: query.trim(), config }),
       });
+      // Fetch the full session object so the dashboard can navigate
+      const session = await apiFetch<ResearchSession>(`/api/v1/research/${created.research_id}`);
       setQuery("");
       onSubmit?.(session);
     } catch (err) {

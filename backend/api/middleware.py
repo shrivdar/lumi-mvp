@@ -62,8 +62,12 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         path = request.url.path.rstrip("/")
 
-        # Skip auth for public paths and WebSocket upgrades (WS auth is per-connection)
-        if path in _PUBLIC_PATHS or request.scope.get("type") == "websocket":
+        # Skip auth for public paths, WebSocket upgrades, and CORS preflight
+        if (
+            path in _PUBLIC_PATHS
+            or request.scope.get("type") == "websocket"
+            or request.method == "OPTIONS"
+        ):
             return await call_next(request)
 
         api_key = request.headers.get("X-API-Key")

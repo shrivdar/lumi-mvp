@@ -32,10 +32,13 @@ async def list_agents(
         agents.append({
             "agent_id": r.agent_id,
             "agent_type": str(r.agent_type),
-            "task_id": r.task_id,
-            "success": r.success,
+            "status": "COMPLETED" if r.success else "FAILED",
+            "hypothesis_branch": r.hypothesis_id or None,
+            "task_count": 1,
             "nodes_added": len(r.nodes_added),
             "edges_added": len(r.edges_added),
+            "task_id": r.task_id,
+            "success": r.success,
             "duration_ms": r.duration_ms,
             "summary": r.summary,
         })

@@ -30,8 +30,12 @@ export default function ResearchDetailPage() {
   const { events, connected } = useResearchWebSocket(
     session?.status === "RUNNING" || session?.status === "INITIALIZING" ? id : null,
   );
-  const { data: agents } = useFetch<AgentInfo[]>(`/api/v1/research/${id}/agents`);
-  const { data: hypotheses } = useFetch<HypothesisNode[]>(`/api/v1/research/${id}/hypotheses`);
+  // Backend returns {agents: [...], count} wrapper
+  const { data: agentsResponse } = useFetch<{ agents: AgentInfo[]; count: number }>(`/api/v1/research/${id}/agents`);
+  const agents = agentsResponse?.agents ?? null;
+  // Backend returns {root_id, nodes: [...], total_visits, node_count} wrapper
+  const { data: hypothesesResponse } = useFetch<{ root_id: string | null; nodes: HypothesisNode[]; total_visits?: number; node_count?: number }>(`/api/v1/research/${id}/hypotheses`);
+  const hypotheses = hypothesesResponse?.nodes ?? null;
 
   const [activeTab, setActiveTab] = useState<"feed" | "agents" | "hypotheses">("feed");
 

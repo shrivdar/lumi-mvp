@@ -230,11 +230,9 @@ class TestCreateAgentFromSpec:
             agent_type_hint=AgentType.LITERATURE_ANALYST,
         )
         agent = create_agent_from_spec(spec, llm=mock_llm, kg=agent_kg)
-        # Should be the specialised subclass
-        from agents.literature_analyst import LiteratureAnalystAgent
-        assert isinstance(agent, LiteratureAnalystAgent)
+        # All agents are now generic BaseAgentImpl driven by spec
+        assert isinstance(agent, BaseAgentImpl)
         assert agent.spec is spec
-        assert agent.template is not None  # should also have the template
 
     def test_create_without_type_hint(self, mock_llm, agent_kg):
         spec = AgentSpec(

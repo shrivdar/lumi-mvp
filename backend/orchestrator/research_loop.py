@@ -43,6 +43,7 @@ from integrations.biosecurity import BiosecurityScreener
 from integrations.dynamic.registry import DynamicToolRegistry
 from integrations.living_document import LivingDocument
 from orchestrator.hypothesis_tree import HypothesisTree
+from report.generator import generate_report
 from orchestrator.strategy_memory import StrategyMemory
 from orchestrator.swarm_composer import SwarmComposer
 from orchestrator.token_budget import TokenBudgetManager
@@ -210,6 +211,17 @@ class ResearchOrchestrator:
 
             # Phase 3: Compile results
             result = self._compile_results(session, start_ms)
+
+            # Phase 3b: Generate report markdown
+            try:
+                result.report_markdown = await generate_report(
+                    session, result, self.kg, self.llm,
+                )
+            except Exception as report_exc:
+                logger.warning("report_generation_failed", error=str(report_exc))
+                # Fallback: use living document content if available
+                if self._living_doc:
+                    result.report_markdown = self._living_doc.render()
 
             # Phase 4: Biosecurity screening
             screening = await self._screen_results(result)

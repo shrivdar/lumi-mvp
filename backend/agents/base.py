@@ -271,12 +271,34 @@ class BaseAgentImpl:
             incremental_node_ids = {n.id for n in self._incremental_nodes}
             incremental_edge_ids = {e.id for e in self._incremental_edges}
 
+            # Write nodes and track ID remapping (add_node may dedup)
+            node_id_remap: dict[str, str] = {}
             for node in nodes:
                 if node.id not in incremental_node_ids:
-                    self.write_node(node, task.hypothesis_branch)
+                    original_id = node.id
+                    actual_id = self.write_node(node, task.hypothesis_branch)
+                    if actual_id != original_id:
+                        node_id_remap[original_id] = actual_id
+
             for edge in edges:
                 if edge.id not in incremental_edge_ids:
-                    self.write_edge(edge, task.hypothesis_branch)
+                    # Remap source/target IDs if nodes were deduped
+                    if edge.source_id in node_id_remap:
+                        edge.source_id = node_id_remap[edge.source_id]
+                    if edge.target_id in node_id_remap:
+                        edge.target_id = node_id_remap[edge.target_id]
+                    try:
+                        self.write_edge(edge, task.hypothesis_branch)
+                    except Exception as exc:
+                        logger.warning(
+                            "edge_write_failed",
+                            agent_id=self.agent_id,
+                            source_id=edge.source_id,
+                            target_id=edge.target_id,
+                            relation=str(edge.relation),
+                            error=str(exc),
+                        )
+                        self._errors.append(f"Edge write failed: {exc}")
 
             # 4. Self-falsification
             falsification_results: list[FalsificationResult] = []
@@ -1153,13 +1175,44 @@ class BaseAgentImpl:
         except Exception as e:
             return f"Error executing code: {e}"
 
+    # Default call examples for well-known tools; used by _build_tool_descriptions
+    _TOOL_CALL_EXAMPLES: dict[str, str] = {
+        "pubmed": 'pubmed:{"action": "search", "query": "BRCA1 breast cancer", "max_results": 10}',
+        "pubmed_search": 'pubmed_search:{"action": "search", "query": "BRCA1 breast cancer", "max_results": 10}',
+        "semantic_scholar": 'semantic_scholar:{"action": "search", "query": "BRCA1 cancer"}',
+        "semantic_scholar_search": 'semantic_scholar_search:{"action": "search", "query": "BRCA1 cancer"}',
+        "uniprot": 'uniprot:{"action": "search", "query": "BRCA1", "max_results": 5}',
+        "kegg": 'kegg:{"action": "search", "query": "Breast cancer pathway"}',
+        "reactome": 'reactome:{"action": "search", "query": "PI3K signaling"}',
+        "mygene": 'mygene:{"action": "search", "query": "BRCA1"}',
+        "mygene_search": 'mygene_search:{"action": "search", "query": "BRCA1"}',
+        "chembl": 'chembl:{"action": "search", "query": "Tamoxifen"}',
+        "chembl_search": 'chembl_search:{"action": "search", "query": "Tamoxifen"}',
+        "clinicaltrials": 'clinicaltrials:{"action": "search", "query": "BRCA1 breast cancer Phase 3"}',
+        "omim": 'omim:{"action": "search", "query": "BRCA1"}',
+        "omim_search": 'omim_search:{"action": "search", "query": "BRCA1"}',
+        "esm": 'esm:{"action": "embed", "sequence": "MDLSALREVE..."}',
+        "python_repl": 'python_repl:{"code": "print(1+1)"}',
+    }
+
+    def _tool_call_example(self, name: str) -> str:
+        """Return an example ``<tool>`` payload for a tool name."""
+        if name in self._TOOL_CALL_EXAMPLES:
+            return self._TOOL_CALL_EXAMPLES[name]
+        return f'{name}:{{"action": "search", "query": "..."}}'
+
     def _build_tool_descriptions(self) -> str:
-        """Build a description of available tools for multi-turn prompts."""
+        """Build a description of available tools for multi-turn prompts.
+
+        Includes tool name, description, and example call format so the LLM
+        knows exactly how to invoke each tool via ``<tool>`` tags.
+        """
         descriptions: list[str] = []
         if self.tools:
             for name, tool in self.tools.items():
                 desc = getattr(tool, "description", f"{name} tool")
-                descriptions.append(f"  - {name}: {desc}")
+                example = self._tool_call_example(name)
+                descriptions.append(f"  - {name}: {desc}\n    Example: <tool>{example}</tool>")
         else:
             descriptions.append("  (No external tools — reasoning only)")
 
@@ -1271,17 +1324,32 @@ class BaseAgentImpl:
             spec_prefix = f"Agent role: {self.spec.role}\nAgent instructions: {self.spec.instructions}\n\n"
             investigation_focus = spec_prefix + (investigation_focus or "")
 
+        # Count domain tools (excluding python_repl and kg_ virtual tools)
+        domain_tool_names = [n for n in self.tools if n != "python_repl"]
+        has_domain_tools = len(domain_tool_names) > 0
+
         # ---- Phase 1: Planning ----
+        tool_instruction = ""
+        if has_domain_tools:
+            tool_instruction = (
+                "IMPORTANT: You MUST use your domain tools to gather real data before answering. "
+                "Do NOT answer from your own knowledge alone — use the tools listed below to "
+                "search for and retrieve actual evidence. Each step in your plan should specify "
+                "which tool to call.\n\n"
+            )
+
         plan_prompt = (
             f"Research task: {task.instruction}\n\n"
             + (f"Investigation focus: {investigation_focus}\n\n" if investigation_focus else "")
             + f"KG context: {len(kg_context.get('nodes', []))} nodes, "
             f"{len(kg_context.get('edges', []))} edges\n"
             f"KG stats: {kg_context.get('stats', {})}\n\n"
-            f"Available tools:\n{tool_descriptions}\n\n"
+            + tool_instruction
+            + f"Available tools:\n{tool_descriptions}\n\n"
             f"Allowed KG node types: {allowed_nodes}\n"
             f"Allowed KG edge types: {allowed_edges}\n\n"
             "Create a numbered plan (3-8 steps) to investigate this. "
+            "Your plan MUST include at least 1-2 tool calls to gather evidence. "
             "Wrap your plan in <think> tags."
         )
 
@@ -1298,6 +1366,9 @@ class BaseAgentImpl:
             parsed_action=plan_think[:2000],
         ))
         observations.append(f"[PLAN]\n{plan_think}")
+
+        # Track how many domain tool calls the agent has made
+        tool_calls_made = 0
 
         # ---- Phase 2: Multi-turn execution loop ----
         for turn_num in range(1, max_turns + 1):
@@ -1345,16 +1416,28 @@ class BaseAgentImpl:
                     "Start synthesizing your findings and prepare to answer soon."
                 )
 
+            # Determine tool-usage nudge for early turns
+            tool_nudge = ""
+            if has_domain_tools and tool_calls_made == 0 and not budget_exhausted:
+                tool_nudge = (
+                    "\n\n🔬 REQUIRED: You have NOT called any domain tools yet. "
+                    "You MUST call at least one tool (e.g., "
+                    + ", ".join(domain_tool_names[:3])
+                    + ") to gather real evidence BEFORE providing your <answer>. "
+                    "Do NOT answer from your own knowledge alone."
+                )
+
             turn_prompt = (
                 f"Research task: {task.instruction}\n\n"
                 f"Turn {turn_num}/{max_turns}\n\n"
                 f"Previous observations:\n{obs_text}\n\n"
                 f"Available tools:\n{tool_descriptions}\n\n"
                 "Execute the next step. Use ONE of these formats:\n\n"
-                "To reason: <think>your reasoning</think>\n"
                 "To call a tool: <tool>tool_name:{\"arg\": \"value\"}</tool>\n"
+                "To reason: <think>your reasoning</think>\n"
                 "To execute code: <execute>python_code</execute>\n"
-                "To provide final answer (be thorough — include 15-25 entities and relationships, "
+                "To provide final answer (ONLY after gathering data from tools — "
+                "be thorough, include 15-25 entities and relationships, "
                 "capture all discovered information):\n"
                 "<answer>{\"entities\": [{\"name\": \"...\", "
                 "\"type\": \"GENE|PROTEIN|DISEASE|...\", "
@@ -1372,7 +1455,9 @@ class BaseAgentImpl:
                 "💡 TIP: Use kg_add_node and kg_add_edge tools to add entities/relationships "
                 "to the knowledge graph incrementally as you discover them — don't wait until "
                 "the final answer. This builds a richer graph.\n\n"
-                "If you have gathered enough information, provide your <answer>."
+                "IMPORTANT: Use your domain tools to search for real data before answering. "
+                "Only provide <answer> after you have made tool calls and gathered evidence."
+                + tool_nudge
                 + urgency
             )
 
@@ -1408,6 +1493,29 @@ class BaseAgentImpl:
                 observations.append(f"[THINK turn {turn_num}] {think_content[:500]}")
 
             if action_type == "answer":
+                # Block premature answers when agent has domain tools but
+                # hasn't called any yet (unless budget/turns exhausted)
+                if (
+                    has_domain_tools
+                    and tool_calls_made == 0
+                    and not budget_exhausted
+                    and remaining > 2
+                ):
+                    # Redirect: treat as think and nudge toward tool use
+                    observations.append(
+                        f"[THINK turn {turn_num}] Agent tried to answer without "
+                        f"calling any tools. Redirecting to use tools first."
+                    )
+                    turns.append(AgentTurn(
+                        turn_number=turn_num,
+                        turn_type=TurnType.THINK,
+                        input_prompt=turn_prompt[:500],
+                        raw_response=response[:2000],
+                        parsed_action="Redirected: must call tools before answering",
+                        duration_ms=duration,
+                    ))
+                    continue
+
                 turns.append(AgentTurn(
                     turn_number=turn_num,
                     turn_type=TurnType.ANSWER,
@@ -1420,6 +1528,7 @@ class BaseAgentImpl:
 
             if action_type == "tool":
                 exec_result = await self._execute_tool_action(content)
+                tool_calls_made += 1
                 observations.append(
                     f"[TOOL turn {turn_num}] {content[:200]}\nResult: {exec_result[:2000]}"
                 )
@@ -1685,28 +1794,52 @@ class BaseAgentImpl:
     def _parse_edges_from_answer(
         self, relationships: list[dict[str, Any]], nodes: list[KGNode]
     ) -> list[KGEdge]:
-        """Convert relationship dicts from an LLM answer to ``KGEdge`` instances."""
-        name_to_id: dict[str, str] = {n.name: n.id for n in nodes}
+        """Convert relationship dicts from an LLM answer to ``KGEdge`` instances.
+
+        Resolution order for source/target names:
+        1. Look up by name in the KG (includes incrementally-added nodes).
+        2. Look up by name in the answer's node list (for nodes not yet written).
+        3. Skip the edge with a warning if a node can't be resolved.
+        """
+        # Build name→id from answer nodes as fallback (KG lookup takes priority)
+        answer_name_to_id: dict[str, str] = {}
+        for n in nodes:
+            answer_name_to_id[n.name.lower()] = n.id
+
         edges: list[KGEdge] = []
 
         for rel in relationships:
             source_name = rel.get("source", "")
             target_name = rel.get("target", "")
 
-            source_id = name_to_id.get(source_name)
-            target_id = name_to_id.get(target_name)
+            # Resolve source: KG first, then answer nodes
+            source_id: str | None = None
+            kg_node = self.kg.get_node_by_name(source_name) if source_name else None
+            if kg_node:
+                source_id = kg_node.id
+            elif source_name.lower() in answer_name_to_id:
+                source_id = answer_name_to_id[source_name.lower()]
 
-            # Resolve from KG if not in answer entities
-            if not source_id:
-                kg_node = self.kg.get_node_by_name(source_name)
-                if kg_node:
-                    source_id = kg_node.id
-            if not target_id:
-                kg_node = self.kg.get_node_by_name(target_name)
-                if kg_node:
-                    target_id = kg_node.id
+            # Resolve target: KG first, then answer nodes
+            target_id: str | None = None
+            kg_node = self.kg.get_node_by_name(target_name) if target_name else None
+            if kg_node:
+                target_id = kg_node.id
+            elif target_name.lower() in answer_name_to_id:
+                target_id = answer_name_to_id[target_name.lower()]
 
             if not source_id or not target_id:
+                missing = []
+                if not source_id:
+                    missing.append(f"source '{source_name}'")
+                if not target_id:
+                    missing.append(f"target '{target_name}'")
+                logger.warning(
+                    "edge_skipped_missing_node",
+                    agent_id=self.agent_id,
+                    relation=rel.get("relation", ""),
+                    missing=", ".join(missing),
+                )
                 continue
 
             try:

@@ -138,10 +138,12 @@ class SwarmComposer:
             response = await self.llm.query(
                 prompt,
                 system_prompt=(
-                    "You are a research orchestrator dynamically composing an agent swarm. "
-                    "For each agent, define its role, specific instructions, recommended tools, "
-                    "and an optional agent_type_hint if it maps to a known specialist. "
-                    "Respond with ONLY a JSON array of agent spec objects."
+                    "You are a research orchestrator designing a team of AI research agents. "
+                    "Each agent you create will independently investigate a hypothesis by calling "
+                    "tools, writing to a shared knowledge graph, and self-falsifying its findings. "
+                    "Design agents with complementary expertise — each should attack the problem "
+                    "from a different angle. Write detailed system prompts that give each agent "
+                    "genuine domain expertise. Respond with ONLY a JSON array of agent spec objects."
                 ),
                 research_id=self.session_id,
                 model=settings.llm_fast_model,
@@ -253,47 +255,56 @@ class SwarmComposer:
         tool_catalog: list[str],
         config: ResearchConfig,
     ) -> str:
-        from agents.templates import AGENT_TEMPLATES
+        from core.models import NodeType, EdgeRelationType
+
+        node_types = ", ".join(nt.value for nt in NodeType)
+        edge_types = ", ".join(er.value for er in EdgeRelationType)
 
         lines = [
             f"Research query: {query}",
             f"Hypothesis to explore: {hypothesis.hypothesis}",
             f"Rationale: {hypothesis.rationale}",
             "",
-            "Known specialist types with their expertise (use as agent_type_hint if applicable):",
-        ]
-        for at in available_types:
-            template = AGENT_TEMPLATES.get(at)
-            if template:
-                # Include template system prompt as guidance for spec composition
-                prompt_summary = template.system_prompt.split("\n")[0] if template.system_prompt else ""
-                tools_str = ", ".join(template.tools) if template.tools else "none"
-                lines.append(
-                    f"  - {at.value}: {template.description}\n"
-                    f"    Expertise: {prompt_summary}\n"
-                    f"    Default tools: [{tools_str}]\n"
-                    f"    Falsification: {template.falsification_protocol or 'N/A'}"
-                )
-            else:
-                lines.append(f"  - {at.value}: Specialist agent")
-
-        lines.extend([
+            "## Your Task",
+            "Design a team of specialist AI research agents to investigate this hypothesis.",
+            "Each agent you create will run an independent multi-turn investigation loop:",
+            "  1. It reads the current knowledge graph for context",
+            "  2. It calls tools (API searches, databases, Python REPL) to gather evidence",
+            "  3. It writes nodes and edges to a shared knowledge graph",
+            "  4. It self-falsifies its own findings (searches for counter-evidence)",
             "",
-            f"Available tools: {', '.join(tool_catalog[:30])}",
+            "## Knowledge Graph Schema",
+            f"Valid node types: {node_types}",
+            f"Valid edge relation types: {edge_types}",
+            "Every edge must have an evidence source (PMID, DOI, database ID, or tool output).",
             "",
-            f"Create {config.max_agents_per_swarm - 1} agent specs (critic is auto-added).",
+            f"## Available Tools ({len(tool_catalog)} total)",
+            "Each agent can use any subset of these tools:",
+            ", ".join(tool_catalog[:50]),
+            "",
+            "## Design Constraints",
+            f"Create exactly {config.max_agents_per_swarm - 1} agents (a scientific critic is auto-added).",
+            "Do NOT include a critic/falsifier — one is always added automatically.",
+            "",
+            "Design agents that COMPLEMENT each other — each should investigate a different",
+            "angle of the hypothesis (e.g., molecular mechanism, clinical evidence, genomic",
+            "data, pathway context, drug implications). Avoid redundancy.",
+            "",
             "For each agent, provide a JSON object with:",
-            '  - "role": concise role description',
-            '  - "instructions": 2-4 sentences of specific investigation instructions',
-            '  - "tools": array of tool names from the catalog above',
-            '  - "agent_type_hint": one of the specialist types if applicable, or null',
-            '  - "system_prompt": optional custom system prompt (if omitted, template default is used)',
-            '  - "falsification_protocol": how this agent should self-falsify its findings',
+            '  - "role": concise role title (e.g., "Expression profiling analyst")',
+            '  - "instructions": 3-5 sentences of SPECIFIC investigation instructions.',
+            "    Tell the agent exactly what to search for, what tools to use, what",
+            "    evidence to look for, and what KG nodes/edges to create.",
+            '  - "tools": array of tool names from the catalog above (pick 3-8 relevant tools)',
+            '  - "system_prompt": 2-3 paragraph expert persona prompt. Describe the agent\'s',
+            "    domain expertise, methodological approach, and quality standards.",
+            '  - "kg_write_permissions": array of node types this agent should create',
+            '  - "kg_edge_permissions": array of edge relation types this agent should create',
+            '  - "falsification_protocol": 1-2 sentences on how this agent should',
+            "    try to disprove its own findings",
             "",
-            "Use the specialist expertise descriptions above to craft precise instructions.",
-            "scientific_critic is always included automatically — do not include it.",
-            "Return a JSON array of agent spec objects.",
-        ])
+            "Return a JSON array of agent spec objects. No markdown, no commentary.",
+        ]
         return "\n".join(lines)
 
     async def _parse_agent_spec(
@@ -354,14 +365,21 @@ class SwarmComposer:
 
         constraints = constraint_override or AgentConstraints()
 
-        # Inject template guidance if agent_type_hint maps to a known template
-        template_guidance = self._get_template_guidance(agent_type_hint)
-        system_prompt = raw.get("system_prompt", "") or template_guidance.get("system_prompt", "")
-        falsification_protocol = (
-            raw.get("falsification_protocol", "") or template_guidance.get("falsification_protocol", "")
-        )
-        kg_write_permissions = template_guidance.get("kg_write_permissions", [])
-        kg_edge_permissions = template_guidance.get("kg_edge_permissions", [])
+        # Use LLM-provided permissions directly; fall back to all-access if not specified
+        from core.models import NodeType, EdgeRelationType
+
+        system_prompt = raw.get("system_prompt", "")
+        falsification_protocol = raw.get("falsification_protocol", "")
+
+        # Parse KG permissions from LLM response
+        raw_node_perms = raw.get("kg_write_permissions", [])
+        raw_edge_perms = raw.get("kg_edge_permissions", [])
+
+        # Validate against actual enum values
+        valid_nodes = {nt.value for nt in NodeType}
+        valid_edges = {er.value for er in EdgeRelationType}
+        kg_write_permissions = [p for p in raw_node_perms if p in valid_nodes] or list(valid_nodes)
+        kg_edge_permissions = [p for p in raw_edge_perms if p in valid_edges] or list(valid_edges)
 
         return AgentSpec(
             role=role,

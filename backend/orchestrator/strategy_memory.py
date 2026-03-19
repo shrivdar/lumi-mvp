@@ -260,7 +260,12 @@ class StrategyMemory:
         # MCTS insight from hypothesis tree
         mcts_insight = ""
         if hypothesis_tree:
-            nodes = hypothesis_tree.get("nodes", [])
+            raw_nodes = hypothesis_tree.get("nodes", [])
+            # nodes may be a dict keyed by node-id; normalise to a list
+            if isinstance(raw_nodes, dict):
+                nodes = list(raw_nodes.values())
+            else:
+                nodes = list(raw_nodes)
             if nodes:
                 best = max(nodes, key=lambda n: n.get("score", 0), default=None)
                 if best:

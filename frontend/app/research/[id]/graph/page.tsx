@@ -11,6 +11,16 @@ import NodeDetailPanel from "@/components/node-detail-panel";
 import TemporalSlider from "@/components/temporal-slider";
 import { cn } from "@/lib/utils";
 
+interface GraphApiResponse {
+  format: string;
+  data: {
+    graph_id: string;
+    nodes: KGNode[];
+    edges: KGEdge[];
+    metadata: Record<string, unknown>;
+  };
+}
+
 interface GraphData {
   nodes: KGNode[];
   edges: KGEdge[];
@@ -22,8 +32,12 @@ export default function GraphPage() {
   const id = params.id as string;
 
   const { data: session } = useResearchSession(id);
-  const { data: graph } = useFetch<GraphData>(`/api/v1/research/${id}/graph?format=json`);
-  const { data: hypotheses } = useFetch<HypothesisNode[]>(`/api/v1/research/${id}/hypotheses`);
+  const { data: graphResponse } = useFetch<GraphApiResponse>(`/api/v1/research/${id}/graph?format=json`);
+  // Unwrap backend response: {format, data: {nodes, edges, ...}} -> {nodes, edges}
+  const graph: GraphData | null = graphResponse ? { nodes: graphResponse.data.nodes, edges: graphResponse.data.edges } : null;
+  // Backend returns {root_id, nodes: [...], ...} wrapper
+  const { data: hypothesesResponse } = useFetch<{ root_id: string | null; nodes: HypothesisNode[] }>(`/api/v1/research/${id}/hypotheses`);
+  const hypotheses = hypothesesResponse?.nodes ?? null;
 
   const [selectedNode, setSelectedNode] = useState<KGNode | null>(null);
   const [timeRange, setTimeRange] = useState<[string, string] | undefined>();

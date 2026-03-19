@@ -187,6 +187,8 @@ class TestToolCreatorAgent:
         llm = MockLLMClient(responses=[
             # Plan
             "<think>Create STRING-db wrapper</think>",
+            # Tool call (required before answer)
+            '<tool>pubmed_search:{"query": "STRING protein interaction database"}</tool>',
             # Answer with wrapper
             '<answer>' + json.dumps({
                 "entities": [
