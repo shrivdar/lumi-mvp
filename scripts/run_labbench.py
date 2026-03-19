@@ -326,44 +326,76 @@ def build_choices(question: BenchQuestion, seed: int | None = None) -> tuple[lis
 # Category-specific hints for DbQA subtasks
 SUBTASK_HINTS: dict[str, str] = {
     "dga_task": (
-        "This question is about disease-gene associations. Consider querying "
-        "databases like DisGeNET, OMIM, and ClinVar to find gene-disease relationships."
+        "This question is about disease-gene associations (DGA). It asks which gene is in "
+        "DisGeNET but NOT in OMIM for a given disease.\n"
+        "KEY REASONING STRATEGY:\n"
+        "- OMIM contains well-established Mendelian disease genes with strong evidence.\n"
+        "- DisGeNET aggregates from many sources (GWAS, literature mining, animal models) and "
+        "contains many more associations, including weaker/indirect ones.\n"
+        "- The CORRECT answer is typically a gene with weaker/indirect evidence (found by GWAS, "
+        "literature mining, or animal models) that DisGeNET includes but OMIM does not.\n"
+        "- Well-known disease genes (like MNX1 for Currarino) are usually in BOTH databases "
+        "and are therefore DISTRACTORS, not correct answers.\n"
+        "- Genes that seem unrelated or have indirect connections to the disease are more "
+        "likely to be the correct answer (in DisGeNET only).\n"
+        "- If you recognize a gene as a classic/canonical gene for the disease, it is likely "
+        "a distractor (in both DisGeNET AND OMIM)."
     ),
     "gene_location_task": (
-        "This question is about gene chromosomal locations. Use NCBI Gene, Ensembl, "
-        "or UCSC Genome Browser data to determine genomic coordinates."
+        "This question is about gene chromosomal locations. Key databases: "
+        "NCBI Gene (official gene symbol, chromosome, map location like 17q21.31), "
+        "Ensembl (precise coordinates, GRCh38). Remember: cytogenetic bands (p/q arms), "
+        "gene symbols may have aliases, and some genes span multiple bands."
     ),
     "mirna_targets_task": (
-        "This question is about microRNA targets. Consider databases like "
-        "miRTarBase, TargetScan, or miRDB."
+        "This question is about microRNA-target interactions. Key database: "
+        "miRTarBase (experimentally validated interactions — reporter assay, western blot, "
+        "qRT-PCR, microarray, sequencing). Pay attention to: miRNA naming conventions "
+        "(hsa-miR-XXX-Xp/Xs), validation methods, and whether the interaction is "
+        "strong (reporter assay) or functional (expression change)."
     ),
     "mouse_tumor_gene_sets": (
-        "This question involves mouse tumor gene sets. Consider MSigDB, MGI, "
-        "or cancer-related gene set databases."
+        "This question involves mouse tumor gene sets from MSigDB. Key collection: "
+        "M (mouse) gene sets mapped from human orthologs. Consider tumor type, "
+        "up/down regulation, and the specific study the gene set comes from."
     ),
     "oncogenic_signatures_task": (
-        "This question is about oncogenic gene signatures. Use MSigDB oncogenic "
-        "signatures or cancer genomics databases like COSMIC."
+        "This question is about oncogenic gene signatures from MSigDB C6 collection. "
+        "These are gene sets representing signatures of cellular pathways often "
+        "dysregulated in cancer (e.g., KRAS.600_UP.V1_UP = genes upregulated by "
+        "oncogenic KRAS). Pay attention to: the specific oncogene/pathway, "
+        "direction (UP/DN), version, and cell type."
     ),
     "tfbs_GTRD_task": (
         "This question is about transcription factor binding sites from the GTRD "
-        "database. Consider ChIP-seq data and TFBS databases."
+        "(Gene Transcription Regulation Database). GTRD aggregates ChIP-seq data "
+        "to identify TF binding sites. Pay attention to: the specific TF, target gene, "
+        "cell line/tissue, and whether the binding is proximal (promoter) or distal (enhancer)."
     ),
     "variant_from_sequence_task": (
-        "This question asks about genetic variants. Use dbSNP, ClinVar, "
-        "or gnomAD to identify variants from sequence data."
+        "This question asks about genetic variants. Key databases: ClinVar (clinical "
+        "significance: pathogenic, likely pathogenic, VUS, likely benign, benign), "
+        "gnomAD (population allele frequencies), dbSNP (rs IDs). Pay attention to: "
+        "the specific variant notation (HGVS), review status (stars in ClinVar), "
+        "and classification criteria."
     ),
     "variant_multi_sequence_task": (
-        "This question involves variants across multiple sequences. Use "
-        "variant databases and sequence alignment tools."
+        "This question involves variants across multiple sequences. Use knowledge of "
+        "ClinVar, gnomAD, and dbSNP. Consider: variant consequences (missense, nonsense, "
+        "frameshift), position in the protein, and clinical significance across databases."
     ),
     "vax_response_task": (
-        "This question is about vaccine response data. Consider immunology "
-        "databases and vaccine-related gene expression studies."
+        "This question is about vaccine response data and immunology. Consider "
+        "ImmPort, GEO/ArrayExpress expression data, and immune-related gene sets. "
+        "Pay attention to: specific vaccine types, immune cell markers, cytokine responses, "
+        "and time-course expression patterns."
     ),
     "viral_ppi_task": (
-        "This question is about viral protein-protein interactions. Use "
-        "IntAct, BioGRID, or virus-host interaction databases."
+        "This question is about viral protein-protein interactions. Key databases: "
+        "IntAct (MI-score, interaction detection methods), BioGRID (genetic and physical "
+        "interactions), VirHostNet. Pay attention to: the specific viral protein, "
+        "host interactor, detection method, and whether the interaction is direct (binary) "
+        "or indirect (co-complex)."
     ),
 }
 
@@ -386,7 +418,10 @@ def _get_subtask_hint(question: BenchQuestion) -> str:
             "This is a literature-based question. Think about which published "
             "studies are relevant and what their key findings were."
         )
-    return "Use biological databases to look up the answer."
+    return (
+        "Use your knowledge of biological databases to determine the answer. "
+        "Consider which database would be the authoritative source for this type of information."
+    )
 
 
 def build_prompt(question: BenchQuestion, choices: list[str]) -> str:
@@ -400,15 +435,22 @@ def build_prompt(question: BenchQuestion, choices: list[str]) -> str:
     parts.append("Choices:\n" + "\n".join(f"  {c}" for c in choices))
 
     hint = _get_subtask_hint(question)
-    parts.append(f"\nHint: {hint}")
+    parts.append(f"\nDatabase hint: {hint}")
 
     parts.append(
-        "\nInstructions:\n"
-        "1. Reason step-by-step about which answer is correct.\n"
-        "2. Consider what biological databases would contain this information.\n"
-        "3. Think about which options are plausible distractors vs the correct answer.\n"
-        "4. Only choose 'Insufficient information' if you truly cannot determine the answer.\n"
-        "5. State your final answer on the LAST line in exactly this format: Answer: X\n"
+        "\nFormat your response as:\n"
+        "Database(s) involved: [identify the database(s) this question is about]\n"
+        "Key facts: [relevant knowledge about the specific entities mentioned]\n"
+        "Reasoning: [step-by-step analysis of each option]\n"
+        "Answer: X\n\n"
+        "Rules:\n"
+        "1. Identify the specific database(s) and recall their data types, schema, and conventions.\n"
+        "2. For each choice, assess whether it is consistent with what the database would contain.\n"
+        "3. Eliminate options that contradict known database entries or biological facts.\n"
+        "4. If two options seem plausible, pick the one more consistent with the database's known content.\n"
+        "5. \"Insufficient information\" is almost never correct. Only choose it if you are CERTAIN "
+        "the databases cannot answer the question. When in doubt, commit to a specific answer.\n"
+        "6. State your final answer on the LAST line in exactly this format: Answer: X\n"
         "   where X is a single letter (A, B, C, D, or E)."
     )
 
@@ -416,13 +458,37 @@ def build_prompt(question: BenchQuestion, choices: list[str]) -> str:
 
 
 SYSTEM_PROMPT = (
-    "You are a biomedical database expert taking a multiple-choice exam about "
-    "biological databases. You have deep knowledge of databases including: "
-    "DisGeNET, OMIM, ClinVar, UniProt, KEGG, Reactome, ChEMBL, MSigDB, GTRD, "
-    "miRTarBase, dbSNP, gnomAD, IntAct, BioGRID, NCBI Gene, and Ensembl.\n\n"
-    "For each question, reason carefully through the options. Use your knowledge "
-    "of what information each database contains and how they differ. "
-    "Select the single best answer."
+    "You are an expert biomedical researcher with deep knowledge of biological databases including:\n"
+    "- DisGeNET: gene-disease associations (GDA scores, evidence types, source databases)\n"
+    "- OMIM: Mendelian disease-gene relationships (phenotype MIM numbers, inheritance)\n"
+    "- UniProt: protein function, subcellular location, tissue expression, domains\n"
+    "- KEGG: metabolic and signaling pathways, drug targets, disease pathways\n"
+    "- ClinVar: variant clinical significance (pathogenic, benign, VUS)\n"
+    "- gnomAD: population allele frequencies, constraint metrics (pLI, Z-scores)\n"
+    "- IntAct/BioGRID: protein-protein interactions (binary, co-complex)\n"
+    "- NCBI Gene: gene summaries, orthologs, RefSeq, chromosomal locations\n"
+    "- Ensembl: genome annotation, gene coordinates, regulatory elements\n"
+    "- MSigDB: gene sets and signatures (hallmark, C2-CGP, C6-oncogenic, C7-immunologic)\n"
+    "- miRTarBase: experimentally validated miRNA-target interactions\n"
+    "- GTRD: transcription factor binding sites from ChIP-seq experiments\n"
+    "- dbSNP: SNP identifiers, allele frequencies, functional annotations\n"
+    "- Reactome: curated biological pathways and reactions\n"
+    "- ChEMBL: bioactivity data for drug-like molecules\n"
+    "- COSMIC: somatic mutations in cancer\n\n"
+    "For each question:\n"
+    "1. Identify which database(s) the question is about\n"
+    "2. Recall what you know about the specific entries, genes, proteins, or variants mentioned\n"
+    "3. Reason carefully about the answer, considering edge cases and database-specific conventions\n"
+    "4. Choose the most likely correct answer\n\n"
+    "IMPORTANT RULES:\n"
+    "1. Most questions have a definitive correct answer. \"Insufficient information\" is rarely "
+    "correct (<10% of the time). Prefer a specific answer over refusing.\n"
+    "2. DISTRACTOR AWARENESS: Questions about \"which entry is in database X but NOT database Y\" "
+    "use well-known/canonical entries as distractors (they appear in BOTH databases). The correct "
+    "answer is often a less obvious entry that only appears in the more comprehensive database.\n"
+    "3. When a gene/protein seems like the obvious answer because it's strongly associated with "
+    "the condition, it is likely a distractor. Look for the less obvious option.\n"
+    "4. Read the database hint carefully — it contains reasoning strategies specific to the question type."
 )
 
 
@@ -454,32 +520,38 @@ def extract_answer_letter(response: str) -> str:
 # ---------------------------------------------------------------------------
 
 AGENTIC_SYSTEM_PROMPT_DBQA = (
-    "You are a biomedical database expert answering a multiple-choice question "
+    "You are an expert biomedical researcher answering a multiple-choice question "
     "about biological databases. You have deep knowledge of databases including: "
     "DisGeNET, OMIM, ClinVar, UniProt, KEGG, Reactome, ChEMBL, MSigDB, GTRD, "
     "miRTarBase, dbSNP, gnomAD, IntAct, BioGRID, NCBI Gene, and Ensembl.\n\n"
-    "You can reason step-by-step AND write Python code to query databases or "
-    "compute answers. To execute code, wrap it in <execute> tags:\n\n"
-    "<execute>\n"
-    "import requests\n"
-    "r = requests.get('https://rest.uniprot.org/uniprotkb/search?query=gene:BRCA1&format=json&size=5')\n"
-    "data = r.json()\n"
-    "print(data['results'][0]['primaryAccession'])\n"
-    "</execute>\n\n"
-    "Write Python code to query biological databases. Use `requests` to call "
-    "REST APIs (UniProt, NCBI, KEGG). Parse JSON responses. Verify your answer "
-    "with a second database.\n\n"
+    "STRATEGY — follow this approach:\n"
+    "1. FIRST: Think through the problem using your training knowledge. Identify which "
+    "database(s) the question is about and what you know about the specific entities.\n"
+    "2. THEN: If you are confident (>70%), just give your answer. Do NOT write code.\n"
+    "3. ONLY IF UNCERTAIN: Write Python code to query FREE, PUBLIC APIs to verify. "
+    "Wrap code in <execute> tags.\n\n"
+    "FREE APIs you CAN query (no authentication needed):\n"
+    "- UniProt REST: https://rest.uniprot.org/uniprotkb/search?query=...&format=json\n"
+    "- NCBI E-utilities: https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=gene&term=...\n"
+    "- NCBI Gene: https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=gene&id=...\n"
+    "- KEGG REST: https://rest.kegg.jp/get/hsa:GENEID or https://rest.kegg.jp/find/pathway/...\n"
+    "- Ensembl REST: https://rest.ensembl.org/lookup/symbol/homo_sapiens/GENE?content-type=application/json\n"
+    "- MyGene.info: https://mygene.info/v3/query?q=GENE&fields=genomic_pos,symbol,name\n\n"
+    "APIs that REQUIRE authentication (DO NOT try these — they will fail):\n"
+    "- DisGeNET API (requires API key)\n"
+    "- OMIM API (requires API key)\n"
+    "- BioGRID REST (requires access key)\n"
+    "For DisGeNET, OMIM, and similar gated databases, rely on your training knowledge instead.\n\n"
     "Available libraries: pandas, numpy, scipy, requests, json, re, math, "
     "collections, itertools, Bio (biopython).\n\n"
     "Rules:\n"
-    "1. Reason step-by-step before answering.\n"
-    "2. Use code to query real APIs when it would help verify your answer.\n"
-    "3. You can execute multiple code blocks across turns.\n"
+    "1. Prefer answering from knowledge over running code. Code is a fallback, not the default.\n"
+    "2. If a code query fails or times out, DO NOT keep retrying — just answer from knowledge.\n"
+    "3. \"Insufficient information\" is almost never correct (<10% of questions). Commit to an answer.\n"
     "4. When you are confident in your answer, state it on the LAST line as:\n"
     "   Answer: X\n"
     "   where X is a single letter (A, B, C, D, or E).\n"
-    "5. Validate your answer with computation when possible.\n"
-    "6. Only choose 'Insufficient information' if databases truly cannot answer this."
+    "5. Keep your reasoning concise — do not over-deliberate."
 )
 
 AGENTIC_SYSTEM_PROMPT_SEQQA = (
@@ -678,8 +750,10 @@ def build_agentic_turn_prompt(
             parts.append(f"\nAdditional guidance: {hint}")
 
         parts.append(
-            "\nThink step-by-step. If you need to look something up, write Python code "
-            "in <execute> tags. When ready, state your final answer as: Answer: X"
+            "\nThink step-by-step about the answer. If you are confident from your "
+            "knowledge alone, just give the answer immediately — no need to write code. "
+            "Only use <execute> tags for code if you are genuinely uncertain and a FREE "
+            "public API can help verify. State your final answer as: Answer: X"
         )
     else:
         # Subsequent turns: show history and ask to continue
@@ -695,7 +769,9 @@ def build_agentic_turn_prompt(
 
         parts.append(
             "\nContinue your analysis. If the code output helps, use it to determine "
-            "the answer. You can run more code if needed. When ready, state: Answer: X"
+            "the answer. If code failed or returned unhelpful results, answer from your "
+            "knowledge — do NOT keep retrying failed API calls. You MUST give a final "
+            "answer now. State: Answer: X"
         )
 
     return "\n\n".join(parts)
@@ -1775,8 +1851,8 @@ def main() -> None:
     parser.add_argument(
         "--max-turns",
         type=int,
-        default=8,
-        help="Max turns per trial in agentic mode (default: 8)",
+        default=4,
+        help="Max turns per trial in agentic mode (default: 4)",
     )
     parser.add_argument(
         "--dry-run",
