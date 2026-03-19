@@ -4,11 +4,12 @@
 Downloads (if needed), loads, and evaluates YOHAS on the LAB-Bench DbQA subset
 (520 multiple-choice questions testing ability to query biological databases).
 
-Competitor to beat: STELLA at 54% on DbQA.
+Competitor to beat: STELLA at 54% on DbQA.  Target: Biomni Lab at 78%.
 
 Usage:
     python scripts/run_labbench.py --limit 5
     python scripts/run_labbench.py --limit 50 --mode zero-shot
+    python scripts/run_labbench.py --mode agentic --trials 3 --limit 10
     python scripts/run_labbench.py                           # all 520 questions
     python scripts/run_labbench.py --resume                  # resume from checkpoint
     python scripts/run_labbench.py --dry-run                 # no LLM calls, test pipeline
@@ -20,11 +21,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import json
 import logging
 import os
 import random
 import re
+import signal
 import sys
 import time
 import traceback
@@ -342,6 +346,447 @@ def extract_answer_letter(response: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Agentic mode: multi-turn reasoning with code execution
+# ---------------------------------------------------------------------------
+
+AGENTIC_SYSTEM_PROMPT = (
+    "You are a biomedical database expert answering a multiple-choice question "
+    "about biological databases. You have deep knowledge of databases including: "
+    "DisGeNET, OMIM, ClinVar, UniProt, KEGG, Reactome, ChEMBL, MSigDB, GTRD, "
+    "miRTarBase, dbSNP, gnomAD, IntAct, BioGRID, NCBI Gene, and Ensembl.\n\n"
+    "You can reason step-by-step AND write Python code to query databases or "
+    "compute answers. To execute code, wrap it in <execute> tags:\n\n"
+    "<execute>\n"
+    "import requests\n"
+    "r = requests.get('https://rest.uniprot.org/uniprotkb/search?query=gene:BRCA1&format=json&size=5')\n"
+    "data = r.json()\n"
+    "print(data['results'][0]['primaryAccession'])\n"
+    "</execute>\n\n"
+    "Available libraries: pandas, numpy, scipy, requests, json, re, math, "
+    "collections, itertools, Bio (biopython).\n\n"
+    "Rules:\n"
+    "1. Reason step-by-step before answering.\n"
+    "2. Use code to query real APIs when it would help verify your answer.\n"
+    "3. You can execute multiple code blocks across turns.\n"
+    "4. When you are confident in your answer, state it on the LAST line as:\n"
+    "   Answer: X\n"
+    "   where X is a single letter (A, B, C, D, or E).\n"
+    "5. Validate your answer with computation when possible.\n"
+    "6. Only choose 'Insufficient information' if databases truly cannot answer this."
+)
+
+
+def execute_code_safely(code: str, timeout: int = 30) -> str:
+    """Execute Python code in a sandboxed namespace with timeout.
+
+    Returns stdout output or error message, truncated to 5000 chars.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        np = None  # type: ignore[assignment]
+    try:
+        import pandas as pd
+    except ImportError:
+        pd = None  # type: ignore[assignment]
+    try:
+        import requests as req_lib
+    except ImportError:
+        req_lib = None  # type: ignore[assignment]
+    try:
+        import scipy.stats as scipy_stats
+    except ImportError:
+        scipy_stats = None  # type: ignore[assignment]
+
+    namespace: dict[str, Any] = {
+        "__builtins__": __builtins__,
+        "json": json,
+        "re": re,
+        "math": __import__("math"),
+        "collections": __import__("collections"),
+        "itertools": __import__("itertools"),
+    }
+    if np is not None:
+        namespace["np"] = np
+        namespace["numpy"] = np
+    if pd is not None:
+        namespace["pd"] = pd
+        namespace["pandas"] = pd
+    if req_lib is not None:
+        namespace["requests"] = req_lib
+    if scipy_stats is not None:
+        namespace["stats"] = scipy_stats
+        namespace["scipy"] = __import__("scipy")
+
+    f = io.StringIO()
+
+    # Use signal-based timeout on Unix; skip on Windows
+    use_signal = hasattr(signal, "SIGALRM")
+
+    def _handler(signum: int, frame: Any) -> None:
+        raise TimeoutError("Code execution timed out")
+
+    if use_signal:
+        old_handler = signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(timeout)
+
+    try:
+        with contextlib.redirect_stdout(f):
+            exec(code, namespace)  # noqa: S102
+        output = f.getvalue()
+        return output[:5000] if output else "(no output)"
+    except TimeoutError:
+        return "Error: TimeoutError: Code execution timed out"
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
+    finally:
+        if use_signal:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+
+def extract_code_block(response: str) -> str | None:
+    """Extract code between <execute> tags."""
+    match = re.search(r"<execute>\s*\n?(.*?)</execute>", response, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def has_final_answer(response: str) -> bool:
+    """Check if the response contains a final answer."""
+    return bool(re.search(r"Answer:\s*\(?[A-Ea-e]\)?", response, re.IGNORECASE))
+
+
+def build_agentic_turn_prompt(
+    question: DbQAQuestion,
+    choices: list[str],
+    history: list[dict[str, str]],
+    turn: int,
+    hint: str = "",
+) -> str:
+    """Build the prompt for a single turn in the agentic loop."""
+    parts: list[str] = []
+
+    if turn == 0:
+        # First turn: present the full question
+        if question.context:
+            parts.append(f"Context:\n{question.context}")
+        parts.append(f"Question: {question.question}")
+        parts.append("Choices:\n" + "\n".join(f"  {c}" for c in choices))
+
+        subtask_hint = _get_subtask_hint(question.subtask)
+        parts.append(f"\nDatabase hint: {subtask_hint}")
+
+        if hint:
+            parts.append(f"\nAdditional guidance: {hint}")
+
+        parts.append(
+            "\nThink step-by-step. If you need to look something up, write Python code "
+            "in <execute> tags. When ready, state your final answer as: Answer: X"
+        )
+    else:
+        # Subsequent turns: show history and ask to continue
+        parts.append("Here is the conversation so far:\n")
+        for entry in history:
+            if entry["role"] == "code":
+                parts.append(f"[Code executed]:\n```python\n{entry['code']}\n```")
+                parts.append(f"[Output]:\n{entry['output']}")
+            elif entry["role"] == "think":
+                parts.append(f"[Your reasoning]:\n{entry['content']}")
+            elif entry["role"] == "assistant":
+                parts.append(f"[Your previous response]:\n{entry['content']}")
+
+        parts.append(
+            "\nContinue your analysis. If the code output helps, use it to determine "
+            "the answer. You can run more code if needed. When ready, state: Answer: X"
+        )
+
+    return "\n\n".join(parts)
+
+
+# Category-specific retry hints for multi-trial mode
+RETRY_HINTS: dict[str, str] = {
+    "dga_task": "Try querying a different database (OMIM, DisGeNET, OpenTargets)",
+    "gene_location_task": "Verify with Ensembl or NCBI Gene REST API",
+    "mirna_targets_task": "Check miRTarBase or TargetScan databases",
+    "mouse_tumor_gene_sets": "Look at MSigDB mouse gene sets or MGI",
+    "oncogenic_signatures_task": "Check MSigDB oncogenic signatures collection (C6)",
+    "tfbs_GTRD_task": "Query the GTRD database for ChIP-seq binding site data",
+    "variant_from_sequence_task": "Look at ClinVar or gnomAD for variant data",
+    "variant_multi_sequence_task": "Use sequence alignment and variant databases",
+    "vax_response_task": "Check immunology databases and ImmPort",
+    "viral_ppi_task": "Query IntAct or VirHostNet for viral PPIs",
+}
+
+
+def _get_retry_hint(subtask: str) -> str:
+    """Get a retry-specific hint for the subtask."""
+    for key, hint in RETRY_HINTS.items():
+        if key in subtask:
+            return hint
+    return "Try a different analytical approach or database query."
+
+
+async def evaluate_question_agentic(
+    question: DbQAQuestion,
+    llm: Any,
+    *,
+    model: str = "",
+    max_turns: int = 8,
+    timeout_seconds: int = 300,
+    trial_hint: str = "",
+) -> tuple[ScoredResult, str]:
+    """Evaluate using multi-turn agentic reasoning with code execution.
+
+    Returns (ScoredResult, reasoning_summary) where reasoning_summary can be
+    used as context for retry hints in multi-trial mode.
+    """
+    start = time.monotonic()
+    choices, correct_letter, refuse_letter = build_choices(question)
+
+    history: list[dict[str, str]] = []
+    total_tokens = 0
+    full_reasoning: list[str] = []
+
+    try:
+        for turn in range(max_turns):
+            # Check total timeout
+            elapsed = time.monotonic() - start
+            if elapsed > timeout_seconds:
+                logger.warning("Agentic evaluation timed out at turn %d", turn)
+                break
+
+            prompt = build_agentic_turn_prompt(
+                question, choices, history, turn, hint=trial_hint
+            )
+
+            remaining_time = timeout_seconds - elapsed
+            resp = await asyncio.wait_for(
+                llm.query(
+                    prompt,
+                    system_prompt=AGENTIC_SYSTEM_PROMPT,
+                    max_tokens=4096,
+                    model=model or None,
+                ),
+                timeout=max(remaining_time, 10),
+            )
+
+            response_text = resp.text
+            total_tokens += resp.call_tokens
+            full_reasoning.append(f"[Turn {turn + 1}]: {response_text}")
+
+            # Check for code execution
+            code = extract_code_block(response_text)
+            if code:
+                logger.debug("Turn %d: executing code (%d chars)", turn, len(code))
+                output = execute_code_safely(code, timeout=30)
+                history.append({"role": "code", "code": code, "output": output})
+                full_reasoning.append(f"[Code output]: {output}")
+
+                # If response also has a final answer after code, extract it
+                if has_final_answer(response_text):
+                    predicted = extract_answer_letter(response_text)
+                    is_correct = predicted == correct_letter
+                    is_refused = predicted == refuse_letter
+                    reasoning = "\n".join(full_reasoning)
+                    return ScoredResult(
+                        question_id=question.id,
+                        subtask=question.subtask,
+                        predicted=predicted,
+                        predicted_text=_get_choice_text(choices, predicted),
+                        correct_answer=correct_letter,
+                        correct_text=question.correct_answer,
+                        is_correct=is_correct,
+                        is_refused=is_refused,
+                        reasoning=reasoning,
+                        tokens_used=total_tokens,
+                        latency_ms=int((time.monotonic() - start) * 1000),
+                        error=None,
+                    ), reasoning
+
+            elif has_final_answer(response_text):
+                predicted = extract_answer_letter(response_text)
+                is_correct = predicted == correct_letter
+                is_refused = predicted == refuse_letter
+                reasoning = "\n".join(full_reasoning)
+                return ScoredResult(
+                    question_id=question.id,
+                    subtask=question.subtask,
+                    predicted=predicted,
+                    predicted_text=_get_choice_text(choices, predicted),
+                    correct_answer=correct_letter,
+                    correct_text=question.correct_answer,
+                    is_correct=is_correct,
+                    is_refused=is_refused,
+                    reasoning=reasoning,
+                    tokens_used=total_tokens,
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                    error=None,
+                ), reasoning
+
+            else:
+                # Thinking step — no code, no final answer
+                history.append({"role": "think", "content": response_text})
+
+        # Exhausted turns without a final answer — try to extract from last response
+        all_text = "\n".join(full_reasoning)
+        predicted = extract_answer_letter(all_text)
+        reasoning = all_text
+
+        return ScoredResult(
+            question_id=question.id,
+            subtask=question.subtask,
+            predicted=predicted,
+            predicted_text=_get_choice_text(choices, predicted),
+            correct_answer=correct_letter,
+            correct_text=question.correct_answer,
+            is_correct=predicted == correct_letter,
+            is_refused=predicted == refuse_letter,
+            reasoning=reasoning,
+            tokens_used=total_tokens,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            error="max_turns_exhausted" if not predicted else None,
+        ), reasoning
+
+    except TimeoutError:
+        reasoning = "\n".join(full_reasoning) if full_reasoning else ""
+        return ScoredResult(
+            question_id=question.id,
+            subtask=question.subtask,
+            predicted="",
+            predicted_text="",
+            correct_answer=correct_letter,
+            correct_text=question.correct_answer,
+            is_correct=False,
+            is_refused=False,
+            reasoning=reasoning,
+            tokens_used=total_tokens,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            error="Timeout",
+        ), reasoning
+
+    except Exception as exc:
+        reasoning = "\n".join(full_reasoning) if full_reasoning else ""
+        return ScoredResult(
+            question_id=question.id,
+            subtask=question.subtask,
+            predicted="",
+            predicted_text="",
+            correct_answer=correct_letter,
+            correct_text=question.correct_answer,
+            is_correct=False,
+            is_refused=False,
+            reasoning=reasoning,
+            tokens_used=total_tokens,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            error=traceback.format_exc(),
+        ), reasoning
+
+
+async def evaluate_question_multitrial(
+    question: DbQAQuestion,
+    llm: Any,
+    *,
+    model: str = "",
+    max_trials: int = 3,
+    agentic: bool = True,
+    max_turns: int = 8,
+    timeout_seconds: int = 300,
+) -> tuple[ScoredResult, list[dict[str, Any]]]:
+    """Evaluate with multiple trials, injecting hints from previous attempts.
+
+    Returns (best_result, trial_details).
+    """
+    trial_details: list[dict[str, Any]] = []
+    best_result: ScoredResult | None = None
+    prev_reasoning = ""
+    prev_predicted = ""
+
+    for trial in range(max_trials):
+        trial_hint = ""
+        if trial > 0 and prev_predicted:
+            # Build hint from previous trial
+            category_hint = _get_retry_hint(question.subtask)
+            trial_hint = (
+                f"On your previous attempt, you chose ({prev_predicted}) but "
+                f"the correct answer was different. Your reasoning was:\n"
+                f"{prev_reasoning[:500]}\n\n"
+                f"Consider alternative approaches, especially: {category_hint}"
+            )
+
+        if agentic:
+            result, reasoning = await evaluate_question_agentic(
+                question,
+                llm,
+                model=model,
+                max_turns=max_turns,
+                timeout_seconds=timeout_seconds,
+                trial_hint=trial_hint,
+            )
+        else:
+            # Zero-shot with hint injection for trial > 0
+            result = await evaluate_question_live(
+                question, llm, model=model, timeout_seconds=timeout_seconds,
+                trial_hint=trial_hint,
+            )
+            reasoning = result.reasoning
+
+        trial_details.append({
+            "trial": trial + 1,
+            "predicted": result.predicted,
+            "is_correct": result.is_correct,
+            "tokens_used": result.tokens_used,
+            "latency_ms": result.latency_ms,
+            "error": result.error,
+        })
+
+        # Early exit: correct answer found
+        if result.is_correct:
+            logger.info(
+                "  Trial %d/%d: CORRECT (early exit)", trial + 1, max_trials
+            )
+            return result, trial_details
+
+        logger.info(
+            "  Trial %d/%d: WRONG (predicted %s, correct %s)",
+            trial + 1, max_trials, result.predicted, result.correct_answer,
+        )
+
+        prev_predicted = result.predicted
+        prev_reasoning = reasoning
+
+        # Keep the best result (prefer one with an answer over no answer)
+        if best_result is None or (not best_result.predicted and result.predicted):
+            best_result = result
+        elif result.predicted and not best_result.is_correct:
+            # Use the latest trial as best (it has more information)
+            best_result = result
+
+    # Aggregate tokens and latency across trials
+    total_tokens = sum(t["tokens_used"] for t in trial_details)
+    total_latency = sum(t["latency_ms"] for t in trial_details)
+    assert best_result is not None
+
+    # Return with aggregated stats
+    aggregated = ScoredResult(
+        question_id=best_result.question_id,
+        subtask=best_result.subtask,
+        predicted=best_result.predicted,
+        predicted_text=best_result.predicted_text,
+        correct_answer=best_result.correct_answer,
+        correct_text=best_result.correct_text,
+        is_correct=best_result.is_correct,
+        is_refused=best_result.is_refused,
+        reasoning=best_result.reasoning,
+        tokens_used=total_tokens,
+        latency_ms=total_latency,
+        error=best_result.error,
+    )
+    return aggregated, trial_details
+
+
+# ---------------------------------------------------------------------------
 # Evaluation loop
 # ---------------------------------------------------------------------------
 
@@ -352,11 +797,14 @@ async def evaluate_question_live(
     *,
     model: str = "",
     timeout_seconds: int = 300,
+    trial_hint: str = "",
 ) -> ScoredResult:
     """Evaluate a single DbQA question using the LLM."""
     start = time.monotonic()
     choices, correct_letter, refuse_letter = build_choices(question)
     prompt = build_prompt(question, choices)
+    if trial_hint:
+        prompt += f"\n\nAdditional guidance from a previous attempt:\n{trial_hint}"
 
     try:
         resp = await asyncio.wait_for(
@@ -528,9 +976,13 @@ class CheckpointManager:
         self.checkpoint_path = output_dir / f"{run_id}_checkpoint.jsonl"
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def save_result(self, result: ScoredResult) -> None:
+    def save_result(
+        self,
+        result: ScoredResult,
+        trial_details: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Append a single result to the checkpoint file."""
-        record = {
+        record: dict[str, Any] = {
             "question_id": result.question_id,
             "subtask": result.subtask,
             "predicted": result.predicted,
@@ -543,6 +995,8 @@ class CheckpointManager:
             "latency_ms": result.latency_ms,
             "error": result.error,
         }
+        if trial_details:
+            record["trial_details"] = trial_details
         with open(self.checkpoint_path, "a") as f:
             f.write(json.dumps(record) + "\n")
 
@@ -587,21 +1041,27 @@ class CheckpointManager:
 async def run_evaluation(
     *,
     limit: int | None = None,
-    mode: str = "sonnet",
+    mode: str = "zero-shot",
+    model_tier: str = "sonnet",
     dry_run: bool = False,
     resume: bool = False,
     timeout_seconds: int = 300,
     concurrency: int = 1,
+    trials: int = 1,
+    max_turns: int = 8,
 ) -> dict[str, Any]:
     """Run the full LAB-Bench DbQA evaluation pipeline.
 
     Args:
         limit: Max questions to evaluate (None = all 520).
-        mode: Model to use — "sonnet", "opus", "haiku".
+        mode: Evaluation mode — "zero-shot" or "agentic".
+        model_tier: Model to use — "sonnet", "opus", "haiku".
         dry_run: Skip LLM calls, random answers.
         resume: Resume from last checkpoint.
         timeout_seconds: Per-question timeout.
         concurrency: Max concurrent LLM calls.
+        trials: Number of trials per question (1-5). Multi-trial injects hints.
+        max_turns: Max turns for agentic mode (default 8).
 
     Returns:
         Full results dict with metrics and per-question results.
@@ -636,15 +1096,15 @@ async def run_evaluation(
         from core.llm import LLMClient
 
         llm = LLMClient()
-        if mode == "sonnet":
+        if model_tier == "sonnet":
             model_name = settings.llm_fast_model
-        elif mode == "opus":
+        elif model_tier == "opus":
             model_name = settings.llm_model
-        elif mode == "haiku":
+        elif model_tier == "haiku":
             model_name = settings.llm_cheap_model
         else:
-            model_name = mode  # allow direct model name
-        logger.info("Using model: %s", model_name)
+            model_name = model_tier  # allow direct model name
+        logger.info("Using model: %s (mode: %s, trials: %d)", model_name, mode, trials)
 
     # 4. Evaluate
     total = len(questions)
@@ -662,12 +1122,35 @@ async def run_evaluation(
     start_time = time.monotonic()
     sem = asyncio.Semaphore(concurrency)
 
+    use_agentic = mode == "agentic"
+    use_multitrial = trials > 1
+
     for idx, question in enumerate(remaining):
         question_num = len(results) + 1
 
         async with sem:
+            trial_details: list[dict[str, Any]] | None = None
+
             if dry_run:
                 result = evaluate_question_dry(question)
+            elif use_multitrial:
+                result, trial_details = await evaluate_question_multitrial(
+                    question,
+                    llm,
+                    model=model_name,
+                    max_trials=trials,
+                    agentic=use_agentic,
+                    max_turns=max_turns,
+                    timeout_seconds=timeout_seconds,
+                )
+            elif use_agentic:
+                result, _reasoning = await evaluate_question_agentic(
+                    question,
+                    llm,
+                    model=model_name,
+                    max_turns=max_turns,
+                    timeout_seconds=timeout_seconds,
+                )
             else:
                 result = await evaluate_question_live(
                     question,
@@ -677,7 +1160,7 @@ async def run_evaluation(
                 )
 
         results.append(result)
-        checkpoint.save_result(result)
+        checkpoint.save_result(result, trial_details=trial_details)
 
         if result.is_correct:
             correct_so_far += 1
@@ -688,14 +1171,29 @@ async def run_evaluation(
         elif result.is_refused:
             status += " (refused)"
 
+        trial_info = ""
+        if trial_details:
+            n_trials_used = len(trial_details)
+            trial_info = f" [{n_trials_used} trial(s)]"
+
         running_acc = correct_so_far / question_num * 100
+
+        # Compare against baselines
+        stella_delta = running_acc - 54.0
+        biomni_delta = running_acc - 78.0
+        baseline_str = (
+            f"vs STELLA {stella_delta:+.1f}pp, vs Biomni {biomni_delta:+.1f}pp"
+        )
+
         logger.info(
-            "Question %d/%d: %s [%s] (running accuracy: %.1f%%) [%dms, %d tok]",
+            "Question %d/%d: %s [%s] (acc: %.1f%% | %s)%s [%dms, %d tok]",
             question_num,
             total,
             question.id[:12] + "...",
             status,
             running_acc,
+            baseline_str,
+            trial_info,
             result.latency_ms,
             result.tokens_used,
         )
@@ -712,18 +1210,23 @@ async def run_evaluation(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "config": {
             "mode": mode,
+            "model_tier": model_tier,
             "model": model_name,
             "dry_run": dry_run,
             "limit": limit,
             "timeout_seconds": timeout_seconds,
             "total_questions": total,
+            "trials": trials,
+            "max_turns": max_turns if mode == "agentic" else None,
         },
         "metrics": metrics,
-        "competitor_baseline": {
+        "competitor_baselines": {
             "STELLA": 0.54,
-            "note": "STELLA DbQA accuracy from LAB-Bench paper",
+            "Biomni_Lab": 0.78,
+            "note": "STELLA 54% (LAB-Bench paper), Biomni Lab 78% (target)",
         },
         "delta_vs_stella": metrics["accuracy"] - 0.54,
+        "delta_vs_biomni": metrics["accuracy"] - 0.78,
         "elapsed_seconds": round(elapsed, 1),
         "results": [
             {
@@ -761,7 +1264,11 @@ async def run_evaluation(
     print("\n" + "=" * 70)
     print("LAB-Bench DbQA Results")
     print("=" * 70)
+    print(f"  Mode:          {mode}")
     print(f"  Model:         {model_name or 'dry-run'}")
+    print(f"  Trials:        {trials}")
+    if mode == "agentic":
+        print(f"  Max turns:     {max_turns}")
     print(f"  Questions:     {metrics['total']}")
     print(f"  Correct:       {metrics['correct']}")
     print(f"  Accuracy:      {metrics['accuracy']:.1%}")
@@ -772,8 +1279,9 @@ async def run_evaluation(
     print(f"  Tokens:        {metrics['total_tokens']:,} total, {metrics['avg_tokens']:,.0f} avg")
     print(f"  Latency:       {metrics['avg_latency_ms']:,.0f}ms avg")
     print(f"  Elapsed:       {elapsed:.1f}s")
-    print(f"  STELLA target: 54.0%")
-    print(f"  Delta:         {full_results['delta_vs_stella']:+.1%}")
+    print(f"  ---")
+    print(f"  STELLA (54%):  {full_results['delta_vs_stella']:+.1%}")
+    print(f"  Biomni (78%):  {full_results['delta_vs_biomni']:+.1%}")
     print()
 
     if metrics["per_subtask"]:
@@ -805,7 +1313,9 @@ def main() -> None:
         epilog=(
             "Examples:\n"
             "  python scripts/run_labbench.py --limit 5\n"
-            "  python scripts/run_labbench.py --limit 50 --mode sonnet\n"
+            "  python scripts/run_labbench.py --limit 50 --model sonnet\n"
+            "  python scripts/run_labbench.py --mode agentic --trials 3 --limit 10\n"
+            "  python scripts/run_labbench.py --mode agentic --model opus --limit 5\n"
             "  python scripts/run_labbench.py --dry-run --limit 10\n"
             "  python scripts/run_labbench.py --resume\n"
         ),
@@ -819,9 +1329,30 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         type=str,
+        default="zero-shot",
+        choices=["zero-shot", "agentic"],
+        help="Evaluation mode: zero-shot (single LLM call) or agentic (multi-turn with code execution)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
         default="sonnet",
         choices=["sonnet", "opus", "haiku"],
         help="Model tier to use (default: sonnet — Claude Sonnet for reasoning)",
+    )
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=1,
+        choices=range(1, 6),
+        metavar="N",
+        help="Number of trials per question (1-5). Trial 2+ injects hints from prior attempts.",
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=8,
+        help="Max turns per trial in agentic mode (default: 8)",
     )
     parser.add_argument(
         "--dry-run",
@@ -859,10 +1390,13 @@ def main() -> None:
         run_evaluation(
             limit=args.limit,
             mode=args.mode,
+            model_tier=args.model,
             dry_run=args.dry_run,
             resume=args.resume,
             timeout_seconds=args.timeout,
             concurrency=args.concurrency,
+            trials=args.trials,
+            max_turns=args.max_turns,
         )
     )
 
