@@ -19,6 +19,8 @@ Usage:
     python scripts/run_bixbench.py --limit 205 --mode mcq
     python scripts/run_bixbench.py --mode agentic --limit 3 --trials 2
     python scripts/run_bixbench.py --mode agentic --limit 5 --replicas 3
+    python scripts/run_bixbench.py --mode agentic --model opus --limit 3 --verbose
+    python scripts/run_bixbench.py --dataset verified50 --mode agentic --limit 5
     python scripts/run_bixbench.py --resume data/benchmarks/bixbench_results.json
 """
 
@@ -80,17 +82,37 @@ BIXBENCH_HF_URL = (
     "/resolve/main/BixBench.jsonl"
 )
 
+# Verified-50 variant
+VERIFIED50_HF_URL = (
+    "https://huggingface.co/datasets/phylobio/BixBench-Verified-50"
+    "/resolve/main/BixBench-Verified-50.jsonl"
+)
+VERIFIED50_JSONL = DATA_DIR / "BixBench-Verified-50.jsonl"
+
 # HuggingFace capsule download URL pattern
 CAPSULE_HF_URL_TEMPLATE = (
     "https://huggingface.co/datasets/futurehouse/BixBench"
     "/resolve/main/capsules/{data_folder}"
 )
 
-COMPETITOR_BASELINE = {"Biomni A1": 0.522}
+# Verified-50 capsule URL template (may share capsules or have its own)
+VERIFIED50_CAPSULE_HF_URL_TEMPLATE = (
+    "https://huggingface.co/datasets/phylobio/BixBench-Verified-50"
+    "/resolve/main/capsules/{data_folder}"
+)
+
+COMPETITOR_BASELINE = {"Biomni A1": 0.522, "K-Dense Verified-50": 0.90}
+
+# Model name mapping
+MODEL_ALIASES: dict[str, str] = {
+    "opus": "claude-opus-4-6",
+    "sonnet": "claude-sonnet-4-20250514",
+    "haiku": "claude-haiku-4-5-20251001",
+}
 
 # Agentic execution defaults
 DEFAULT_MAX_TURNS = 8
-CODE_EXEC_TIMEOUT_SECONDS = 60
+CODE_EXEC_TIMEOUT_SECONDS = 120
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,27 +126,47 @@ logger = logging.getLogger("bixbench")
 # ---------------------------------------------------------------------------
 
 
-def ensure_dataset() -> Path:
-    """Download BixBench.jsonl from HuggingFace if not already present."""
-    if RAW_JSONL.exists():
-        n = sum(1 for _ in open(RAW_JSONL))
-        logger.info("Dataset already present: %s (%d questions)", RAW_JSONL, n)
-        return RAW_JSONL
+def _resolve_model_name(alias: str | None) -> str | None:
+    """Resolve a model alias (opus/sonnet/haiku) to a full model name."""
+    if alias is None:
+        return None
+    return MODEL_ALIASES.get(alias.lower(), alias)
+
+
+def ensure_dataset(dataset: str = "full") -> Path:
+    """Download BixBench JSONL from HuggingFace if not already present.
+
+    Args:
+        dataset: 'full' for standard BixBench, 'verified50' for Verified-50.
+    """
+    if dataset == "verified50":
+        target_path = VERIFIED50_JSONL
+        url = VERIFIED50_HF_URL
+        label = "BixBench-Verified-50"
+    else:
+        target_path = RAW_JSONL
+        url = BIXBENCH_HF_URL
+        label = "BixBench"
+
+    if target_path.exists():
+        n = sum(1 for _ in open(target_path))
+        logger.info("Dataset already present: %s (%d questions)", target_path, n)
+        return target_path
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading BixBench dataset from HuggingFace ...")
+    logger.info("Downloading %s dataset from HuggingFace ...", label)
     req = urllib.request.Request(
-        BIXBENCH_HF_URL, headers={"User-Agent": "YOHAS-Benchmark/3.0"}
+        url, headers={"User-Agent": "YOHAS-Benchmark/3.0"}
     )
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
-            RAW_JSONL.write_bytes(resp.read())
-        n = sum(1 for _ in open(RAW_JSONL))
-        logger.info("Downloaded %d questions -> %s", n, RAW_JSONL)
+            target_path.write_bytes(resp.read())
+        n = sum(1 for _ in open(target_path))
+        logger.info("Downloaded %d questions -> %s", n, target_path)
     except Exception as exc:
         logger.error("Failed to download dataset: %s", exc)
         raise SystemExit(1) from exc
-    return RAW_JSONL
+    return target_path
 
 
 def load_questions(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
@@ -146,7 +188,7 @@ def load_questions(path: Path, limit: int | None = None) -> list[dict[str, Any]]
 # ---------------------------------------------------------------------------
 
 
-def ensure_capsule(question_row: dict[str, Any]) -> Path | None:
+def ensure_capsule(question_row: dict[str, Any], dataset: str = "full") -> Path | None:
     """Download and extract the data capsule for a question.
 
     Returns the path to the extracted capsule directory, or None on failure.
@@ -165,17 +207,32 @@ def ensure_capsule(question_row: dict[str, Any]) -> Path | None:
     # Download the ZIP
     CAPSULE_DIR.mkdir(parents=True, exist_ok=True)
     zip_path = CAPSULE_DIR / data_folder
-    url = CAPSULE_HF_URL_TEMPLATE.format(data_folder=data_folder)
+
+    # Try the dataset-specific URL first, then fallback to standard BixBench
+    if dataset == "verified50":
+        urls = [
+            VERIFIED50_CAPSULE_HF_URL_TEMPLATE.format(data_folder=data_folder),
+            CAPSULE_HF_URL_TEMPLATE.format(data_folder=data_folder),
+        ]
+    else:
+        urls = [CAPSULE_HF_URL_TEMPLATE.format(data_folder=data_folder)]
 
     if not zip_path.exists():
         logger.info("Downloading capsule %s ...", data_folder)
-        req = urllib.request.Request(url, headers={"User-Agent": "YOHAS-Benchmark/3.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                zip_path.write_bytes(resp.read())
-            logger.info("Downloaded capsule -> %s", zip_path)
-        except Exception as exc:
-            logger.error("Failed to download capsule %s: %s", data_folder, exc)
+        downloaded = False
+        for url in urls:
+            req = urllib.request.Request(url, headers={"User-Agent": "YOHAS-Benchmark/3.0"})
+            try:
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    zip_path.write_bytes(resp.read())
+                logger.info("Downloaded capsule -> %s", zip_path)
+                downloaded = True
+                break
+            except Exception as exc:
+                logger.debug("Failed to download from %s: %s", url, exc)
+                continue
+        if not downloaded:
+            logger.error("Failed to download capsule %s from all URLs", data_folder)
             return None
 
     # Extract
@@ -233,24 +290,23 @@ def execute_code(code: str, data_dir: str, timeout: int = CODE_EXEC_TIMEOUT_SECO
 
     Returns stdout output or an error message.
     """
-    # Pre-import available libraries
+    # Pre-import comprehensive libraries for bioinformatics analysis
     namespace: dict[str, Any] = {
         "__builtins__": __builtins__,
         "DATA_DIR": data_dir,
     }
 
-    # Import libraries that might be available
+    # Core libraries
     for mod_name, alias in [
         ("pandas", "pd"),
         ("numpy", "np"),
-        ("scipy.stats", "stats"),
         ("scipy", "scipy"),
+        ("scipy.stats", "stats"),
         ("os", "os"),
         ("json", "json"),
         ("csv", "csv"),
         ("re", "re"),
         ("math", "math"),
-        ("pathlib", "Path"),
         ("collections", "collections"),
         ("itertools", "itertools"),
         ("glob", "glob"),
@@ -265,6 +321,57 @@ def execute_code(code: str, data_dir: str, timeout: int = CODE_EXEC_TIMEOUT_SECO
     try:
         from pathlib import Path as _Path
         namespace["Path"] = _Path
+    except ImportError:
+        pass
+
+    # Pre-import commonly used scipy.stats functions
+    try:
+        from scipy.stats import (
+            pearsonr, spearmanr, ttest_ind, mannwhitneyu,
+            fisher_exact, chi2_contingency,
+        )
+        namespace["pearsonr"] = pearsonr
+        namespace["spearmanr"] = spearmanr
+        namespace["ttest_ind"] = ttest_ind
+        namespace["mannwhitneyu"] = mannwhitneyu
+        namespace["fisher_exact"] = fisher_exact
+        namespace["chi2_contingency"] = chi2_contingency
+    except ImportError:
+        pass
+
+    # Pre-import collections helpers
+    try:
+        from collections import Counter, defaultdict
+        namespace["Counter"] = Counter
+        namespace["defaultdict"] = defaultdict
+    except ImportError:
+        pass
+
+    # Pre-import itertools.combinations
+    try:
+        from itertools import combinations
+        namespace["combinations"] = combinations
+    except ImportError:
+        pass
+
+    # Pre-import sklearn if available
+    try:
+        from sklearn.decomposition import PCA
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+        namespace["PCA"] = PCA
+        namespace["KMeans"] = KMeans
+        namespace["StandardScaler"] = StandardScaler
+    except ImportError:
+        pass
+
+    # Pre-import matplotlib in non-interactive mode
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        namespace["matplotlib"] = matplotlib
+        namespace["plt"] = plt
     except ImportError:
         pass
 
@@ -381,11 +488,20 @@ def grade_range_verifier(predicted: str, ideal: str) -> bool:
         return lower <= val <= upper
     except ValueError:
         pass
-    # Try to find a number in the text
-    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", predicted_clean)
-    if m:
+    # Try to find all numbers and pick the best one (closest to the range)
+    matches = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", predicted_clean)
+    if matches:
+        # Try each number, prefer one that falls in range
+        for m in matches:
+            try:
+                val = float(m)
+                if lower <= val <= upper:
+                    return True
+            except ValueError:
+                continue
+        # If none in range, try the last number (most likely the final answer)
         try:
-            val = float(m.group())
+            val = float(matches[-1])
             return lower <= val <= upper
         except ValueError:
             pass
@@ -514,36 +630,57 @@ def _build_system_prompt() -> str:
 
 def _build_agentic_system_prompt() -> str:
     return (
-        "You are YOHAS (Your Own Hypothesis-driven Agentic Scientist), an "
-        "expert computational biologist with access to a Python code execution "
-        "environment. You are given a bioinformatics research question along with "
-        "data files from the original analysis.\n\n"
-        "## Your workflow:\n"
-        "1. Review the available data files and the question\n"
-        "2. Plan your analysis approach\n"
-        "3. Write Python code in <execute>...</execute> blocks to analyze the data\n"
-        "4. Review the output and iterate as needed\n"
-        "5. When you have the answer, wrap it in <answer>...</answer> tags\n\n"
-        "## Code execution environment:\n"
-        "- pandas (as pd), numpy (as np), scipy.stats (as stats) are pre-imported\n"
+        "You are an expert bioinformatics data analyst. You are given a research "
+        "question and a data capsule containing real experimental data files.\n\n"
+        "YOUR TASK: Analyze the data to answer the question precisely.\n\n"
+        "METHODOLOGY:\n"
+        "1. FIRST: Explore the data thoroughly\n"
+        "   - List all files (os.listdir)\n"
+        "   - For each CSV: read with pandas, print shape, columns, dtypes, head(3)\n"
+        "   - For each JSON: load and print structure\n"
+        "   - For each .py/.R file: read and understand the analysis pipeline\n\n"
+        "2. THEN: Plan your analysis\n"
+        "   - What statistical test or computation is needed?\n"
+        "   - What columns/variables are relevant?\n"
+        "   - What is the expected output format?\n\n"
+        "3. THEN: Execute the analysis\n"
+        "   - Write clean, well-commented Python code\n"
+        "   - Use pandas, numpy, scipy.stats, scikit-learn as needed\n"
+        "   - Print intermediate results to verify each step\n"
+        "   - Handle missing data, type conversions, filtering\n\n"
+        "4. FINALLY: Extract the precise answer\n"
+        "   - State the answer clearly in <answer>YOUR_ANSWER</answer> tags\n"
+        "   - For numeric answers: report the exact value (e.g., 0.0023, not \"approximately 0.002\")\n"
+        "   - For string answers: use the exact format expected (gene names, p-values, etc.)\n\n"
+        "COMMON BIOINFORMATICS ANALYSES:\n"
+        "- Differential expression: use scipy.stats.ttest_ind or mannwhitneyu\n"
+        "- Correlation: use scipy.stats.pearsonr or spearmanr\n"
+        "- Enrichment: use scipy.stats.fisher_exact or chi2_contingency\n"
+        "- Survival: use lifelines.KaplanMeierFitter if available, else scipy\n"
+        "- Clustering: use sklearn.cluster.KMeans or DBSCAN\n"
+        "- Dimensionality reduction: use sklearn.decomposition.PCA\n\n"
+        "CODE EXECUTION ENVIRONMENT:\n"
+        "- pandas (pd), numpy (np), scipy.stats (stats) are pre-imported\n"
+        "- scipy.stats functions: pearsonr, spearmanr, ttest_ind, mannwhitneyu, fisher_exact, chi2_contingency\n"
         "- os, json, csv, re, math, pathlib.Path, collections, itertools, glob are available\n"
+        "- Counter, defaultdict, combinations are directly available\n"
+        "- sklearn: PCA, KMeans, StandardScaler (if installed)\n"
+        "- matplotlib.pyplot as plt (Agg backend, if installed)\n"
         "- The working directory is set to the data capsule folder\n"
         "- Use DATA_DIR variable for the absolute path to the data directory\n"
         "- Print results using print() — all stdout is captured\n\n"
-        "## Rules:\n"
+        "RULES:\n"
         "- Write ONE <execute> block per turn. Wait for results before continuing.\n"
         "- If code errors, fix and retry with a different approach.\n"
         "- When you have the final answer, respond with <answer>YOUR_ANSWER</answer>\n"
         "- If the question asks for a number, put ONLY the number in <answer> tags.\n"
         "- If the question asks for a name/term, put ONLY that term.\n"
         "- Be precise: match the expected format (e.g. rounded to N decimal places).\n\n"
-        "## Self-Correction:\n"
-        "If your code produces an error, READ THE ERROR MESSAGE CAREFULLY and fix your code.\n"
-        "Common fixes:\n"
-        "- FileNotFoundError: list files with os.listdir('.') first\n"
-        "- ImportError: try alternative libraries (e.g., scipy.stats instead of statsmodels)\n"
-        "- KeyError: check df.columns first\n"
-        "- TypeError: check df.dtypes\n"
+        "IMPORTANT:\n"
+        "- ALWAYS load and explore data before attempting analysis\n"
+        "- If a computation fails, READ THE ERROR and fix your code\n"
+        "- If data doesn't match expectations, adapt your approach\n"
+        "- Report EXACT values, not approximations\n"
     )
 
 
@@ -630,6 +767,136 @@ def _build_agentic_prompt(
     return "\n".join(parts)
 
 
+def _build_pre_analysis_code() -> str:
+    """Build thorough pre-analysis code for automatic data exploration."""
+    return '''
+import os, json
+
+print("=== Available files ===")
+all_files = sorted(os.listdir('.'))
+for f in all_files:
+    if os.path.isdir(f):
+        sub_files = os.listdir(f)
+        print(f"  {f}/ (directory, {len(sub_files)} items)")
+        for sf in sorted(sub_files)[:5]:
+            sf_path = os.path.join(f, sf)
+            if os.path.isfile(sf_path):
+                print(f"    {sf} ({os.path.getsize(sf_path):,} bytes)")
+        if len(sub_files) > 5:
+            print(f"    ... and {len(sub_files) - 5} more")
+        continue
+    size = os.path.getsize(f)
+    print(f"  {f} ({size:,} bytes)")
+
+print()
+
+import pandas as pd
+import numpy as np
+
+for f in all_files:
+    if os.path.isdir(f):
+        continue
+    ext = os.path.splitext(f)[1].lower()
+    size = os.path.getsize(f)
+
+    if ext in ('.csv', '.tsv'):
+        print(f"=== {f} (CSV/TSV) ===")
+        sep = '\\t' if ext == '.tsv' else ','
+        try:
+            # For large files, preview first 100 rows
+            if size > 1_000_000:
+                df = pd.read_csv(f, sep=sep, nrows=100)
+                print(f"  NOTE: Large file ({size:,} bytes), showing preview of 100 rows")
+            else:
+                df = pd.read_csv(f, sep=sep)
+            print(f"  Shape: {df.shape}")
+            print(f"  Columns: {list(df.columns)}")
+            print(f"  Dtypes:")
+            for col in df.columns:
+                print(f"    {col}: {df[col].dtype}")
+            # Summary stats for numeric columns
+            num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            if num_cols:
+                print(f"  Numeric summary ({len(num_cols)} cols):")
+                for col in num_cols[:5]:
+                    print(f"    {col}: min={df[col].min():.4g}, max={df[col].max():.4g}, mean={df[col].mean():.4g}, nulls={df[col].isna().sum()}")
+                if len(num_cols) > 5:
+                    print(f"    ... and {len(num_cols) - 5} more numeric columns")
+            # Detect bioinformatics patterns
+            col_lower = [c.lower() for c in df.columns]
+            if any('gene' in c for c in col_lower):
+                print(f"  Detected: Gene-related data")
+            if any(c in ['logfc', 'log2foldchange', 'log2fc', 'foldchange'] for c in col_lower):
+                print(f"  Detected: Differential expression results")
+            if any(c in ['pvalue', 'p_value', 'pval', 'padj', 'fdr', 'adj.p.val'] for c in col_lower):
+                print(f"  Detected: Statistical test results")
+            print(f"  Head(3):")
+            print(df.head(3).to_string())
+        except Exception as e:
+            print(f"  Error reading: {e}")
+        print()
+
+    elif ext == '.json':
+        print(f"=== {f} (JSON) ===")
+        try:
+            with open(f) as fh:
+                data = json.load(fh)
+            if isinstance(data, list):
+                print(f"  List of {len(data)} items")
+                if data and isinstance(data[0], dict):
+                    print(f"  First item keys: {list(data[0].keys())}")
+                    print(f"  First item: {str(data[0])[:200]}")
+            elif isinstance(data, dict):
+                print(f"  Dict with {len(data)} keys: {list(data.keys())[:15]}")
+                for k in list(data.keys())[:3]:
+                    v = data[k]
+                    v_str = str(v)[:100]
+                    print(f"    {k}: {type(v).__name__} = {v_str}")
+            else:
+                print(f"  Type: {type(data).__name__}, value: {str(data)[:200]}")
+        except Exception as e:
+            print(f"  Error reading: {e}")
+        print()
+
+    elif ext in ('.py', '.r', '.R'):
+        print(f"=== {f} (Script: {ext}) ===")
+        try:
+            with open(f) as fh:
+                content = fh.read()
+            lines = content.split('\\n')
+            print(f"  {len(lines)} lines")
+            # Extract imports and key function/variable definitions
+            imports = [l.strip() for l in lines if l.strip().startswith(('import ', 'from ', 'library(', 'require('))]
+            if imports:
+                print(f"  Imports: {imports[:5]}")
+            # Look for key patterns
+            if ext == '.py':
+                funcs = [l.strip() for l in lines if l.strip().startswith('def ')]
+                if funcs:
+                    print(f"  Functions: {funcs[:5]}")
+            print(f"  First 5 lines:")
+            for l in lines[:5]:
+                print(f"    {l}")
+        except Exception as e:
+            print(f"  Error reading: {e}")
+        print()
+
+    elif ext in ('.txt',) and size < 50000:
+        print(f"=== {f} (Text) ===")
+        try:
+            with open(f) as fh:
+                content = fh.read()
+            lines = content.split('\\n')
+            print(f"  {len(lines)} lines, {size:,} bytes")
+            print(f"  First 3 lines:")
+            for l in lines[:3]:
+                print(f"    {l[:120]}")
+        except Exception as e:
+            print(f"  Error reading: {e}")
+        print()
+'''
+
+
 def _extract_open_answer(response: str) -> str:
     """Extract answer from <answer> tags or fall back to robust heuristics."""
     # 1. <answer> tags (highest priority)
@@ -684,6 +951,41 @@ def _extract_open_answer(response: str) -> str:
     return lines[-1] if lines else response.strip()
 
 
+def _extract_numeric_answer(text: str) -> str | None:
+    """Extract numeric answer with full precision from text near <answer> tags.
+
+    Optimized for BixBench range_verifier questions where precision matters.
+    """
+    # First try <answer> tags
+    m = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+    if m:
+        inner = m.group(1).strip()
+        # Try to parse as a number directly
+        try:
+            float(inner)
+            return inner
+        except ValueError:
+            pass
+        # Extract number from within the answer tag
+        nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", inner)
+        if nums:
+            return nums[0]
+
+    # Look for numbers near answer-related keywords in the last part of the text
+    last_section = text[-1000:] if len(text) > 1000 else text
+    # Find numbers after "answer", "result", "=", "is" keywords
+    patterns = [
+        r"(?:answer|result|value)\s*(?:is|=|:)\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)",
+        r"=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, last_section, re.IGNORECASE | re.MULTILINE)
+        if m:
+            return m.group(1)
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Agentic evaluation (multi-turn with code execution)
 # ---------------------------------------------------------------------------
@@ -698,6 +1000,7 @@ async def evaluate_question_agentic(
     trial: int = 1,
     prev_answer: str | None = None,
     prev_reason: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate a question using the agentic multi-turn code execution loop."""
     start = time.monotonic()
@@ -708,7 +1011,7 @@ async def evaluate_question_agentic(
         # If no capsule, fall back to zero-shot open mode
         if capsule_path is None:
             logger.warning("No capsule for %s, falling back to zero-shot", qid)
-            result = await evaluate_question(question_row, llm, mode="open", timeout_seconds=timeout_seconds)
+            result = await evaluate_question(question_row, llm, mode="open", timeout_seconds=timeout_seconds, model=model)
             result["mode"] = "agentic-fallback"
             return result
 
@@ -716,7 +1019,7 @@ async def evaluate_question_agentic(
         capsule_files = list_capsule_files(capsule_path)
         if not capsule_files:
             logger.warning("Empty capsule for %s, falling back to zero-shot", qid)
-            result = await evaluate_question(question_row, llm, mode="open", timeout_seconds=timeout_seconds)
+            result = await evaluate_question(question_row, llm, mode="open", timeout_seconds=timeout_seconds, model=model)
             result["mode"] = "agentic-fallback"
             return result
 
@@ -747,28 +1050,12 @@ async def evaluate_question_agentic(
         turns_used = 0
 
         # Pre-analysis: automatically explore data files before the agent's first turn
-        pre_analysis_code = """
-import os, json
-print("=== Available files ===")
-for f in sorted(os.listdir('.')):
-    size = os.path.getsize(f)
-    print(f"  {f} ({size:,} bytes)")
-    if f.endswith('.csv'):
-        import pandas as pd
-        df = pd.read_csv(f, nrows=3)
-        print(f"    Columns: {list(df.columns)}")
-        print(f"    Shape: {df.shape}")
-        print(f"    Dtypes: {dict(df.dtypes)}")
-    elif f.endswith('.json'):
-        with open(f) as fh:
-            data = json.load(fh)
-        if isinstance(data, list):
-            print(f"    List of {len(data)} items")
-        elif isinstance(data, dict):
-            print(f"    Dict with keys: {list(data.keys())[:10]}")
-"""
-        pre_analysis_output = execute_code(pre_analysis_code, str(capsule_path))
+        pre_analysis_code = _build_pre_analysis_code()
+        pre_analysis_output = execute_code(pre_analysis_code, str(capsule_path), timeout=30)
         if pre_analysis_output.strip():
+            # Truncate if too long
+            if len(pre_analysis_output) > 6000:
+                pre_analysis_output = pre_analysis_output[:4000] + "\n... (output truncated) ...\n" + pre_analysis_output[-1500:]
             conversation[0] += (
                 f"\n\n## Pre-Analysis (auto-generated data exploration)\n"
                 f"```\n{pre_analysis_output}\n```"
@@ -790,6 +1077,7 @@ for f in sorted(os.listdir('.')):
                     full_prompt,
                     system_prompt=system_prompt,
                     max_tokens=4096,
+                    model=model,
                 ),
                 timeout=remaining_timeout,
             )
@@ -801,6 +1089,11 @@ for f in sorted(os.listdir('.')):
             if answer is not None:
                 predicted = answer
                 answer_found = True
+                # Log raw vs extracted for debugging
+                logger.debug(
+                    "Answer extracted for %s: raw_tag='%s' | extracted='%s'",
+                    qid, answer, predicted,
+                )
                 break
 
             # Check for code to execute
@@ -837,7 +1130,24 @@ for f in sorted(os.listdir('.')):
 
         # If no answer tag found, try to extract from the last response
         if not answer_found:
-            predicted = _extract_open_answer(response_text)
+            # For range_verifier questions, try numeric extraction first
+            eval_mode = question_row.get("eval_mode", "str_verifier")
+            if eval_mode == "range_verifier":
+                numeric_ans = _extract_numeric_answer(response_text)
+                if numeric_ans:
+                    predicted = numeric_ans
+                    logger.debug(
+                        "Numeric extraction for %s: '%s' (range_verifier fallback)",
+                        qid, predicted,
+                    )
+                else:
+                    predicted = _extract_open_answer(response_text)
+            else:
+                predicted = _extract_open_answer(response_text)
+            logger.debug(
+                "No <answer> tag for %s, extracted: '%s' from last response",
+                qid, predicted,
+            )
 
         duration_ms = int((time.monotonic() - start) * 1000)
         correct = await grade_answer(predicted, question_row, llm=llm)
@@ -914,6 +1224,7 @@ async def evaluate_question(
     llm: Any,
     mode: str = "open",
     timeout_seconds: int = 300,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate a single BixBench question and return result dict."""
     start = time.monotonic()
@@ -928,6 +1239,7 @@ async def evaluate_question(
                     prompt,
                     system_prompt=_build_system_prompt(),
                     max_tokens=1024,
+                    model=model,
                 ),
                 timeout=timeout_seconds,
             )
@@ -941,6 +1253,7 @@ async def evaluate_question(
                     prompt,
                     system_prompt=_build_system_prompt(),
                     max_tokens=2048,
+                    model=model,
                 ),
                 timeout=timeout_seconds,
             )
@@ -1128,6 +1441,7 @@ async def evaluate_with_voting(
     timeout_seconds: int = 300,
     num_trials: int = 1,
     verbose: bool = False,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Run evaluation N times and take majority vote on the answer.
 
@@ -1167,10 +1481,11 @@ async def evaluate_with_voting(
                     trial=trial,
                     prev_answer=prev_answer,
                     prev_reason=prev_reason,
+                    model=model,
                 )
         else:
             result = await evaluate_question(
-                modified_q, llm, mode=mode, timeout_seconds=timeout_seconds
+                modified_q, llm, mode=mode, timeout_seconds=timeout_seconds, model=model
             )
 
         replica_results.append(result)  # type: ignore[arg-type]
@@ -1234,10 +1549,14 @@ async def evaluate_with_voting(
 
 async def run_pipeline(args: argparse.Namespace) -> None:
     """Main evaluation pipeline."""
+    # Resolve model name from alias
+    resolved_model = _resolve_model_name(args.model)
+
     # 1. Ensure dataset is present
-    dataset_path = ensure_dataset()
+    dataset_variant = getattr(args, "dataset", "full")
+    dataset_path = ensure_dataset(dataset=dataset_variant)
     questions = load_questions(dataset_path, limit=args.limit)
-    logger.info("Loaded %d questions from BixBench", len(questions))
+    logger.info("Loaded %d questions from %s", len(questions), dataset_variant)
 
     # 2. Load checkpoint for resume
     results_path = Path(args.output) if args.output else RESULTS_FILE
@@ -1252,10 +1571,8 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     # 3. Initialize LLM
     from core.llm import LLMClient
     llm = LLMClient()
-    logger.info(
-        "LLM initialized (model: %s)",
-        os.environ.get("LLM_MODEL", "default"),
-    )
+    model_display = resolved_model or os.environ.get("LLM_MODEL", "default")
+    logger.info("LLM initialized (model: %s)", model_display)
 
     # 4. Evaluate
     total = len(questions)
@@ -1273,7 +1590,9 @@ async def run_pipeline(args: argparse.Namespace) -> None:
 
     print("\n" + "=" * 70)
     print(f"  BixBench Evaluation — {total} questions, mode={mode_label}")
-    print(f"  Competitor baseline: Biomni A1 = 52.2%")
+    print(f"  Model: {model_display}")
+    print(f"  Dataset: {dataset_variant}")
+    print(f"  Competitor baselines: Biomni A1 = 52.2%, K-Dense Verified-50 = 90%")
     if completed_ids:
         print(f"  Resuming: {len(completed_ids)} already completed")
     print("=" * 70 + "\n")
@@ -1294,7 +1613,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
 
         if num_replicas > 1:
             # Majority voting mode — run N replicas and take consensus
-            capsule_path = ensure_capsule(q) if args.mode == "agentic" else None
+            capsule_path = ensure_capsule(q, dataset=dataset_variant) if args.mode == "agentic" else None
             print(f"    -> Running {num_replicas} replicas for majority voting...")
             result = await evaluate_with_voting(
                 q,
@@ -1306,11 +1625,12 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                 timeout_seconds=args.timeout,
                 num_trials=num_trials,
                 verbose=args.verbose,
+                model=resolved_model,
             )
             results.append(result)
         elif args.mode == "agentic":
             # Download/extract capsule
-            capsule_path = ensure_capsule(q)
+            capsule_path = ensure_capsule(q, dataset=dataset_variant)
 
             # Multi-trial loop
             result = None
@@ -1337,13 +1657,14 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                     trial=trial,
                     prev_answer=prev_answer,
                     prev_reason=prev_reason,
+                    model=resolved_model,
                 )
 
             results.append(result)  # type: ignore[arg-type]
         else:
             # Zero-shot modes (open / mcq)
             result = await evaluate_question(
-                q, llm, mode=args.mode, timeout_seconds=args.timeout
+                q, llm, mode=args.mode, timeout_seconds=args.timeout, model=resolved_model
             )
             results.append(result)
 
@@ -1373,12 +1694,20 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         )
         print(f"    Running accuracy: {running_correct}/{running_total} ({running_acc:.1f}%)")
 
+        # Log raw vs extracted answer for debugging
+        if args.verbose:
+            raw_resp = result.get("raw_response", "")[:200]  # type: ignore[union-attr]
+            print(f"    [debug] raw_response: {raw_resp}")
+            print(f"    [debug] eval_mode: {result.get('eval_mode', '?')}")  # type: ignore[union-attr]
+
         # Save intermediate results after every question
         save_results(
             results,
             results_path,
             metadata={
                 "mode": args.mode,
+                "model": model_display,
+                "dataset": dataset_variant,
                 "limit": args.limit,
                 "timeout": args.timeout,
                 "trials": num_trials,
@@ -1395,6 +1724,8 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         results_path,
         metadata={
             "mode": args.mode,
+            "model": model_display,
+            "dataset": dataset_variant,
             "limit": args.limit,
             "timeout": args.timeout,
             "trials": num_trials,
@@ -1416,6 +1747,8 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     print("  BIXBENCH RESULTS")
     print("=" * 70)
     print(f"  Mode:      {args.mode}")
+    print(f"  Model:     {model_display}")
+    print(f"  Dataset:   {dataset_variant}")
     if args.mode == "agentic":
         print(f"  Max turns: {args.max_turns}")
         print(f"  Trials:    {num_trials}")
@@ -1430,11 +1763,18 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     if skipped:
         print(f"  Skipped:   {skipped} (already completed)")
     print()
-    print(f"  vs Biomni A1: {final_acc:.1f}% vs 52.2%", end="")
-    if final_acc > 52.2:
-        print("  ** BEATING COMPETITOR **")
+    if dataset_variant == "verified50":
+        print(f"  vs K-Dense Verified-50: {final_acc:.1f}% vs 90.0%", end="")
+        if final_acc > 90.0:
+            print("  ** BEATING COMPETITOR **")
+        else:
+            print(f"  (gap: {90.0 - final_acc:.1f}pp)")
     else:
-        print(f"  (gap: {52.2 - final_acc:.1f}pp)")
+        print(f"  vs Biomni A1: {final_acc:.1f}% vs 52.2%", end="")
+        if final_acc > 52.2:
+            print("  ** BEATING COMPETITOR **")
+        else:
+            print(f"  (gap: {52.2 - final_acc:.1f}pp)")
 
     # Per eval_mode breakdown
     by_mode: dict[str, list[bool]] = {}
@@ -1477,8 +1817,10 @@ def parse_args() -> argparse.Namespace:
             "  python scripts/run_bixbench.py --limit 5\n"
             "  python scripts/run_bixbench.py --limit 205 --mode mcq\n"
             "  python scripts/run_bixbench.py --mode agentic --limit 3\n"
+            "  python scripts/run_bixbench.py --mode agentic --model opus --limit 3 --verbose\n"
             "  python scripts/run_bixbench.py --mode agentic --limit 10 --trials 2\n"
             "  python scripts/run_bixbench.py --mode agentic --limit 5 --replicas 3\n"
+            "  python scripts/run_bixbench.py --dataset verified50 --mode agentic --limit 5\n"
             "  python scripts/run_bixbench.py --resume data/benchmarks/bixbench_results.json\n"
         ),
     )
@@ -1493,6 +1835,20 @@ def parse_args() -> argparse.Namespace:
         choices=["open", "mcq", "agentic"],
         default="agentic",
         help="Answer mode: 'open' (free-form), 'mcq' (multiple choice), or 'agentic' (code execution). Default: agentic",
+    )
+    p.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model to use: 'opus' (claude-opus-4-6), 'sonnet' (claude-sonnet-4-20250514), "
+             "'haiku' (claude-haiku-4-5-20251001), or a full model ID. Default: uses LLM_MODEL from config.",
+    )
+    p.add_argument(
+        "--dataset",
+        choices=["full", "verified50"],
+        default="full",
+        help="Dataset variant: 'full' (standard 205-question BixBench) or 'verified50' "
+             "(BixBench-Verified-50 from phylobio). Default: full",
     )
     p.add_argument(
         "--trials",

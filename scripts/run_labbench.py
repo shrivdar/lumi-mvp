@@ -75,6 +75,16 @@ logger = logging.getLogger("labbench")
 
 VALID_SUBTASKS = ("dbqa", "seqqa", "litqa2", "all")
 
+# ---------------------------------------------------------------------------
+# Model ID mapping — explicit model IDs so we don't depend on settings
+# ---------------------------------------------------------------------------
+
+MODEL_ID_MAP: dict[str, str] = {
+    "opus": "claude-opus-4-6",
+    "sonnet": "claude-sonnet-4-20250514",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+
 # Map CLI subtask name -> HuggingFace config name
 HF_CONFIG_MAP: dict[str, str] = {
     "dbqa": "DbQA",
@@ -555,34 +565,44 @@ AGENTIC_SYSTEM_PROMPT_DBQA = (
 )
 
 AGENTIC_SYSTEM_PROMPT_SEQQA = (
-    "You are a molecular biology expert answering a multiple-choice question "
-    "about DNA, RNA, and protein sequences. You are an expert in sequence "
-    "manipulation, restriction enzymes, codon tables, and bioinformatics.\n\n"
-    "You can reason step-by-step AND write Python code to manipulate sequences. "
-    "To execute code, wrap it in <execute> tags:\n\n"
-    "<execute>\n"
+    "You are a molecular biology expert solving a sequence analysis question.\n\n"
+    "RULES:\n"
+    "1. You MUST write Python code to solve this. Do NOT answer from memory or mental math.\n"
+    "2. Use BioPython for ALL sequence operations:\n"
+    "   - from Bio.Seq import Seq\n"
+    "   - from Bio.SeqUtils import molecular_weight, GC\n"
+    "   - from Bio.Restriction import *\n"
+    "   - from Bio.Data.CodonTable import standard_dna_table\n"
+    "3. ALWAYS print your intermediate results so you can verify them.\n"
+    "4. After computing the answer, state it clearly.\n"
+    "5. To execute code, wrap it in <execute> tags.\n\n"
+    "Available functions (pre-imported in the execution environment):\n"
+    "```python\n"
     "from Bio.Seq import Seq\n"
-    "seq = Seq('ATCGATCG')\n"
-    "print(seq.reverse_complement())\n"
-    "</execute>\n\n"
-    "Write Python code using BioPython to manipulate DNA/protein sequences. "
-    "Use `from Bio.Seq import Seq` for sequence operations. "
-    "Use `from Bio import SeqIO` for file parsing. "
-    "Use `from Bio.Restriction import *` for restriction enzyme analysis. "
-    "Use `from Bio.Data.CodonTable import standard_dna_table` for codon lookups.\n\n"
-    "Available libraries: pandas, numpy, scipy, requests, json, re, math, "
-    "collections, itertools, Bio (biopython).\n\n"
-    "Rules:\n"
-    "1. Reason step-by-step before answering.\n"
-    "2. ALWAYS use code to compute sequence operations — do NOT try to do them "
-    "   in your head. Reverse complements, translations, restriction sites etc. "
-    "   are error-prone without code.\n"
-    "3. You can execute multiple code blocks across turns.\n"
-    "4. When you are confident in your answer, state it on the LAST line as:\n"
-    "   Answer: X\n"
-    "   where X is a single letter (A, B, C, D, or E).\n"
-    "5. Double-check your code output before answering.\n"
-    "6. Only choose 'Insufficient information' if you truly cannot determine the answer."
+    "from Bio import SeqIO\n"
+    "from Bio.SeqUtils import molecular_weight, GC, GC123\n"
+    "from Bio.Restriction import RestrictionBatch, Analysis, AllEnzymes\n"
+    "from Bio.Data.CodonTable import standard_dna_table\n"
+    "import re, json, math, collections, itertools\n"
+    "```\n\n"
+    "Common operations:\n"
+    "- Reverse complement: str(Seq('ATCG').reverse_complement())\n"
+    "- Translate: str(Seq('ATGATGATG').translate())\n"
+    "- Find ORFs: use regex on all 6 reading frames\n"
+    "- Restriction sites: Analysis(RestrictionBatch(first=[]), seq).full()\n"
+    "- GC content: GC('ATCGATCG')\n"
+    "- Molecular weight: molecular_weight('ATCG', 'DNA')\n"
+    "- Complement: str(Seq('ATCG').complement())\n"
+    "- Transcribe: str(Seq('ATCG').transcribe())\n"
+    "- Back-transcribe: str(Seq('AUCG').back_transcribe())\n\n"
+    "WORKFLOW:\n"
+    "1. Read the question carefully and identify what sequence operation is needed.\n"
+    "2. Write Python code using BioPython to compute the answer. Print all results.\n"
+    "3. Compare the computed result against each answer choice.\n"
+    "4. State your final answer as: Answer: X\n\n"
+    "IMPORTANT: You MUST execute at least one code block before giving your answer.\n"
+    "Sequence operations done in your head are error-prone. Always use code.\n"
+    "Only choose 'Insufficient information' if you truly cannot determine the answer."
 )
 
 AGENTIC_SYSTEM_PROMPT_LITQA2 = (
@@ -624,12 +644,274 @@ AGENTIC_SYSTEM_PROMPT = AGENTIC_SYSTEM_PROMPT_DBQA
 
 
 def _get_agentic_system_prompt(bench_subtask: str) -> str:
-    """Return the appropriate agentic system prompt for a bench subtask."""
+    """Return the appropriate agentic system prompt for a bench subtask.
+
+    All prompts get the DB_HELPERS_PROMPT_BLOCK appended so agents know
+    about the pre-built query functions available in the code namespace.
+    """
     if bench_subtask == "seqqa":
-        return AGENTIC_SYSTEM_PROMPT_SEQQA
+        return AGENTIC_SYSTEM_PROMPT_SEQQA + DB_HELPERS_PROMPT_BLOCK
     if bench_subtask == "litqa2":
-        return AGENTIC_SYSTEM_PROMPT_LITQA2
-    return AGENTIC_SYSTEM_PROMPT_DBQA
+        return AGENTIC_SYSTEM_PROMPT_LITQA2 + DB_HELPERS_PROMPT_BLOCK
+    return AGENTIC_SYSTEM_PROMPT_DBQA + DB_HELPERS_PROMPT_BLOCK
+
+
+# ---------------------------------------------------------------------------
+# Pre-built database query helpers (injected into agent code namespace)
+# ---------------------------------------------------------------------------
+
+
+def query_uniprot(
+    query: str,
+    fields: str = "accession,id,gene_names,protein_name,organism_name,length,go_p,go_c,go_f,cc_subcellular_location",
+    limit: int = 5,
+) -> list[dict]:
+    """Query UniProt REST API. Returns list of protein entries."""
+    import requests as _req
+
+    url = (
+        f"https://rest.uniprot.org/uniprotkb/search"
+        f"?query={query}&fields={fields}&format=json&size={limit}"
+    )
+    r = _req.get(url, timeout=15)
+    r.raise_for_status()
+    return r.json().get("results", [])
+
+
+def query_ncbi_gene(query: str, limit: int = 5) -> list[dict]:
+    """Query NCBI Gene via E-utilities. Returns gene summaries."""
+    import requests as _req
+
+    search_url = (
+        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        f"?db=gene&term={query}&retmax={limit}&retmode=json"
+    )
+    r = _req.get(search_url, timeout=15)
+    ids = r.json().get("esearchresult", {}).get("idlist", [])
+    if not ids:
+        return []
+    fetch_url = (
+        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+        f"?db=gene&id={','.join(ids)}&retmode=json"
+    )
+    r = _req.get(fetch_url, timeout=15)
+    result = r.json().get("result", {})
+    return [result[gid] for gid in ids if gid in result]
+
+
+def query_kegg(pathway_or_gene: str) -> dict:
+    """Query KEGG REST API for pathway or gene info."""
+    import requests as _req
+
+    url = f"https://rest.kegg.jp/get/{pathway_or_gene}"
+    r = _req.get(url, timeout=15)
+    if r.status_code == 200:
+        return {"text": r.text[:3000]}
+    return {"error": f"KEGG returned {r.status_code}"}
+
+
+def query_ncbi_clinvar(query: str, limit: int = 5) -> list[dict]:
+    """Query ClinVar via E-utilities."""
+    import requests as _req
+
+    search_url = (
+        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        f"?db=clinvar&term={query}&retmax={limit}&retmode=json"
+    )
+    r = _req.get(search_url, timeout=15)
+    ids = r.json().get("esearchresult", {}).get("idlist", [])
+    if not ids:
+        return []
+    fetch_url = (
+        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+        f"?db=clinvar&id={','.join(ids)}&retmode=json"
+    )
+    r = _req.get(fetch_url, timeout=15)
+    result = r.json().get("result", {})
+    return [result[vid] for vid in ids if vid in result]
+
+
+def query_pubmed(query: str, limit: int = 5) -> list[dict]:
+    """Search PubMed and return article summaries."""
+    import requests as _req
+
+    search_url = (
+        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        f"?db=pubmed&term={query}&retmax={limit}&retmode=json"
+    )
+    r = _req.get(search_url, timeout=15)
+    ids = r.json().get("esearchresult", {}).get("idlist", [])
+    if not ids:
+        return []
+    fetch_url = (
+        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+        f"?db=pubmed&id={','.join(ids)}&rettype=abstract&retmode=text"
+    )
+    r = _req.get(fetch_url, timeout=15)
+    return [{"abstracts": r.text[:3000]}]
+
+
+def query_ensembl_gene(gene_symbol: str, species: str = "human") -> dict:
+    """Get gene info from Ensembl REST API."""
+    import requests as _req
+
+    url = f"https://rest.ensembl.org/lookup/symbol/homo_sapiens/{gene_symbol}?expand=1"
+    r = _req.get(url, headers={"Content-Type": "application/json"}, timeout=15)
+    if r.status_code == 200:
+        return r.json()
+    return {"error": f"Ensembl returned {r.status_code}"}
+
+
+def query_string_interactions(
+    protein: str, species: int = 9606, limit: int = 10,
+) -> list[dict]:
+    """Get protein-protein interactions from STRING-db."""
+    import requests as _req
+
+    url = (
+        f"https://string-db.org/api/json/network"
+        f"?identifiers={protein}&species={species}&limit={limit}"
+    )
+    r = _req.get(url, timeout=15)
+    if r.status_code == 200:
+        return r.json()
+    return []
+
+
+# All pre-built helpers in a dict for easy namespace injection
+DB_QUERY_HELPERS: dict[str, Any] = {
+    "query_uniprot": query_uniprot,
+    "query_ncbi_gene": query_ncbi_gene,
+    "query_kegg": query_kegg,
+    "query_ncbi_clinvar": query_ncbi_clinvar,
+    "query_pubmed": query_pubmed,
+    "query_ensembl_gene": query_ensembl_gene,
+    "query_string_interactions": query_string_interactions,
+}
+
+# Description block injected into agentic system prompts
+DB_HELPERS_PROMPT_BLOCK = (
+    "\n\nYou have pre-built database query functions available in the code "
+    "execution environment:\n"
+    "- query_uniprot(\"BRCA1\") -> protein entries with GO terms, subcellular location\n"
+    "- query_ncbi_gene(\"TP53\") -> gene summaries from NCBI\n"
+    "- query_kegg(\"hsa:7157\") -> KEGG pathway/gene info\n"
+    "- query_ncbi_clinvar(\"BRAF V600E\") -> ClinVar variant classifications\n"
+    "- query_pubmed(\"EGFR resistance NSCLC\") -> PubMed abstracts\n"
+    "- query_ensembl_gene(\"KRAS\") -> Ensembl gene info with coordinates\n"
+    "- query_string_interactions(\"TP53\") -> STRING protein interactions\n\n"
+    "USE THESE FUNCTIONS. They work reliably. Do NOT try to construct API URLs yourself."
+)
+
+
+# ---------------------------------------------------------------------------
+# SeqQA helpers: BioPython pre-imports & sequence extraction
+# ---------------------------------------------------------------------------
+
+
+def _inject_biopython_namespace(namespace: dict[str, Any]) -> None:
+    """Pre-import BioPython modules into the execution namespace for SeqQA.
+
+    Handles import failures gracefully — each module is tried independently
+    so a missing sub-package does not block the rest.
+    """
+    try:
+        from Bio.Seq import Seq
+        namespace["Seq"] = Seq
+    except ImportError:
+        pass
+    try:
+        from Bio import SeqIO
+        namespace["SeqIO"] = SeqIO
+    except ImportError:
+        pass
+    try:
+        from Bio.SeqUtils import molecular_weight, GC123
+        namespace["molecular_weight"] = molecular_weight
+        namespace["GC123"] = GC123
+        # BioPython >=1.80: GC renamed to gc_fraction
+        try:
+            from Bio.SeqUtils import GC  # type: ignore[attr-defined]
+            namespace["GC"] = GC
+        except ImportError:
+            from Bio.SeqUtils import gc_fraction
+            namespace["GC"] = gc_fraction
+            namespace["gc_fraction"] = gc_fraction
+    except ImportError:
+        pass
+    try:
+        from Bio.Restriction import RestrictionBatch, Analysis, AllEnzymes
+        namespace["RestrictionBatch"] = RestrictionBatch
+        namespace["Analysis"] = Analysis
+        namespace["AllEnzymes"] = AllEnzymes
+    except ImportError:
+        pass
+    try:
+        from Bio.Data.CodonTable import standard_dna_table
+        namespace["standard_dna_table"] = standard_dna_table
+    except ImportError:
+        pass
+    try:
+        from Bio.SeqUtils import MeltingTemp
+        namespace["MeltingTemp"] = MeltingTemp
+    except ImportError:
+        pass
+
+
+def _extract_sequences_from_text(text: str) -> dict[str, list[str]]:
+    """Extract DNA/RNA and protein sequences from question text.
+
+    Returns dict with 'dna' and 'protein' keys, each a list of sequences
+    found (10+ characters long to avoid false positives).
+    """
+    # DNA/RNA: runs of ATCGU (case-insensitive)
+    dna_seqs = re.findall(r'[ATCGUatcgu]{10,}', text)
+    # De-duplicate preserving order, normalize to uppercase
+    seen: set[str] = set()
+    unique_dna: list[str] = []
+    for s in dna_seqs:
+        s_upper = s.upper()
+        if s_upper not in seen:
+            seen.add(s_upper)
+            unique_dna.append(s_upper)
+
+    # Protein: runs of standard amino acid single-letter codes (20 AA)
+    # Exclude sequences that look like DNA (only ATCG)
+    protein_seqs = re.findall(r'[ACDEFGHIKLMNPQRSTVWY]{10,}', text)
+    unique_protein: list[str] = []
+    seen_prot: set[str] = set()
+    for s in protein_seqs:
+        if s not in seen_prot and not re.fullmatch(r'[ATCG]+', s):
+            seen_prot.add(s)
+            unique_protein.append(s)
+
+    return {"dna": unique_dna, "protein": unique_protein}
+
+
+def _build_seqqa_sequence_context(question_text: str) -> str:
+    """Build a context string with pre-extracted sequences from the question.
+
+    Injected into the first-turn prompt for SeqQA so the agent has them
+    available as named variables in code.
+    """
+    seqs = _extract_sequences_from_text(question_text)
+    parts: list[str] = []
+    if seqs["dna"]:
+        parts.append("Detected DNA/RNA sequence(s) in the question:")
+        for i, s in enumerate(seqs["dna"]):
+            var_name = f"seq{i + 1}" if len(seqs["dna"]) > 1 else "seq"
+            parts.append(f'  {var_name} = "{s}"  ({len(s)} nt)')
+    if seqs["protein"]:
+        parts.append("Detected protein sequence(s) in the question:")
+        for i, s in enumerate(seqs["protein"]):
+            var_name = f"prot{i + 1}" if len(seqs["protein"]) > 1 else "prot"
+            parts.append(f'  {var_name} = "{s}"  ({len(s)} aa)')
+    if parts:
+        parts.append(
+            "\nUse these sequences directly in your code. "
+            "Copy them exactly — do NOT retype sequences by hand."
+        )
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -637,8 +919,16 @@ def _get_agentic_system_prompt(bench_subtask: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def execute_code_safely(code: str, timeout: int = 30) -> str:
+def execute_code_safely(
+    code: str, timeout: int = 30, *, seqqa_mode: bool = False,
+) -> str:
     """Execute Python code in a sandboxed namespace with timeout.
+
+    Args:
+        code: Python code string to execute.
+        timeout: Max seconds before killing execution.
+        seqqa_mode: If True, pre-import all BioPython modules into the
+            namespace so agents can use them without explicit imports.
 
     Returns stdout output or error message, truncated to 5000 chars.
     """
@@ -685,6 +975,13 @@ def execute_code_safely(code: str, timeout: int = 30) -> str:
         namespace["Bio"] = Bio
     except ImportError:
         pass
+
+    # SeqQA mode: pre-import all BioPython modules into namespace
+    if seqqa_mode:
+        _inject_biopython_namespace(namespace)
+
+    # Inject pre-built database query helpers
+    namespace.update(DB_QUERY_HELPERS)
 
     f = io.StringIO()
 
@@ -734,6 +1031,7 @@ def build_agentic_turn_prompt(
     hint: str = "",
 ) -> str:
     """Build the prompt for a single turn in the agentic loop."""
+    is_seqqa = question.bench_subtask == "seqqa"
     parts: list[str] = []
 
     if turn == 0:
@@ -746,15 +1044,30 @@ def build_agentic_turn_prompt(
         subtask_hint = _get_subtask_hint(question)
         parts.append(f"\nDatabase hint: {subtask_hint}")
 
+        # SeqQA: inject pre-extracted sequences
+        if is_seqqa:
+            seq_context = _build_seqqa_sequence_context(question.question)
+            if seq_context:
+                parts.append(f"\n{seq_context}")
+
         if hint:
             parts.append(f"\nAdditional guidance: {hint}")
 
-        parts.append(
-            "\nThink step-by-step about the answer. If you are confident from your "
-            "knowledge alone, just give the answer immediately — no need to write code. "
-            "Only use <execute> tags for code if you are genuinely uncertain and a FREE "
-            "public API can help verify. State your final answer as: Answer: X"
-        )
+        if is_seqqa:
+            parts.append(
+                "\nYou MUST write Python code using BioPython to solve this. "
+                "Wrap your code in <execute> tags. Do NOT attempt to compute "
+                "sequence operations in your head — use code for ALL of them. "
+                "After seeing the code output, compare it against the answer "
+                "choices and state your final answer as: Answer: X"
+            )
+        else:
+            parts.append(
+                "\nThink step-by-step about the answer. If you are confident from your "
+                "knowledge alone, just give the answer immediately — no need to write code. "
+                "Only use <execute> tags for code if you are genuinely uncertain and a FREE "
+                "public API can help verify. State your final answer as: Answer: X"
+            )
     else:
         # Subsequent turns: show history and ask to continue
         parts.append("Here is the conversation so far:\n")
@@ -767,12 +1080,20 @@ def build_agentic_turn_prompt(
             elif entry["role"] == "assistant":
                 parts.append(f"[Your previous response]:\n{entry['content']}")
 
-        parts.append(
-            "\nContinue your analysis. If the code output helps, use it to determine "
-            "the answer. If code failed or returned unhelpful results, answer from your "
-            "knowledge — do NOT keep retrying failed API calls. You MUST give a final "
-            "answer now. State: Answer: X"
-        )
+        if is_seqqa:
+            parts.append(
+                "\nContinue your analysis. Use the code output to determine "
+                "the correct answer by matching against the choices. "
+                "If code had an error, fix and re-run it. "
+                "You MUST give a final answer now. State: Answer: X"
+            )
+        else:
+            parts.append(
+                "\nContinue your analysis. If the code output helps, use it to determine "
+                "the answer. If code failed or returned unhelpful results, answer from your "
+                "knowledge — do NOT keep retrying failed API calls. You MUST give a final "
+                "answer now. State: Answer: X"
+            )
 
     return "\n\n".join(parts)
 
@@ -815,6 +1136,39 @@ def _get_retry_hint(question: BenchQuestion) -> str:
     return "Try a different analytical approach or database query."
 
 
+def _seqqa_verify_answer(
+    code: str, stated_answer: str, choices: list[str], predicted_letter: str,
+) -> tuple[bool, str]:
+    """Re-execute the agent's final code block and verify output matches answer.
+
+    Returns (verified, detail_message).
+    """
+    try:
+        output = execute_code_safely(code, timeout=15, seqqa_mode=True)
+        if output.startswith("Error:"):
+            return False, f"Verification code error: {output}"
+        # Check if the stated answer text appears somewhere in the code output
+        choice_text = ""
+        if predicted_letter:
+            idx = ord(predicted_letter) - ord("A")
+            if 0 <= idx < len(choices):
+                # Strip the "(X) " prefix to get raw answer text
+                choice_text = re.sub(r"^\([A-E]\)\s*", "", choices[idx])
+        if choice_text and choice_text.strip() in output:
+            return True, f"Verified: answer text found in code output"
+        # Also check if any significant part of the output matches the choice
+        # (for numeric answers, single-word answers, etc.)
+        output_stripped = output.strip()
+        if output_stripped and choice_text:
+            # Check if key parts of the choice appear in output
+            # For short answers (< 50 chars), check direct containment
+            if len(choice_text) < 50 and choice_text.strip().lower() in output.lower():
+                return True, f"Verified: answer found in output (case-insensitive)"
+        return False, f"Unverified: output={output_stripped[:200]}, choice={choice_text[:100]}"
+    except Exception as e:
+        return False, f"Verification exception: {e}"
+
+
 async def evaluate_question_agentic(
     question: BenchQuestion,
     llm: Any,
@@ -827,6 +1181,9 @@ async def evaluate_question_agentic(
 ) -> tuple[ScoredResult, str]:
     """Evaluate using multi-turn agentic reasoning with code execution.
 
+    For SeqQA questions, this enforces code execution before accepting an
+    answer, pre-imports BioPython modules, and runs a verification step.
+
     Returns (ScoredResult, reasoning_summary) where reasoning_summary can be
     used as context for retry hints in multi-trial mode.
     """
@@ -834,14 +1191,38 @@ async def evaluate_question_agentic(
     choices, correct_letter, refuse_letter = build_choices(question)
     system_prompt = _get_agentic_system_prompt(question.bench_subtask)
 
+    is_seqqa = question.bench_subtask == "seqqa"
+    is_verbose = logger.isEnabledFor(logging.DEBUG)
+
     history: list[dict[str, str]] = []
     total_tokens = 0
     full_reasoning: list[str] = []
+    code_executed = False  # Track whether any code was run (for SeqQA enforcement)
+    last_code_block: str | None = None  # For verification
 
     # Build extra kwargs for temperature if provided
     extra_kwargs: dict[str, Any] = {}
     if temperature is not None:
         extra_kwargs["temperature"] = temperature
+
+    def _make_result(
+        predicted: str, reasoning: str, error: str | None = None,
+    ) -> ScoredResult:
+        return ScoredResult(
+            question_id=question.id,
+            subtask=question.subtask,
+            predicted=predicted,
+            predicted_text=_get_choice_text(choices, predicted),
+            correct_answer=correct_letter,
+            correct_text=question.correct_answer,
+            is_correct=predicted == correct_letter,
+            is_refused=predicted == refuse_letter,
+            reasoning=reasoning,
+            tokens_used=total_tokens,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            error=error,
+            bench_subtask=question.bench_subtask,
+        )
 
     try:
         for turn in range(max_turns):
@@ -874,53 +1255,77 @@ async def evaluate_question_agentic(
             # Check for code execution
             code = extract_code_block(response_text)
             if code:
-                logger.debug("Turn %d: executing code (%d chars)", turn, len(code))
-                output = execute_code_safely(code, timeout=30)
+                if is_verbose:
+                    logger.debug(
+                        "Turn %d: executing code (%d chars):\n%s",
+                        turn, len(code), code,
+                    )
+                else:
+                    logger.debug("Turn %d: executing code (%d chars)", turn, len(code))
+                output = execute_code_safely(
+                    code, timeout=30, seqqa_mode=is_seqqa,
+                )
                 history.append({"role": "code", "code": code, "output": output})
                 full_reasoning.append(f"[Code output]: {output}")
+                code_executed = True
+                last_code_block = code
 
                 # If response also has a final answer after code, extract it
                 if has_final_answer(response_text):
                     predicted = extract_answer_letter(response_text)
-                    is_correct = predicted == correct_letter
-                    is_refused = predicted == refuse_letter
                     reasoning = "\n".join(full_reasoning)
-                    return ScoredResult(
-                        question_id=question.id,
-                        subtask=question.subtask,
-                        predicted=predicted,
-                        predicted_text=_get_choice_text(choices, predicted),
-                        correct_answer=correct_letter,
-                        correct_text=question.correct_answer,
-                        is_correct=is_correct,
-                        is_refused=is_refused,
-                        reasoning=reasoning,
-                        tokens_used=total_tokens,
-                        latency_ms=int((time.monotonic() - start) * 1000),
-                        error=None,
-                        bench_subtask=question.bench_subtask,
-                    ), reasoning
+
+                    # SeqQA verification step
+                    if is_seqqa and last_code_block:
+                        verified, detail = _seqqa_verify_answer(
+                            last_code_block, predicted, choices, predicted,
+                        )
+                        full_reasoning.append(f"[Verification]: {detail}")
+                        reasoning = "\n".join(full_reasoning)
+                        if is_verbose:
+                            logger.debug("SeqQA verification: %s", detail)
+
+                    result = _make_result(predicted, reasoning)
+                    return result, reasoning
 
             elif has_final_answer(response_text):
                 predicted = extract_answer_letter(response_text)
-                is_correct = predicted == correct_letter
-                is_refused = predicted == refuse_letter
+
+                # SeqQA enforcement: if no code was executed, redirect
+                if is_seqqa and not code_executed and turn < max_turns - 1:
+                    logger.debug(
+                        "SeqQA: answer without code at turn %d — redirecting",
+                        turn,
+                    )
+                    history.append({"role": "think", "content": response_text})
+                    history.append({
+                        "role": "think",
+                        "content": (
+                            "STOP. You gave an answer without running any code. "
+                            "For sequence questions you MUST use BioPython code "
+                            "to compute the answer. Write a <execute> block now."
+                        ),
+                    })
+                    full_reasoning.append(
+                        "[SeqQA redirect]: forced code execution — "
+                        "answer without code not accepted"
+                    )
+                    continue
+
                 reasoning = "\n".join(full_reasoning)
-                return ScoredResult(
-                    question_id=question.id,
-                    subtask=question.subtask,
-                    predicted=predicted,
-                    predicted_text=_get_choice_text(choices, predicted),
-                    correct_answer=correct_letter,
-                    correct_text=question.correct_answer,
-                    is_correct=is_correct,
-                    is_refused=is_refused,
-                    reasoning=reasoning,
-                    tokens_used=total_tokens,
-                    latency_ms=int((time.monotonic() - start) * 1000),
-                    error=None,
-                    bench_subtask=question.bench_subtask,
-                ), reasoning
+
+                # SeqQA verification step
+                if is_seqqa and last_code_block:
+                    verified, detail = _seqqa_verify_answer(
+                        last_code_block, predicted, choices, predicted,
+                    )
+                    full_reasoning.append(f"[Verification]: {detail}")
+                    reasoning = "\n".join(full_reasoning)
+                    if is_verbose:
+                        logger.debug("SeqQA verification: %s", detail)
+
+                result = _make_result(predicted, reasoning)
+                return result, reasoning
 
             else:
                 # Thinking step — no code, no final answer
@@ -931,58 +1336,119 @@ async def evaluate_question_agentic(
         predicted = extract_answer_letter(all_text)
         reasoning = all_text
 
-        return ScoredResult(
-            question_id=question.id,
-            subtask=question.subtask,
-            predicted=predicted,
-            predicted_text=_get_choice_text(choices, predicted),
-            correct_answer=correct_letter,
-            correct_text=question.correct_answer,
-            is_correct=predicted == correct_letter,
-            is_refused=predicted == refuse_letter,
-            reasoning=reasoning,
-            tokens_used=total_tokens,
-            latency_ms=int((time.monotonic() - start) * 1000),
+        result = _make_result(
+            predicted, reasoning,
             error="max_turns_exhausted" if not predicted else None,
-            bench_subtask=question.bench_subtask,
-        ), reasoning
+        )
+        return result, reasoning
 
     except TimeoutError:
         reasoning = "\n".join(full_reasoning) if full_reasoning else ""
-        return ScoredResult(
-            question_id=question.id,
-            subtask=question.subtask,
-            predicted="",
-            predicted_text="",
-            correct_answer=correct_letter,
-            correct_text=question.correct_answer,
-            is_correct=False,
-            is_refused=False,
-            reasoning=reasoning,
-            tokens_used=total_tokens,
-            latency_ms=int((time.monotonic() - start) * 1000),
-            error="Timeout",
-            bench_subtask=question.bench_subtask,
-        ), reasoning
+        return _make_result("", reasoning, error="Timeout"), reasoning
 
     except Exception as exc:
         reasoning = "\n".join(full_reasoning) if full_reasoning else ""
-        return ScoredResult(
-            question_id=question.id,
-            subtask=question.subtask,
-            predicted="",
-            predicted_text="",
-            correct_answer=correct_letter,
-            correct_text=question.correct_answer,
-            is_correct=False,
-            is_refused=False,
-            reasoning=reasoning,
-            tokens_used=total_tokens,
-            latency_ms=int((time.monotonic() - start) * 1000),
-            error=traceback.format_exc(),
-            bench_subtask=question.bench_subtask,
-        ), reasoning
+        return _make_result("", reasoning, error=traceback.format_exc()), reasoning
 
+
+async def verify_answer(
+    question: BenchQuestion,
+    llm: Any,
+    original_result: ScoredResult,
+    choices: list[str],
+    correct_letter: str,
+    refuse_letter: str,
+    *,
+    model: str = "",
+    timeout_seconds: int = 300,
+) -> ScoredResult:
+    """Run a second-pass verification of the original answer.
+
+    Asks the LLM to verify from a different angle. If the verification
+    disagrees, the verification answer is used instead.
+    """
+    start = time.monotonic()
+
+    original_letter = original_result.predicted
+    original_text = original_result.predicted_text
+
+    verify_prompt = (
+        "You previously answered a multiple-choice biology question.\n\n"
+        f"Question: {question.question}\n\n"
+        "Choices:\n" + "\n".join(f"  {c}" for c in choices) + "\n\n"
+        f"Your previous answer was: ({original_letter}) {original_text}\n\n"
+        "VERIFY this is correct by checking from a different angle. "
+        "Consider alternative interpretations, edge cases, and whether "
+        "a different choice might actually be correct.\n\n"
+        "If your original answer is correct, confirm it. If you find "
+        "it is wrong, provide the corrected answer.\n\n"
+        "State your final answer on the LAST line as: Answer: X"
+    )
+
+    system_prompt = _get_agentic_system_prompt(question.bench_subtask)
+
+    try:
+        resp = await asyncio.wait_for(
+            llm.query(
+                verify_prompt,
+                system_prompt=system_prompt,
+                max_tokens=2048,
+                model=model or None,
+            ),
+            timeout=timeout_seconds,
+        )
+
+        verify_text = resp.text
+        verify_tokens = resp.call_tokens
+        verified_letter = extract_answer_letter(verify_text)
+
+        if verified_letter and verified_letter != original_letter:
+            logger.info(
+                "  Verification CHANGED answer: %s -> %s",
+                original_letter, verified_letter,
+            )
+            is_correct = verified_letter == correct_letter
+            is_refused = verified_letter == refuse_letter
+            return ScoredResult(
+                question_id=question.id,
+                subtask=question.subtask,
+                predicted=verified_letter,
+                predicted_text=_get_choice_text(choices, verified_letter),
+                correct_answer=correct_letter,
+                correct_text=question.correct_answer,
+                is_correct=is_correct,
+                is_refused=is_refused,
+                reasoning=(
+                    original_result.reasoning
+                    + f"\n\n[VERIFICATION]: Changed {original_letter} -> {verified_letter}\n"
+                    + verify_text
+                ),
+                tokens_used=original_result.tokens_used + verify_tokens,
+                latency_ms=original_result.latency_ms + int((time.monotonic() - start) * 1000),
+                error=None,
+                bench_subtask=question.bench_subtask,
+            )
+        else:
+            logger.info("  Verification CONFIRMED answer: %s", original_letter)
+            return ScoredResult(
+                question_id=original_result.question_id,
+                subtask=original_result.subtask,
+                predicted=original_result.predicted,
+                predicted_text=original_result.predicted_text,
+                correct_answer=original_result.correct_answer,
+                correct_text=original_result.correct_text,
+                is_correct=original_result.is_correct,
+                is_refused=original_result.is_refused,
+                reasoning=original_result.reasoning + "\n\n[VERIFICATION]: Confirmed",
+                tokens_used=original_result.tokens_used + verify_tokens,
+                latency_ms=original_result.latency_ms + int((time.monotonic() - start) * 1000),
+                error=None,
+                bench_subtask=original_result.bench_subtask,
+            )
+
+    except Exception as exc:
+        logger.warning("Verification failed: %s \u2014 keeping original answer", exc)
+        return original_result
 
 async def evaluate_question_multitrial(
     question: BenchQuestion,
@@ -1466,6 +1932,7 @@ async def run_evaluation(
     max_turns: int = 8,
     subtask: str = "dbqa",
     replicas: int = 1,
+    verify: bool = False,
 ) -> dict[str, Any]:
     """Run the full LAB-Bench evaluation pipeline.
 
@@ -1481,6 +1948,7 @@ async def run_evaluation(
         max_turns: Max turns for agentic mode (default 8).
         subtask: Which subtask(s) to evaluate — "dbqa", "seqqa", "litqa2", "all".
         replicas: Number of replicas for majority voting (1 = disabled).
+        verify: If True, run a second-pass verification on each answer.
 
     Returns:
         Full results dict with metrics and per-question results.
@@ -1521,18 +1989,11 @@ async def run_evaluation(
     llm = None
     model_name = ""
     if not dry_run:
-        from core.config import settings
         from core.llm import LLMClient
 
         llm = LLMClient()
-        if model_tier == "sonnet":
-            model_name = settings.llm_fast_model
-        elif model_tier == "opus":
-            model_name = settings.llm_model
-        elif model_tier == "haiku":
-            model_name = settings.llm_cheap_model
-        else:
-            model_name = model_tier  # allow direct model name
+        # Resolve model tier to explicit model ID
+        model_name = MODEL_ID_MAP.get(model_tier, model_tier)
         logger.info(
             "Using model: %s (mode: %s, trials: %d, replicas: %d, subtask: %s)",
             model_name, mode, trials, replicas,
@@ -1610,6 +2071,20 @@ async def run_evaluation(
                     timeout_seconds=timeout_seconds,
                 )
 
+        # Two-pass verification (--verify)
+        if verify and not dry_run and result.predicted and not result.error:
+            choices_v, correct_v, refuse_v = build_choices(question)
+            result = await verify_answer(
+                question,
+                llm,
+                result,
+                choices_v,
+                correct_v,
+                refuse_v,
+                model=model_name,
+                timeout_seconds=timeout_seconds,
+            )
+
         results.append(result)
         checkpoint.save_result(result, trial_details=trial_details)
 
@@ -1678,6 +2153,7 @@ async def run_evaluation(
             "subtask": subtask,
             "subtask_keys": subtask_keys,
             "max_turns": max_turns if mode == "agentic" else None,
+            "verify": verify,
         },
         "metrics": metrics,
         "competitor_baselines": {
@@ -1729,6 +2205,7 @@ async def run_evaluation(
     print(f"  Model:         {model_name or 'dry-run'}")
     print(f"  Trials:        {trials}")
     print(f"  Replicas:      {replicas}")
+    print(f"  Verify:        {verify}")
     if mode == "agentic":
         print(f"  Max turns:     {max_turns}")
     print(f"  Questions:     {metrics['total']}")
@@ -1877,6 +2354,11 @@ def main() -> None:
         help="Max concurrent LLM calls (default: 1)",
     )
     parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Enable two-pass verification: after the agent answers, a second pass checks the answer from a different angle.",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -1902,6 +2384,7 @@ def main() -> None:
             max_turns=args.max_turns,
             subtask=args.subtask,
             replicas=args.replicas,
+            verify=args.verify,
         )
     )
 
