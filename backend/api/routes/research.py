@@ -70,23 +70,16 @@ async def create_research(
 
     llm = LLMClient()
 
-    # Build tool instances for agent execution
-    tool_instances = _build_tool_instances_for_api()
-
-    # Initialize Slack for HITL
-    slack_tool = None
-    try:
-        from integrations.slack import SlackTool
-        slack_tool = SlackTool()
-    except Exception:
-        pass
+    # Build full tool registry + instances (same as E2E script)
+    tool_registry, tool_instances = _build_full_tool_stack()
+    tool_entries = tool_registry.list_tools()
 
     orchestrator = ResearchOrchestrator(
         llm=llm,
         kg=kg,
         agent_factory=create_agent,
+        tool_entries=tool_entries,
         tool_instances=tool_instances,
-        slack_tool=slack_tool,
     )
 
     sessions[session.id] = session
@@ -124,55 +117,141 @@ async def create_research(
     )
 
 
-def _build_tool_instances_for_api() -> dict:
-    """Build tool instances for the API server context."""
-    tools: dict = {}
+_tool_cache: tuple | None = None
+
+
+def _build_full_tool_stack() -> tuple:
+    """Build the full tool registry + instances (native + MCP catalog).
+
+    Returns (InMemoryToolRegistry, dict[str, BaseTool]).
+    Caches after first call so tools are reused across requests.
+    """
+    global _tool_cache
+    if _tool_cache is not None:
+        return _tool_cache
+
+    from core.models import ToolRegistryEntry, ToolSourceType
+    from core.tool_registry import InMemoryToolRegistry
+
+    registry = InMemoryToolRegistry()
+    tool_instances: dict = {}
+
+    # Import and instantiate all native tools
+    tool_classes = []
     try:
         from integrations.pubmed import PubMedTool
-        tools["pubmed"] = PubMedTool()
+        tool_classes.append(PubMedTool)
     except Exception:
         pass
     try:
         from integrations.semantic_scholar import SemanticScholarTool
-        tools["semantic_scholar"] = SemanticScholarTool()
+        tool_classes.append(SemanticScholarTool)
     except Exception:
         pass
     try:
         from integrations.uniprot import UniProtTool
-        tools["uniprot"] = UniProtTool()
+        tool_classes.append(UniProtTool)
     except Exception:
         pass
     try:
         from integrations.kegg import KEGGTool
-        tools["kegg"] = KEGGTool()
+        tool_classes.append(KEGGTool)
     except Exception:
         pass
     try:
         from integrations.reactome import ReactomeTool
-        tools["reactome"] = ReactomeTool()
+        tool_classes.append(ReactomeTool)
     except Exception:
         pass
     try:
         from integrations.mygene import MyGeneTool
-        tools["mygene"] = MyGeneTool()
+        tool_classes.append(MyGeneTool)
     except Exception:
         pass
     try:
         from integrations.chembl import ChEMBLTool
-        tools["chembl"] = ChEMBLTool()
+        tool_classes.append(ChEMBLTool)
     except Exception:
         pass
     try:
         from integrations.clinicaltrials import ClinicalTrialsTool
-        tools["clinicaltrials"] = ClinicalTrialsTool()
+        tool_classes.append(ClinicalTrialsTool)
     except Exception:
         pass
     try:
         from integrations.python_repl import PythonREPLTool
-        tools["python_repl"] = PythonREPLTool()
+        tool_classes.append(PythonREPLTool)
     except Exception:
         pass
-    return tools
+    try:
+        from integrations.opentargets import OpenTargetsTool
+        tool_classes.append(OpenTargetsTool)
+    except Exception:
+        pass
+    try:
+        from integrations.clinvar import ClinVarTool
+        tool_classes.append(ClinVarTool)
+    except Exception:
+        pass
+    try:
+        from integrations.gtex import GTExTool
+        tool_classes.append(GTExTool)
+    except Exception:
+        pass
+    try:
+        from integrations.gnomad import GnomADTool
+        tool_classes.append(GnomADTool)
+    except Exception:
+        pass
+    try:
+        from integrations.hpo import HPOTool
+        tool_classes.append(HPOTool)
+    except Exception:
+        pass
+    try:
+        from integrations.omim import OMIMTool
+        tool_classes.append(OMIMTool)
+    except Exception:
+        pass
+    try:
+        from integrations.biogrid import BioGRIDTool
+        tool_classes.append(BioGRIDTool)
+    except Exception:
+        pass
+    try:
+        from integrations.depmap import DepMapTool
+        tool_classes.append(DepMapTool)
+    except Exception:
+        pass
+    try:
+        from integrations.cellxgene import CellxGeneTool
+        tool_classes.append(CellxGeneTool)
+    except Exception:
+        pass
+    try:
+        from integrations.string_db import StringDBTool
+        tool_classes.append(StringDBTool)
+    except Exception:
+        pass
+
+    for cls in tool_classes:
+        try:
+            instance = cls(registry=registry)
+            tool_instances[instance.name] = instance
+        except Exception:
+            pass
+
+    # Register MCP + container catalog entries (metadata only)
+    try:
+        from integrations.tool_catalog import get_catalog
+        for entry in get_catalog():
+            if entry.source_type in (ToolSourceType.MCP, ToolSourceType.CONTAINER):
+                registry.register(entry)
+    except Exception:
+        pass
+
+    _tool_cache = (registry, tool_instances)
+    return _tool_cache
 
 
 @router.get("")
