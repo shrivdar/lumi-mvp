@@ -220,6 +220,9 @@ def get_longest_orf(dna_sequence: str) -> dict:
 def aa_at_position(dna_sequence: str, position: int) -> str:
     """Get the amino acid at a given position in the longest ORF.
 
+    First tries M-starting ORFs. If position is out of range, falls back to
+    the longest reading frame between stop codons (which may not start with M).
+
     Args:
         dna_sequence: DNA sequence string.
         position: 1-indexed position in the longest ORF protein.
@@ -228,13 +231,30 @@ def aa_at_position(dna_sequence: str, position: int) -> str:
         Single amino acid character, or error string.
     """
     try:
+        # Try M-starting ORFs first
         orf = get_longest_orf(dna_sequence)
-        if "error" in orf:
-            return f"Error: {orf['error']}"
-        protein = orf["protein"]
-        if position < 1 or position > len(protein):
-            return f"Error: position {position} out of range (1-{len(protein)})"
-        return protein[position - 1]
+        if "error" not in orf:
+            protein = orf["protein"]
+            if 1 <= position <= len(protein):
+                return protein[position - 1]
+
+        # Fall back: find longest reading frame between stop codons
+        # (some questions mean "ORF" as any reading frame, not just M-started)
+        seq = dna_sequence.upper().replace("U", "T")
+        rc = reverse_complement(seq)
+        best_frame = ""
+        for strand_seq in [seq, rc]:
+            for frame in range(3):
+                protein = translate_sequence(strand_seq, frame)
+                # Split by stop codons, find longest segment
+                segments = protein.replace("*", "\n").split("\n")
+                for seg in segments:
+                    if len(seg) > len(best_frame):
+                        best_frame = seg
+
+        if position < 1 or position > len(best_frame):
+            return f"Error: position {position} out of range (1-{len(best_frame)})"
+        return best_frame[position - 1]
     except Exception as e:
         return f"Error: {e}"
 
