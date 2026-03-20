@@ -119,8 +119,110 @@ MODEL_ALIASES: dict[str, str] = {
 }
 
 # Agentic execution defaults
-DEFAULT_MAX_TURNS = 8
+DEFAULT_MAX_TURNS = 6
 CODE_EXEC_TIMEOUT_SECONDS = 120
+
+# ---------------------------------------------------------------------------
+# Category-specific hints for BixBench question domains
+# ---------------------------------------------------------------------------
+
+CATEGORY_HINTS: dict[str, str] = {
+    "rna-seq": (
+        "DOMAIN HINT (RNA-seq): This is an RNA-seq analysis question. Likely needs: "
+        "differential expression (t-tests or Mann-Whitney), gene filtering, p-value "
+        "adjustment (FDR/BH). Load count matrix and metadata, identify experimental "
+        "groups, run statistical tests. Check for log2FoldChange, padj, baseMean columns."
+    ),
+    "transcriptomics": (
+        "DOMAIN HINT (Transcriptomics): Look for gene expression patterns, clustering, "
+        "or pathway enrichment in the data. May involve normalized counts, TPM/FPKM values, "
+        "or pre-computed DE results. Check for expression matrices and sample annotations."
+    ),
+    "genomics": (
+        "DOMAIN HINT (Genomics): May involve variant analysis, sequence comparison, "
+        "genome annotation, or structural variation. Look for VCF-like data, BED files, "
+        "or genome coordinate tables. Pay attention to chromosome, position, ref/alt alleles."
+    ),
+    "phylogenetics": (
+        "DOMAIN HINT (Phylogenetics): May need distance matrices, tree construction, "
+        "or evolutionary analysis. Look for sequence alignments, FASTA files, or "
+        "pre-computed distance/similarity matrices. Consider Newick tree format."
+    ),
+    "epigenomics": (
+        "DOMAIN HINT (Epigenomics): May involve methylation data (beta values, M-values), "
+        "ChIP-seq peaks, or chromatin accessibility (ATAC-seq). Look for peak files, "
+        "methylation arrays, or histone modification data."
+    ),
+    "imaging": (
+        "DOMAIN HINT (Biomedical imaging): May involve image metrics, quantification, "
+        "spatial analysis, or cell counting data. Look for measurement tables, ROI data, "
+        "or pre-extracted image features."
+    ),
+    "proteomics": (
+        "DOMAIN HINT (Proteomics): May involve protein expression, mass spec data, "
+        "or protein-protein interactions. Look for intensity values, peptide counts, "
+        "or abundance ratios."
+    ),
+    "single-cell": (
+        "DOMAIN HINT (Single-cell): May involve scRNA-seq analysis, cell type annotation, "
+        "clustering, or trajectory analysis. Look for count matrices, cell metadata, "
+        "UMAP/tSNE coordinates, or marker gene lists."
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Common analysis code templates for BixBench
+# ---------------------------------------------------------------------------
+
+DE_CODE_TEMPLATE = '''
+# Differential expression analysis template
+import pandas as pd
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
+
+# Load data - adapt filenames as needed
+# counts = pd.read_csv('counts.csv', index_col=0)
+# metadata = pd.read_csv('metadata.csv')
+
+# Identify groups
+# group_col = [c for c in metadata.columns if metadata[c].nunique() == 2][0]
+# groups = metadata[group_col].unique()
+
+# For each gene, run t-test
+# results = []
+# for gene in counts.index:
+#     g1 = counts.loc[gene, metadata[group_col] == groups[0]]
+#     g2 = counts.loc[gene, metadata[group_col] == groups[1]]
+#     stat, pval = stats.ttest_ind(g1, g2)
+#     fc = g1.mean() / g2.mean() if g2.mean() != 0 else float('inf')
+#     results.append({'gene': gene, 'pvalue': pval, 'fold_change': fc})
+# results_df = pd.DataFrame(results)
+# results_df['padj'] = multipletests(results_df['pvalue'], method='fdr_bh')[1]
+'''
+
+ANALYSIS_TEMPLATES: dict[str, str] = {
+    "rna-seq": (
+        "ANALYSIS TEMPLATE: For DE analysis, use scipy.stats.ttest_ind or mannwhitneyu "
+        "for each gene. Apply statsmodels.stats.multitest.multipletests(pvals, method='fdr_bh') "
+        "for multiple testing correction. For pre-computed DE results, filter by padj < 0.05 "
+        "and |log2FoldChange| > 1."
+    ),
+    "transcriptomics": (
+        "ANALYSIS TEMPLATE: For expression patterns, try PCA or hierarchical clustering. "
+        "For enrichment, use scipy.stats.fisher_exact. For gene filtering, check for "
+        "variance, mean expression, or fold change thresholds."
+    ),
+    "genomics": (
+        "ANALYSIS TEMPLATE: For variant analysis, count variants per type/region. "
+        "For sequence comparison, use alignment scores or percent identity. "
+        "Watch for 0-based vs 1-based coordinates."
+    ),
+    "phylogenetics": (
+        "ANALYSIS TEMPLATE: For distance matrices, scipy.spatial.distance or sklearn. "
+        "For tree metrics, count leaves/nodes. Parse Newick with string manipulation. "
+        "For bootstrap support, look at node labels."
+    ),
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -359,6 +461,28 @@ def execute_code(code: str, data_dir: str, timeout: int = CODE_EXEC_TIMEOUT_SECO
     try:
         from itertools import combinations
         namespace["combinations"] = combinations
+    except ImportError:
+        pass
+
+    # Pre-import statsmodels for multiple testing correction and regression
+    try:
+        from statsmodels.stats.multitest import multipletests
+        namespace["multipletests"] = multipletests
+    except ImportError:
+        pass
+    try:
+        import statsmodels.api as sm
+        namespace["sm"] = sm
+    except ImportError:
+        pass
+    try:
+        import statsmodels
+        namespace["statsmodels"] = statsmodels
+    except ImportError:
+        pass
+    try:
+        from statsmodels.miscmodels.ordinal_model import OrderedModel
+        namespace["OrderedModel"] = OrderedModel
     except ImportError:
         pass
 
@@ -639,37 +763,62 @@ def _build_system_prompt() -> str:
     )
 
 
-def _build_agentic_system_prompt() -> str:
+def _get_category_hint(categories: str) -> str:
+    """Get domain-specific hints based on question categories."""
+    if not categories:
+        return ""
+    hints = []
+    cat_lower = categories.lower()
+    for key, hint in CATEGORY_HINTS.items():
+        if key in cat_lower:
+            hints.append(hint)
+    # Also check analysis templates
+    for key, template in ANALYSIS_TEMPLATES.items():
+        if key in cat_lower:
+            hints.append(template)
+    return "\n\n".join(hints)
+
+
+def _build_agentic_system_prompt(categories: str = "") -> str:
+    category_hint = _get_category_hint(categories)
+    category_section = f"\n\n{category_hint}\n" if category_hint else ""
+
     return (
         "You are an expert bioinformatics data analyst. You are given a research "
         "question and a data capsule containing real experimental data files.\n\n"
         "YOUR TASK: Analyze the data to answer the question precisely.\n\n"
         "METHODOLOGY:\n"
-        "1. FIRST: Explore the data thoroughly\n"
-        "   - List all files (os.listdir)\n"
-        "   - For each CSV: read with pandas, print shape, columns, dtypes, head(3)\n"
-        "   - For each JSON: load and print structure\n"
-        "   - For each .py/.R file: read and understand the analysis pipeline\n\n"
-        "2. THEN: Plan your analysis\n"
-        "   - What statistical test or computation is needed?\n"
-        "   - What columns/variables are relevant?\n"
-        "   - What is the expected output format?\n\n"
-        "3. THEN: Execute the analysis\n"
-        "   - Write clean, well-commented Python code\n"
-        "   - Use pandas, numpy, scipy.stats, scikit-learn as needed\n"
-        "   - Print intermediate results to verify each step\n"
-        "   - Handle missing data, type conversions, filtering\n\n"
-        "4. FINALLY: Extract the precise answer\n"
+        "1. FIRST: Review the pre-analysis output (already provided below)\n"
+        "   - Identify which files are relevant to the question\n"
+        "   - Note column names, data types, and data shapes\n"
+        "   - Do NOT re-explore files that were already analyzed in pre-analysis\n\n"
+        "2. THEN: Write targeted analysis code\n"
+        "   - Go directly to the computation needed to answer the question\n"
+        "   - Use the column names and file names from the pre-analysis\n"
+        "   - Print the EXACT result value\n\n"
+        "3. FINALLY: Extract the precise answer\n"
         "   - State the answer clearly in <answer>YOUR_ANSWER</answer> tags\n"
-        "   - For numeric answers: report the exact value (e.g., 0.0023, not \"approximately 0.002\")\n"
-        "   - For string answers: use the exact format expected (gene names, p-values, etc.)\n\n"
+        "   - For numeric answers: report the EXACT value from your code output (e.g., 0.0023, not \"approximately 0.002\")\n"
+        "   - For range_verifier questions: report full precision (all decimal places)\n"
+        "   - For string answers: use the exact format expected (gene names, p-values, etc.)\n"
+        "   - Copy the value DIRECTLY from your code output, do not round or approximate\n\n"
+        "SPEED: You have limited turns. Do NOT waste turns on unnecessary exploration.\n"
+        "The pre-analysis already shows file contents. Go straight to computing the answer.\n\n"
         "COMMON BIOINFORMATICS ANALYSES:\n"
         "- Differential expression: use scipy.stats.ttest_ind or mannwhitneyu\n"
         "- Correlation: use scipy.stats.pearsonr or spearmanr\n"
         "- Enrichment: use scipy.stats.fisher_exact or chi2_contingency\n"
+        "- Multiple testing: use statsmodels.stats.multitest.multipletests\n"
+        "- Ordinal logistic regression: use statsmodels.miscmodels.ordinal_model.OrderedModel\n"
+        "  Example: model = OrderedModel(y, X, distr='logit'); result = model.fit(method='bfgs'); odds_ratio = np.exp(result.params['var'])\n"
+        "- Logistic regression: use statsmodels.api.Logit or sklearn.linear_model.LogisticRegression\n"
         "- Survival: use lifelines.KaplanMeierFitter if available, else scipy\n"
         "- Clustering: use sklearn.cluster.KMeans or DBSCAN\n"
-        "- Dimensionality reduction: use sklearn.decomposition.PCA\n\n"
+        "- Dimensionality reduction: use sklearn.decomposition.PCA\n"
+        "- Chi-square: use scipy.stats.chi2_contingency for contingency tables\n\n"
+        "CRITICAL: When the question specifies a particular method (e.g., 'ordinal logistic regression', "
+        "'DESeq2', 'chi-square test'), you MUST use that EXACT method. Using an alternative method "
+        "will give incorrect results even if it seems reasonable.\n\n"
         "CODE EXECUTION ENVIRONMENT:\n"
         "- pandas (pd), numpy (np), scipy.stats (stats) are pre-imported\n"
         "- scipy.stats functions: pearsonr, spearmanr, ttest_ind, mannwhitneyu, fisher_exact, chi2_contingency\n"
@@ -680,18 +829,21 @@ def _build_agentic_system_prompt() -> str:
         "- The working directory is set to the data capsule folder\n"
         "- Use DATA_DIR variable for the absolute path to the data directory\n"
         "- Print results using print() — all stdout is captured\n\n"
+        "ERROR RECOVERY:\n"
+        "- If code fails, READ the error carefully and fix it\n"
+        "- FileNotFoundError: check os.listdir('.') for actual filenames\n"
+        "- If a CSV won't parse: try sep='\\t', or encoding='latin1', or skiprows=N\n"
+        "- If a library is missing: use an alternative (e.g., scipy.stats instead of statsmodels)\n"
+        "- If data types are wrong: use .astype(float), pd.to_numeric(errors='coerce')\n"
+        "- Try at most 2 different approaches before giving your best answer\n\n"
         "RULES:\n"
         "- Write ONE <execute> block per turn. Wait for results before continuing.\n"
-        "- If code errors, fix and retry with a different approach.\n"
         "- When you have the final answer, respond with <answer>YOUR_ANSWER</answer>\n"
         "- If the question asks for a number, put ONLY the number in <answer> tags.\n"
         "- If the question asks for a name/term, put ONLY that term.\n"
-        "- Be precise: match the expected format (e.g. rounded to N decimal places).\n\n"
-        "IMPORTANT:\n"
-        "- ALWAYS load and explore data before attempting analysis\n"
-        "- If a computation fails, READ THE ERROR and fix your code\n"
-        "- If data doesn't match expectations, adapt your approach\n"
-        "- Report EXACT values, not approximations\n"
+        "- Be precise: match the expected format (e.g. rounded to N decimal places).\n"
+        "- Report EXACT values from code output, not approximations.\n"
+        + category_section
         + BENCH_HELPERS_PROMPT
     )
 
@@ -769,39 +921,58 @@ def _build_agentic_prompt(
                 preview = preview[:1500] + "\n... (truncated)"
             parts.append(f"```\n{preview}\n```")
 
+    # Add eval_mode hint so the agent knows what format is expected
+    eval_mode = question_row.get("eval_mode", "str_verifier")
+    if eval_mode == "range_verifier":
+        parts.append(
+            "\n## Answer Format\n"
+            "This question expects a PRECISE NUMERIC answer. You MUST:\n"
+            "1. First run your analysis code and print the result\n"
+            "2. VERIFY the result makes sense (check units, sign, magnitude)\n"
+            "3. If the question specifies a particular model or method (e.g., ordinal logistic regression, "
+            "DESeq2, chi-square), use EXACTLY that method\n"
+            "4. Report the exact value with full precision in <answer> tags\n"
+            "Do NOT give the answer on the same turn as your analysis code. "
+            "Wait for the output, verify it, THEN provide the answer."
+        )
+    elif eval_mode == "str_verifier":
+        parts.append(
+            "\n## Answer Format\n"
+            "This question expects an EXACT STRING answer. Match the expected format "
+            "precisely (e.g., gene names in correct case, exact numeric format)."
+        )
+
     parts.append(
         "\n## Instructions\n"
-        "Analyze the data files to answer the research question. "
-        "Start by exploring the data, then write code to compute the answer. "
+        "The pre-analysis output above already shows file contents and structure. "
+        "Go DIRECTLY to writing analysis code — do not waste a turn re-exploring files. "
         "Use <execute>...</execute> blocks for code and <answer>...</answer> "
-        "for your final answer."
+        "for your final answer. You have limited turns, so be efficient."
     )
     return "\n".join(parts)
 
 
 def _build_pre_analysis_code() -> str:
-    """Build thorough pre-analysis code for automatic data exploration."""
+    """Build targeted pre-analysis code — fast, focused, avoids printing too much."""
     return '''
 import os, json
 
-print("=== Available files ===")
+print("=== Files ===")
 all_files = sorted(os.listdir('.'))
 for f in all_files:
     if os.path.isdir(f):
         sub_files = os.listdir(f)
-        print(f"  {f}/ (directory, {len(sub_files)} items)")
-        for sf in sorted(sub_files)[:5]:
+        print(f"  {f}/ ({len(sub_files)} items)")
+        for sf in sorted(sub_files)[:3]:
             sf_path = os.path.join(f, sf)
             if os.path.isfile(sf_path):
                 print(f"    {sf} ({os.path.getsize(sf_path):,} bytes)")
-        if len(sub_files) > 5:
-            print(f"    ... and {len(sub_files) - 5} more")
+        if len(sub_files) > 3:
+            print(f"    ... and {len(sub_files) - 3} more")
         continue
-    size = os.path.getsize(f)
-    print(f"  {f} ({size:,} bytes)")
+    print(f"  {f} ({os.path.getsize(f):,} bytes)")
 
 print()
-
 import pandas as pd
 import numpy as np
 
@@ -812,99 +983,77 @@ for f in all_files:
     size = os.path.getsize(f)
 
     if ext in ('.csv', '.tsv'):
-        print(f"=== {f} (CSV/TSV) ===")
+        print(f"=== {f} ===")
         sep = '\\t' if ext == '.tsv' else ','
         try:
-            # For large files, preview first 100 rows
-            if size > 1_000_000:
-                df = pd.read_csv(f, sep=sep, nrows=100)
-                print(f"  NOTE: Large file ({size:,} bytes), showing preview of 100 rows")
+            if size > 5_000_000:
+                df = pd.read_csv(f, sep=sep, nrows=50)
+                total_rows = sum(1 for _ in open(f)) - 1
+                print(f"  Shape: (~{total_rows}, {df.shape[1]}) [large file, previewing 50 rows]")
             else:
                 df = pd.read_csv(f, sep=sep)
-            print(f"  Shape: {df.shape}")
+                print(f"  Shape: {df.shape}")
             print(f"  Columns: {list(df.columns)}")
-            print(f"  Dtypes:")
-            for col in df.columns:
-                print(f"    {col}: {df[col].dtype}")
-            # Summary stats for numeric columns
+            # Compact dtype + stats summary
             num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            str_cols = df.select_dtypes(include=['object']).columns.tolist()
             if num_cols:
-                print(f"  Numeric summary ({len(num_cols)} cols):")
-                for col in num_cols[:5]:
-                    print(f"    {col}: min={df[col].min():.4g}, max={df[col].max():.4g}, mean={df[col].mean():.4g}, nulls={df[col].isna().sum()}")
-                if len(num_cols) > 5:
-                    print(f"    ... and {len(num_cols) - 5} more numeric columns")
-            # Detect bioinformatics patterns
-            col_lower = [c.lower() for c in df.columns]
-            if any('gene' in c for c in col_lower):
-                print(f"  Detected: Gene-related data")
-            if any(c in ['logfc', 'log2foldchange', 'log2fc', 'foldchange'] for c in col_lower):
-                print(f"  Detected: Differential expression results")
-            if any(c in ['pvalue', 'p_value', 'pval', 'padj', 'fdr', 'adj.p.val'] for c in col_lower):
-                print(f"  Detected: Statistical test results")
-            print(f"  Head(3):")
-            print(df.head(3).to_string())
+                print(f"  Numeric ({len(num_cols)}): {num_cols[:8]}")
+                for col in num_cols[:3]:
+                    print(f"    {col}: min={df[col].min():.4g} max={df[col].max():.4g} mean={df[col].mean():.4g} nulls={df[col].isna().sum()}")
+            if str_cols:
+                print(f"  String ({len(str_cols)}): {str_cols[:8]}")
+                for col in str_cols[:2]:
+                    nuniq = df[col].nunique()
+                    examples = df[col].dropna().unique()[:4].tolist()
+                    print(f"    {col}: {nuniq} unique, e.g. {examples}")
+            print(f"  Head(2):")
+            print(df.head(2).to_string())
         except Exception as e:
-            print(f"  Error reading: {e}")
+            print(f"  Error: {e}")
         print()
 
     elif ext == '.json':
-        print(f"=== {f} (JSON) ===")
+        print(f"=== {f} ===")
         try:
             with open(f) as fh:
                 data = json.load(fh)
             if isinstance(data, list):
-                print(f"  List of {len(data)} items")
+                print(f"  List[{len(data)}]")
                 if data and isinstance(data[0], dict):
-                    print(f"  First item keys: {list(data[0].keys())}")
-                    print(f"  First item: {str(data[0])[:200]}")
+                    print(f"  Keys: {list(data[0].keys())}")
+                    print(f"  First: {str(data[0])[:200]}")
             elif isinstance(data, dict):
-                print(f"  Dict with {len(data)} keys: {list(data.keys())[:15]}")
-                for k in list(data.keys())[:3]:
-                    v = data[k]
-                    v_str = str(v)[:100]
-                    print(f"    {k}: {type(v).__name__} = {v_str}")
-            else:
-                print(f"  Type: {type(data).__name__}, value: {str(data)[:200]}")
+                print(f"  Dict[{len(data)}]: {list(data.keys())[:10]}")
+                for k in list(data.keys())[:2]:
+                    print(f"    {k}: {type(data[k]).__name__} = {str(data[k])[:80]}")
         except Exception as e:
-            print(f"  Error reading: {e}")
+            print(f"  Error: {e}")
+        print()
+
+    elif ext in ('.txt',) and size < 50000:
+        print(f"=== {f} ({size:,}b) ===")
+        try:
+            with open(f) as fh:
+                lines = fh.readlines()
+            print(f"  {len(lines)} lines")
+            for l in lines[:3]:
+                print(f"    {l.rstrip()[:120]}")
+        except Exception as e:
+            print(f"  Error: {e}")
         print()
 
     elif ext in ('.py', '.r', '.R'):
-        print(f"=== {f} (Script: {ext}) ===")
+        print(f"=== {f} (script) ===")
         try:
             with open(f) as fh:
                 content = fh.read()
             lines = content.split('\\n')
             print(f"  {len(lines)} lines")
-            # Extract imports and key function/variable definitions
-            imports = [l.strip() for l in lines if l.strip().startswith(('import ', 'from ', 'library(', 'require('))]
-            if imports:
-                print(f"  Imports: {imports[:5]}")
-            # Look for key patterns
-            if ext == '.py':
-                funcs = [l.strip() for l in lines if l.strip().startswith('def ')]
-                if funcs:
-                    print(f"  Functions: {funcs[:5]}")
-            print(f"  First 5 lines:")
-            for l in lines[:5]:
+            for l in lines[:3]:
                 print(f"    {l}")
         except Exception as e:
-            print(f"  Error reading: {e}")
-        print()
-
-    elif ext in ('.txt',) and size < 50000:
-        print(f"=== {f} (Text) ===")
-        try:
-            with open(f) as fh:
-                content = fh.read()
-            lines = content.split('\\n')
-            print(f"  {len(lines)} lines, {size:,} bytes")
-            print(f"  First 3 lines:")
-            for l in lines[:3]:
-                print(f"    {l[:120]}")
-        except Exception as e:
-            print(f"  Error reading: {e}")
+            print(f"  Error: {e}")
         print()
 '''
 
@@ -1038,7 +1187,8 @@ async def evaluate_question_agentic(
 
         # Build initial prompt
         initial_prompt = _build_agentic_prompt(question_row, capsule_files)
-        system_prompt = _build_agentic_system_prompt()
+        categories = question_row.get("categories", "")
+        system_prompt = _build_agentic_system_prompt(categories=categories)
         # Inject strategy into agentic system prompt
         if strategy_injection:
             system_prompt = system_prompt + strategy_injection
@@ -1069,13 +1219,16 @@ async def evaluate_question_agentic(
         pre_analysis_code = _build_pre_analysis_code()
         pre_analysis_output = execute_code(pre_analysis_code, str(capsule_path), timeout=30)
         if pre_analysis_output.strip():
-            # Truncate if too long
-            if len(pre_analysis_output) > 6000:
-                pre_analysis_output = pre_analysis_output[:4000] + "\n... (output truncated) ...\n" + pre_analysis_output[-1500:]
+            # Truncate if too long — keep it concise to save context window
+            if len(pre_analysis_output) > 4000:
+                pre_analysis_output = pre_analysis_output[:3000] + "\n... (truncated) ...\n" + pre_analysis_output[-800:]
             conversation[0] += (
                 f"\n\n## Pre-Analysis (auto-generated data exploration)\n"
                 f"```\n{pre_analysis_output}\n```"
             )
+
+        # Force-answer turn threshold — after this turn, we demand an answer
+        force_answer_turn = max(max_turns - 2, 3)  # e.g., turn 4 of 6
 
         for turn in range(max_turns):
             turns_used = turn + 1
@@ -1118,31 +1271,52 @@ async def evaluate_question_agentic(
                 logger.debug("Turn %d: Executing code (%d chars)", turn + 1, len(code))
                 output = execute_code(code, str(capsule_path))
                 # Truncate very long output
-                if len(output) > 8000:
-                    output = output[:4000] + "\n... (output truncated) ...\n" + output[-2000:]
+                if len(output) > 6000:
+                    output = output[:3000] + "\n... (output truncated) ...\n" + output[-1500:]
 
                 # Add to conversation — include self-correction nudge on errors
                 conversation.append(response_text)
                 if "Error:" in output or "Traceback" in output:
+                    error_suffix = (
+                        "**Your code produced an error.** Read the error and fix it.\n"
+                        "Common fixes: FileNotFoundError->os.listdir('.'), ImportError->alternative lib, "
+                        "KeyError->df.columns, ValueError->pd.to_numeric(errors='coerce').\n"
+                    )
+                    if turn + 1 >= force_answer_turn:
+                        error_suffix += (
+                            "\n**WARNING: You are running low on turns. "
+                            "Fix the error quickly or provide your best answer NOW in <answer>...</answer> tags.**"
+                        )
                     conversation.append(
-                        f"## Code Execution Output (Turn {turn + 1}):\n```\n{output}\n```\n\n"
-                        "**Your code produced an error.** Read the error message carefully and fix it.\n"
-                        "Common fixes:\n"
-                        "- FileNotFoundError: use os.listdir('.') to check available files\n"
-                        "- ImportError: try an alternative library\n"
-                        "- KeyError: print df.columns to check column names\n"
-                        "- TypeError: print df.dtypes to check types\n\n"
-                        "Fix the code and try again."
+                        f"## Output (Turn {turn + 1}):\n```\n{output}\n```\n\n{error_suffix}"
                     )
                 else:
-                    conversation.append(f"## Code Execution Output (Turn {turn + 1}):\n```\n{output}\n```\n\nContinue your analysis. If you have the answer, provide it in <answer>...</answer> tags.")
+                    # Successful execution
+                    if turn + 1 >= force_answer_turn:
+                        conversation.append(
+                            f"## Output (Turn {turn + 1}):\n```\n{output}\n```\n\n"
+                            "**You are running low on turns. Provide your final answer NOW "
+                            "in <answer>YOUR_ANSWER</answer> tags based on the results above. "
+                            "Copy the EXACT value from the output. Do NOT run more code.**"
+                        )
+                    else:
+                        conversation.append(
+                            f"## Output (Turn {turn + 1}):\n```\n{output}\n```\n\n"
+                            "Continue your analysis. If you have the answer, provide it in <answer>...</answer> tags."
+                        )
             else:
                 # No code and no answer — ask the agent to provide one
                 conversation.append(response_text)
-                conversation.append(
-                    "Please either write code in <execute>...</execute> blocks to analyze the data, "
-                    "or provide your final answer in <answer>...</answer> tags."
-                )
+                if turn + 1 >= force_answer_turn:
+                    conversation.append(
+                        "**You are running low on turns. Provide your final answer NOW "
+                        "in <answer>YOUR_ANSWER</answer> tags.**"
+                    )
+                else:
+                    conversation.append(
+                        "Please either write code in <execute>...</execute> blocks to analyze the data, "
+                        "or provide your final answer in <answer>...</answer> tags."
+                    )
 
         # If no answer tag found, try to extract from the last response
         if not answer_found:
@@ -1717,7 +1891,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                     execute_fn=lambda code: execute_code(code, str(capsule_path)),
                     max_steps=args.max_turns,
                     timeout_seconds=args.timeout,
-                    system_prompt=_build_agentic_system_prompt() + (current_strategy or ""),
+                    system_prompt=_build_agentic_system_prompt(categories=q.get("categories", "")) + (current_strategy or ""),
                 )
 
                 predicted = ca_result.answer

@@ -34,6 +34,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -167,11 +168,242 @@ def _is_refuse_choice(text: str) -> bool:
     return any(phrase in lower for phrase in REFUSE_PHRASES)
 
 
+def _detect_databases_in_question(question: str) -> list[str]:
+    """Detect which databases a question is asking about."""
+    q_lower = question.lower()
+    detected: list[str] = []
+    db_keywords = {
+        "disgenet": "DisGeNET",
+        "omim": "OMIM",
+        "uniprot": "UniProt",
+        "clinvar": "ClinVar",
+        "kegg": "KEGG",
+        "ensembl": "Ensembl",
+        "ncbi gene": "NCBI Gene",
+        "ncbi": "NCBI",
+        "gnomad": "gnomAD",
+        "mirbase": "miRBase",
+        "mirtarbase": "miRTarBase",
+        "gtrd": "GTRD",
+        "msigdb": "MSigDB",
+        "cosmic": "COSMIC",
+        "reactome": "Reactome",
+        "intact": "IntAct",
+        "biogrid": "BioGRID",
+        "string": "STRING",
+        "dbsnp": "dbSNP",
+        "chembl": "ChEMBL",
+    }
+    for kw, name in db_keywords.items():
+        if kw in q_lower:
+            detected.append(name)
+    return detected
+
+
+def _query_databases_for_choices(
+    question: str,
+    choices: list[tuple[str, str]],
+    subtask: str,
+) -> str:
+    """Query real databases for each answer choice BEFORE LLM calls.
+
+    Returns a formatted string of database results to inject into prompts.
+    This is the key optimization: giving the LLM real data instead of
+    relying on its training knowledge for obscure database entries.
+
+    Strategy: be SELECTIVE. Only query when the subtask/question clearly maps
+    to a database we can query. Noisy/irrelevant results hurt more than help.
+    """
+    from bench_helpers import (
+        query_gene_disease_association,
+        query_gene_location,
+        query_protein_function,
+        query_variant_significance,
+        compare_databases,
+    )
+
+    db_context_parts: list[str] = []
+    q_lower = question.lower()
+    detected_dbs = _detect_databases_in_question(question)
+
+    # Extract entity names from non-refuse choices
+    choice_entities = []
+    for letter, text in choices:
+        if not _is_refuse_choice(text):
+            choice_entities.append((letter, text.strip()))
+
+    def _safe_call(fn, *args, **kwargs):
+        """Call a DB helper, return result or empty dict on failure."""
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _summarize_gene_disease(result: dict) -> str:
+        """Extract a concise summary from gene-disease query results."""
+        gene = result.get("gene", "")
+        diseases = result.get("diseases_found", [])
+        if not diseases:
+            return f"'{gene}': No disease associations found in NCBI/UniProt/ClinVar"
+        sources = set()
+        disease_names = []
+        for d in diseases[:5]:
+            src = d.get("source", "")
+            if src:
+                sources.add(src)
+            dname = d.get("disease", "")
+            if dname and len(dname) < 100:
+                disease_names.append(dname)
+        return (
+            f"'{gene}': Found in {', '.join(sorted(sources))}. "
+            f"Associations: {'; '.join(disease_names[:3])}"
+        )
+
+    def _summarize_gene_location(result: dict) -> str:
+        """Extract concise location info."""
+        gene = result.get("gene", "")
+        chrom = result.get("chromosome", "")
+        band = result.get("band", "")
+        if not chrom and not band:
+            return f"'{gene}': Location not found"
+        loc = f"chr{chrom}" if chrom else ""
+        if band:
+            loc += f" ({band})" if loc else band
+        return f"'{gene}': {loc}"
+
+    def _summarize_variant(result: dict) -> str:
+        """Extract concise variant info."""
+        variant = result.get("variant", "")
+        sig = result.get("significance", "")
+        cond = result.get("condition", "")
+        if not sig or sig == "Not found in ClinVar":
+            return f"'{variant}': Not found in ClinVar"
+        parts = [f"'{variant}': {sig}"]
+        if cond:
+            parts.append(f"({cond})")
+        return " ".join(parts)
+
+    def _summarize_protein(result: dict) -> str:
+        """Extract concise protein function info."""
+        name = result.get("name", "")
+        func = result.get("function", "")
+        if not func or func == "Not found":
+            return f"'{name}': Not found in UniProt"
+        return f"'{name}': {func[:200]}"
+
+    # ---- Subtask-specific routing (be selective!) ----
+
+    # Gene-disease association tasks (dga_task)
+    # dga_task asks about DisGeNET vs OMIM — these are specialized databases
+    # that cannot be directly queried via free public APIs. Our proxy queries
+    # (NCBI, UniProt, ClinVar) return similar data for all choices and add noise.
+    # Skip DB queries for dga_task and rely on improved prompting instead.
+    if subtask in ("dga_task", "dga_task-v1-public"):
+        pass  # No DB queries — LLM knowledge is more reliable here
+
+    elif subtask in ("gene_disease_task",) and "DisGeNET" not in detected_dbs and "OMIM" not in detected_dbs:
+        for letter, entity in choice_entities:
+            result = _safe_call(query_gene_disease_association, entity)
+            db_context_parts.append(
+                f"  ({letter}) {_summarize_gene_disease(result)}"
+            )
+
+    # Gene location tasks
+    elif subtask == "gene_location_task" or "chromosome" in q_lower or "locus" in q_lower or "cytogenetic" in q_lower:
+        for letter, entity in choice_entities:
+            result = _safe_call(query_gene_location, entity)
+            db_context_parts.append(
+                f"  ({letter}) {_summarize_gene_location(result)}"
+            )
+
+    # Variant tasks
+    elif subtask == "variant_task" or "ClinVar" in detected_dbs or ("variant" in q_lower and ("pathogenic" in q_lower or "benign" in q_lower)):
+        for letter, entity in choice_entities:
+            result = _safe_call(query_variant_significance, entity)
+            db_context_parts.append(
+                f"  ({letter}) {_summarize_variant(result)}"
+            )
+
+    # miRNA target tasks — query PubMed for evidence
+    elif subtask == "mirna_target_task" or "miRTarBase" in detected_dbs or ("mirna" in q_lower and "target" in q_lower):
+        try:
+            from run_labbench import query_pubmed
+        except ImportError:
+            query_pubmed = None
+        if query_pubmed:
+            for letter, entity in choice_entities:
+                result = _safe_call(query_pubmed, f"miRNA target {entity}", 3)
+                abstracts = result[0].get("abstracts", "")[:300] if result else "No results"
+                db_context_parts.append(
+                    f"  ({letter}) PubMed search 'miRNA target {entity}': {abstracts}"
+                )
+
+    # Transcription factor binding site tasks
+    elif subtask == "tfbs_task" or "GTRD" in detected_dbs or "transcription factor" in q_lower:
+        try:
+            from run_labbench import query_pubmed
+        except ImportError:
+            query_pubmed = None
+        if query_pubmed:
+            for letter, entity in choice_entities:
+                result = _safe_call(query_pubmed, f"transcription factor binding {entity}", 3)
+                abstracts = result[0].get("abstracts", "")[:300] if result else "No results"
+                db_context_parts.append(
+                    f"  ({letter}) PubMed search 'TF binding {entity}': {abstracts}"
+                )
+
+    # Protein/UniProt tasks
+    elif "UniProt" in detected_dbs or subtask in ("protein_task",):
+        for letter, entity in choice_entities:
+            result = _safe_call(query_protein_function, entity)
+            db_context_parts.append(
+                f"  ({letter}) {_summarize_protein(result)}"
+            )
+
+    # For questions about specific databases we CAN query, do a general lookup
+    elif detected_dbs and "DisGeNET" not in detected_dbs and "OMIM" not in detected_dbs:
+        for letter, entity in choice_entities:
+            result = _safe_call(query_gene_disease_association, entity)
+            db_context_parts.append(
+                f"  ({letter}) {_summarize_gene_disease(result)}"
+            )
+
+    # No DB queries for unrecognized subtasks or DisGeNET/OMIM — avoid noise
+    # (the LLM's training knowledge is better than irrelevant proxy DB results)
+
+    if db_context_parts:
+        db_names = ", ".join(detected_dbs) if detected_dbs else "biological databases"
+        return (
+            f"\n=== DATABASE LOOKUP RESULTS ({db_names}) ===\n"
+            f"Live query results for each answer choice:\n"
+            + "\n".join(db_context_parts)
+            + "\n\nNOTE: These are real-time lookups via NCBI, UniProt, Ensembl, "
+            "and ClinVar APIs. An entity with 'Not found' likely has limited "
+            "presence in that database. Use this to distinguish between choices.\n"
+            "=== END DATABASE RESULTS ===\n"
+        )
+    return ""
+
+
+async def _query_databases_for_choices_async(
+    question: str,
+    choices: list[tuple[str, str]],
+    subtask: str,
+) -> str:
+    """Run DB queries in a thread pool to avoid blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return await loop.run_in_executor(
+            pool, _query_databases_for_choices, question, choices, subtask,
+        )
+
+
 def _build_evidence_prompt(
     question: str,
     choices: list[tuple[str, str]],
     subtask: str,
     db_helpers_available: bool,
+    db_context: str = "",
 ) -> str:
     """Build the Phase 2 evidence-collection prompt."""
     choices_block = _format_choices_block(choices)
@@ -188,6 +420,14 @@ def _build_evidence_prompt(
     if subtask:
         subtask_hint = f"\n\nQuestion domain/subtask: {subtask}"
 
+    db_results_section = ""
+    if db_context:
+        db_results_section = f"""
+{db_context}
+Use the database results above as ADDITIONAL evidence to cross-check your knowledge.
+If a choice entity was NOT found in a relevant database, that is significant evidence.
+"""
+
     return f"""You are an expert biomedical researcher evaluating a multiple-choice question.
 For EACH answer choice, provide evidence supporting or contradicting it.
 
@@ -195,7 +435,7 @@ Question: {question}
 
 Answer choices:
 {choices_block}
-{subtask_hint}{db_hint}
+{subtask_hint}{db_hint}{db_results_section}
 
 IMPORTANT: "Insufficient information" is almost never the correct answer (<10% of questions).
 Prefer a specific, evidence-backed answer.
@@ -214,14 +454,16 @@ Return your analysis as a JSON array (one object per choice):
 ]
 ```
 
-Be thorough and specific. Reference actual database entries, gene functions,
-pathway memberships, variant classifications, or published findings when possible."""
+Be thorough and specific. Reference the database query results above when available.
+Cross-check against actual database entries, gene functions, pathway memberships,
+variant classifications, or published findings."""
 
 
 def _build_independent_verifier_prompt(
     question: str,
     choices: list[tuple[str, str]],
     subtask: str,
+    db_context: str = "",
 ) -> str:
     """Build the Phase 2 independent-verifier prompt.
 
@@ -230,6 +472,12 @@ def _build_independent_verifier_prompt(
     """
     choices_block = _format_choices_block(choices)
 
+    db_section = ""
+    if db_context:
+        db_section = f"""
+{db_context}
+"""
+
     return f"""You are an expert biomedical scientist. Answer this multiple-choice question
 using your deep knowledge of biological databases and molecular biology.
 
@@ -237,7 +485,7 @@ Question: {question}
 
 Choices:
 {choices_block}
-
+{db_section}
 Think step by step:
 1. What specific database(s) or biological domain is this question about?
 2. What do you know about each entity/gene/protein/variant mentioned?
@@ -314,6 +562,7 @@ def _build_falsification_prompt(
     top_answer: str,
     top_answer_text: str,
     hypotheses: list[HypothesisEvidence],
+    db_context: str = "",
 ) -> str:
     """Build the Phase 4 falsification prompt."""
     choices_block = _format_choices_block(choices)
@@ -324,6 +573,18 @@ def _build_falsification_prompt(
         if h.answer != top_answer and not _is_refuse_choice(h.answer_text):
             alternatives.append(f"  ({h.answer}) {h.answer_text} [confidence: {h.confidence:.2f}]")
     alternatives_block = "\n".join(alternatives) if alternatives else "  (none)"
+
+    db_section = ""
+    if db_context:
+        db_section = f"""
+
+{db_context}
+
+Use the database results above to check whether the proposed answer is actually
+correct according to real database entries. Pay special attention to:
+- Whether the proposed entity actually appears in the database the question asks about
+- Whether an alternative entity has stronger database evidence
+"""
 
     return f"""You are a scientific critic whose job is to FALSIFY a proposed answer.
 
@@ -336,7 +597,7 @@ The proposed answer is: ({top_answer}) {top_answer_text}
 
 Alternative candidates:
 {alternatives_block}
-
+{db_section}
 Your task — ACTIVELY TRY TO PROVE THE PROPOSED ANSWER WRONG:
 1. What specific biological facts or database entries would make ({top_answer}) incorrect?
 2. Is there a known exception, edge case, or database inconsistency that applies here?
@@ -645,14 +906,42 @@ async def evaluate_with_yohas(
             "miRTarBase, GTRD, dbSNP, Reactome, ChEMBL, and COSMIC."
         )
 
+        # === PRE-LLM DATABASE QUERIES ===
+        # Query actual databases BEFORE any LLM calls so we can feed
+        # real data into the prompts. This is the key accuracy boost.
+        db_context = ""
+        try:
+            db_context = await _query_databases_for_choices_async(
+                question, choices, subtask,
+            )
+            if db_context:
+                logger.info(
+                    "DB queries returned %d chars of context for %d choices",
+                    len(db_context), len(choices),
+                )
+                all_reasoning.append(
+                    f"[Phase 2 - DB Queries] Retrieved {len(db_context)} chars "
+                    f"of real database results before LLM calls"
+                )
+            else:
+                all_reasoning.append(
+                    "[Phase 2 - DB Queries] No database results retrieved"
+                )
+        except Exception as exc:
+            logger.warning("Pre-LLM database queries failed: %s", exc)
+            all_reasoning.append(
+                f"[Phase 2 - DB Queries] FAILED: {exc}"
+            )
+
         # Agent 1: Evidence Collector
         evidence_prompt = _build_evidence_prompt(
             question, choices, subtask, db_helpers is not None,
+            db_context=db_context,
         )
 
         # Agent 2: Independent Verifier
         verifier_prompt = _build_independent_verifier_prompt(
-            question, choices, subtask,
+            question, choices, subtask, db_context=db_context,
         )
 
         # Run both agents in parallel
@@ -883,6 +1172,7 @@ async def evaluate_with_yohas(
             if not _is_refuse_choice(top_text):
                 falsify_prompt = _build_falsification_prompt(
                     question, choices, top_answer, top_text, hypotheses,
+                    db_context=db_context,
                 )
                 falsify_resp = await _query(
                     falsify_prompt, system=system_prompt, max_tokens=2048,
