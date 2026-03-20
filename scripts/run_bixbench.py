@@ -100,13 +100,13 @@ VERIFIED50_JSONL = DATA_DIR / "BixBench-Verified-50.jsonl"
 # HuggingFace capsule download URL pattern
 CAPSULE_HF_URL_TEMPLATE = (
     "https://huggingface.co/datasets/futurehouse/BixBench"
-    "/resolve/main/capsules/{data_folder}"
+    "/resolve/main/{data_folder}"
 )
 
 # Verified-50 capsule URL template (may share capsules or have its own)
 VERIFIED50_CAPSULE_HF_URL_TEMPLATE = (
     "https://huggingface.co/datasets/phylobio/BixBench-Verified-50"
-    "/resolve/main/capsules/{data_folder}"
+    "/resolve/main/{data_folder}"
 )
 
 COMPETITOR_BASELINE = {"Biomni A1": 0.522, "K-Dense Verified-50": 0.90}
