@@ -51,6 +51,7 @@ from benchmark_strategy import (
     detect_databases_from_text,
     detect_question_type,
 )
+from bench_helpers import BENCH_HELPERS, BENCH_HELPERS_PROMPT
 
 # ---------------------------------------------------------------------------
 # Path setup — ensure backend is importable
@@ -382,6 +383,9 @@ def execute_code(code: str, data_dir: str, timeout: int = CODE_EXEC_TIMEOUT_SECO
     except ImportError:
         pass
 
+    # Inject bench_helpers (sequence, DB, stats functions)
+    namespace.update(BENCH_HELPERS)
+
     old_cwd = os.getcwd()
     os.chdir(data_dir)
     try:
@@ -688,6 +692,7 @@ def _build_agentic_system_prompt() -> str:
         "- If a computation fails, READ THE ERROR and fix your code\n"
         "- If data doesn't match expectations, adapt your approach\n"
         "- Report EXACT values, not approximations\n"
+        + BENCH_HELPERS_PROMPT
     )
 
 
@@ -1623,6 +1628,8 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     mode_label = args.mode
     if args.mode == "agentic":
         mode_label = f"agentic (max_turns={args.max_turns}, trials={num_trials})"
+    elif args.mode == "codeact":
+        mode_label = f"codeact (max_steps={args.max_turns})"
     if num_replicas > 1:
         mode_label += f", replicas={num_replicas}"
 
@@ -1669,6 +1676,75 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                 model=resolved_model,
             )
             results.append(result)
+        elif args.mode == "codeact":
+            # CodeAct plan-code-execute-observe loop
+            from codeact_loop import codeact_evaluate as _codeact_eval
+
+            # Download/extract capsule
+            capsule_path = ensure_capsule(q, dataset=dataset_variant)
+            if capsule_path is None:
+                # Fall back to zero-shot open mode
+                logger.warning("No capsule for %s, falling back to zero-shot", qid)
+                result = await evaluate_question(q, llm, mode="open", timeout_seconds=args.timeout, model=resolved_model, strategy_injection=current_strategy)
+                result["mode"] = "codeact-fallback"
+                results.append(result)
+            else:
+                capsule_files = list_capsule_files(capsule_path)
+                # Build data context from file listing
+                ctx_parts = ["## Available Data Files"]
+                for finfo in capsule_files:
+                    ctx_parts.append(f"\n### {finfo['path']} ({finfo['size']})")
+                    if "preview" in finfo:
+                        preview = finfo["preview"]
+                        if len(preview) > 1500:
+                            preview = preview[:1500] + "\n... (truncated)"
+                        ctx_parts.append(f"```\n{preview}\n```")
+                data_context = "\n".join(ctx_parts)
+
+                # Run pre-analysis to give the agent initial data exploration
+                pre_code = _build_pre_analysis_code()
+                pre_output = execute_code(pre_code, str(capsule_path), timeout=30)
+                if pre_output.strip():
+                    if len(pre_output) > 6000:
+                        pre_output = pre_output[:4000] + "\n... (truncated) ...\n" + pre_output[-1500:]
+                    data_context += f"\n\n## Pre-Analysis (auto-generated data exploration)\n```\n{pre_output}\n```"
+
+                ca_result = await _codeact_eval(
+                    question=q["question"],
+                    context=data_context,
+                    llm=llm,
+                    model=resolved_model or "",
+                    execute_fn=lambda code: execute_code(code, str(capsule_path)),
+                    max_steps=args.max_turns,
+                    timeout_seconds=args.timeout,
+                    system_prompt=_build_agentic_system_prompt() + (current_strategy or ""),
+                )
+
+                predicted = ca_result.answer
+                duration_ms = ca_result.total_duration_ms
+                correct = await grade_answer(predicted, q, llm=llm)
+
+                result = {
+                    "question_id": qid,
+                    "question": q["question"][:200],
+                    "hypothesis": q.get("hypothesis", "")[:200],
+                    "ideal": str(q.get("ideal", "")),
+                    "predicted": predicted,
+                    "correct": correct,
+                    "eval_mode": q.get("eval_mode", "str_verifier"),
+                    "categories": q.get("categories", ""),
+                    "tokens_used": ca_result.total_tokens,
+                    "duration_ms": duration_ms,
+                    "mode": "codeact",
+                    "turns_used": len(ca_result.steps),
+                    "code_executions": ca_result.code_executions,
+                    "code_errors": ca_result.code_errors,
+                    "confidence": ca_result.confidence,
+                    "capsule_uuid": q.get("capsule_uuid", ""),
+                    "raw_response": ca_result.plan[:500],
+                    "error": None,
+                }
+                results.append(result)
         elif args.mode == "yohas":
             # Full YOHAS 4-phase pipeline (hypothesize -> investigate -> synthesize -> falsify)
             from yohas_bench_eval import evaluate_with_yohas as _yohas_eval
@@ -1795,7 +1871,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         tokens = result.get("tokens_used", 0)  # type: ignore[union-attr]
         error_flag = " [ERROR]" if result.get("error") else ""  # type: ignore[union-attr]
         turns_info = ""
-        if args.mode == "agentic":
+        if args.mode in ("agentic", "codeact"):
             turns_info = f" turns={result.get('turns_used', '?')}"  # type: ignore[union-attr]
             if num_trials > 1:
                 turns_info += f" trial={result.get('trial', '?')}"  # type: ignore[union-attr]
@@ -1870,9 +1946,10 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     print(f"  Mode:      {args.mode}")
     print(f"  Model:     {model_display}")
     print(f"  Dataset:   {dataset_variant}")
-    if args.mode == "agentic":
+    if args.mode in ("agentic", "codeact"):
         print(f"  Max turns: {args.max_turns}")
-        print(f"  Trials:    {num_trials}")
+        if args.mode == "agentic":
+            print(f"  Trials:    {num_trials}")
     if num_replicas > 1:
         print(f"  Replicas:  {num_replicas} (majority voting)")
     print(f"  Total:     {final_total}")
@@ -1920,6 +1997,20 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         if fallback_results:
             print(f"    Fallback (no capsule): {len(fallback_results)} questions")
 
+    # CodeAct-specific stats
+    if args.mode == "codeact":
+        codeact_results = [r for r in results if r.get("mode") == "codeact"]
+        ca_fallback = [r for r in results if r.get("mode") == "codeact-fallback"]
+        if codeact_results:
+            avg_steps = sum(r.get("turns_used", 0) for r in codeact_results) / len(codeact_results)
+            total_execs = sum(r.get("code_executions", 0) for r in codeact_results)
+            total_errs = sum(r.get("code_errors", 0) for r in codeact_results)
+            print(f"\n  CodeAct stats:")
+            print(f"    Full codeact: {len(codeact_results)} questions (avg {avg_steps:.1f} steps)")
+            print(f"    Code executions: {total_execs} ({total_errs} errors)")
+        if ca_fallback:
+            print(f"    Fallback (no capsule): {len(ca_fallback)} questions")
+
     print(f"\n  Results saved to: {results_path}")
     print("=" * 70)
 
@@ -1953,9 +2044,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--mode",
-        choices=["open", "mcq", "agentic", "yohas"],
+        choices=["open", "mcq", "agentic", "yohas", "codeact"],
         default="agentic",
-        help="Answer mode: 'open' (free-form), 'mcq' (multiple choice), 'agentic' (code execution), or 'yohas' (full YOHAS 4-phase pipeline). Default: agentic",
+        help="Answer mode: 'open' (free-form), 'mcq' (multiple choice), 'agentic' (code execution), 'yohas' (full YOHAS 4-phase pipeline), or 'codeact' (plan-code-execute-observe loop). Default: agentic",
     )
     p.add_argument(
         "--model",

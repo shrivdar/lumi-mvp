@@ -49,6 +49,7 @@ from benchmark_strategy import (
     detect_databases_from_text,
     detect_question_type,
 )
+from bench_helpers import BENCH_HELPERS, BENCH_HELPERS_PROMPT
 
 # ---------------------------------------------------------------------------
 # Path setup — must happen before any backend imports
@@ -828,7 +829,7 @@ DB_HELPERS_PROMPT_BLOCK = (
     "- query_ensembl_gene(\"KRAS\") -> Ensembl gene info with coordinates\n"
     "- query_string_interactions(\"TP53\") -> STRING protein interactions\n\n"
     "USE THESE FUNCTIONS. They work reliably. Do NOT try to construct API URLs yourself."
-)
+) + BENCH_HELPERS_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -1009,6 +1010,9 @@ def execute_code_safely(
 
     # Inject pre-built database query helpers
     namespace.update(DB_QUERY_HELPERS)
+
+    # Inject bench_helpers (sequence, DB, stats functions)
+    namespace.update(BENCH_HELPERS)
 
     f = io.StringIO()
 
@@ -2074,12 +2078,17 @@ async def run_evaluation(
 
     use_yohas = mode == "yohas"
     use_agentic = mode == "agentic"
+    use_codeact = mode == "codeact"
     use_multitrial = trials > 1
     use_voting = replicas > 1
 
     # Lazy-import YOHAS evaluator only when needed
     if use_yohas:
         from yohas_bench_eval import evaluate_mcq_with_yohas
+
+    # Lazy-import CodeAct evaluator only when needed
+    if use_codeact:
+        from codeact_loop import codeact_evaluate
 
     for idx, question in enumerate(remaining):
         question_num = len(results) + 1
@@ -2115,6 +2124,58 @@ async def run_evaluation(
 
             if dry_run:
                 result = evaluate_question_dry(question)
+            elif use_codeact:
+                # CodeAct plan-code-execute-observe loop
+                choices_ca, correct_letter_ca, refuse_letter_ca = build_choices(question)
+                choices_block = "\n".join(choices_ca)
+                formatted_question = (
+                    f"{question.question}\n\n"
+                    f"Choose the best answer:\n{choices_block}\n\n"
+                    f"After your analysis, provide your final answer letter "
+                    f"(A, B, C, ...) in <answer> tags like: <answer>B</answer>"
+                )
+                ca_system = _get_agentic_system_prompt(question.bench_subtask)
+                if current_strategy:
+                    ca_system += current_strategy
+
+                ca_result = await codeact_evaluate(
+                    question=formatted_question,
+                    context=question.context or "",
+                    llm=llm,
+                    model=model_name,
+                    execute_fn=lambda code: execute_code_safely(
+                        code, timeout=30,
+                        seqqa_mode=(question.bench_subtask == "seqqa"),
+                    ),
+                    max_steps=max_turns,
+                    timeout_seconds=timeout_seconds,
+                    system_prompt=ca_system,
+                    helper_functions_doc=DB_HELPERS_PROMPT_BLOCK,
+                )
+
+                # Extract letter from the CodeAct answer
+                predicted_letter = extract_answer_letter(ca_result.answer)
+                if not predicted_letter:
+                    # Try to find a letter directly in the answer string
+                    letter_match = re.search(r"\b([A-H])\b", ca_result.answer)
+                    predicted_letter = letter_match.group(1) if letter_match else ""
+
+                result = ScoredResult(
+                    question_id=question.id,
+                    subtask=question.subtask,
+                    predicted=predicted_letter,
+                    predicted_text=_get_choice_text(choices_ca, predicted_letter),
+                    correct_answer=correct_letter_ca,
+                    correct_text=question.correct_answer,
+                    is_correct=predicted_letter == correct_letter_ca,
+                    is_refused=predicted_letter == refuse_letter_ca,
+                    reasoning=f"CodeAct loop: {ca_result.code_executions} code executions, "
+                              f"{ca_result.code_errors} errors, {len(ca_result.steps)} steps",
+                    tokens_used=ca_result.total_tokens,
+                    latency_ms=ca_result.total_duration_ms,
+                    error=None if predicted_letter else "no_answer",
+                    bench_subtask=question.bench_subtask,
+                )
             elif use_yohas:
                 # Full YOHAS 4-phase pipeline (hypothesize -> investigate -> synthesize -> falsify)
                 choices_list, correct_letter_y, refuse_letter_y = build_choices(question)
@@ -2407,6 +2468,7 @@ def main() -> None:
             "  python scripts/run_labbench.py --subtask litqa2 --limit 5 --mode agentic\n"
             "  python scripts/run_labbench.py --subtask all --limit 10 --dry-run\n"
             "  python scripts/run_labbench.py --subtask dbqa --replicas 3 --limit 5\n"
+            "  python scripts/run_labbench.py --subtask dbqa --mode codeact --model sonnet --limit 1\n"
             "  python scripts/run_labbench.py --subtask dbqa --mode yohas --model opus --limit 5\n"
         ),
     )
@@ -2420,8 +2482,8 @@ def main() -> None:
         "--mode",
         type=str,
         default="zero-shot",
-        choices=["zero-shot", "agentic", "yohas"],
-        help="Evaluation mode: zero-shot (single LLM call), agentic (multi-turn with code execution), or yohas (full YOHAS 4-phase pipeline)",
+        choices=["zero-shot", "agentic", "yohas", "codeact"],
+        help="Evaluation mode: zero-shot (single LLM call), agentic (multi-turn with code execution), yohas (full YOHAS 4-phase pipeline), or codeact (plan-code-execute-observe loop)",
     )
     parser.add_argument(
         "--model",

@@ -1,8 +1,13 @@
 """YOHAS-powered benchmark evaluation using the full architecture.
 
-Runs each benchmark question through a 4-phase pipeline that mirrors the
-core YOHAS research loop — Hypothesize, Investigate, Synthesize, Falsify —
-adapted for single-question answering.
+Runs each benchmark question through a 6-phase pipeline that mirrors the
+core YOHAS research loop — Hypothesize, Investigate, Code Review, Science
+Review, Synthesize, Falsify — adapted for single-question answering.
+
+The dual-review validation (phases 3-4) is inspired by K-Dense's approach
+to BixBench: two review agents validate every result before synthesis.
+The Code Review agent checks technical correctness while the Science Review
+agent validates methodology and biological reasoning.
 
 Usage from other benchmark runners::
 
@@ -17,9 +22,9 @@ Usage from other benchmark runners::
     )
     print(result.predicted, result.confidence)
 
-Each evaluation uses 3-5 LLM calls (vs 1 for zero-shot) but should be
-significantly more accurate thanks to multi-hypothesis investigation and
-active falsification.
+Each evaluation uses 5-7 LLM calls (vs 1 for zero-shot) but should be
+significantly more accurate thanks to multi-hypothesis investigation,
+dual-review validation, and active falsification.
 """
 
 from __future__ import annotations
@@ -352,6 +357,198 @@ Be rigorous. A good scientist tries hard to disprove their hypothesis."""
 
 
 # ---------------------------------------------------------------------------
+# Dual-review validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_code_blocks(text: str) -> list[str]:
+    """Extract Python code blocks from LLM output."""
+    blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
+    return [b.strip() for b in blocks if b.strip()]
+
+
+def _extract_code_outputs(text: str) -> list[str]:
+    """Extract code output sections from LLM output."""
+    outputs = re.findall(r"(?:Output|Result|>>>)\s*:?\s*\n?(.*?)(?=\n```|\n##|\Z)", text, re.DOTALL)
+    return [o.strip() for o in outputs if o.strip()]
+
+
+def parse_json_safe(text: str) -> dict:
+    """Parse JSON from LLM response, returning empty dict on failure."""
+    result = _extract_json_from_response(text)
+    if isinstance(result, dict):
+        return result
+    return {}
+
+
+async def _code_review(
+    query_fn,
+    question: str,
+    agent_output: str,
+    code_blocks: list[str],
+    code_outputs: list[str],
+) -> dict:
+    """Review the technical quality of code execution and results.
+
+    Args:
+        query_fn: Async callable wrapping llm.query with token tracking.
+        question: The benchmark question text.
+        agent_output: The agent's conclusion text.
+        code_blocks: List of code snippets the agent executed.
+        code_outputs: Corresponding outputs for each code block.
+
+    Returns:
+        Dict with keys: approved (bool), issues (list[str]),
+        corrected_answer (str|None), confidence (float).
+    """
+    if not code_blocks:
+        # Nothing to review — auto-approve
+        return {"approved": True, "issues": [], "corrected_answer": None, "confidence": 1.0}
+
+    code_section = "\n\n".join(
+        f"```python\n{c}\n```\nOutput: {o}"
+        for c, o in zip(code_blocks, code_outputs or ["(no output)"] * len(code_blocks))
+    )
+
+    prompt = f"""You are a senior bioinformatics code reviewer. Review this analysis:
+
+QUESTION: {question}
+
+CODE EXECUTED:
+{code_section}
+
+AGENT'S CONCLUSION: {agent_output[:1500]}
+
+Review checklist:
+1. Does the code correctly load and parse data?
+2. Are the right variables/columns being analyzed?
+3. Is the statistical test appropriate for this question type?
+4. Are there any off-by-one errors or indexing issues?
+5. Does the output match what the agent claims?
+6. Are edge cases handled (missing data, NaN values, empty results)?
+
+Return JSON only (no other text):
+{{"approved": true, "issues": [], "corrected_answer": null, "confidence": 0.95}}
+
+If problems found:
+{{"approved": false, "issues": ["specific problem 1", "specific problem 2"], "corrected_answer": "X", "confidence": 0.4}}"""
+
+    resp = await query_fn(prompt, max_tokens=500)
+    result = parse_json_safe(resp.text)
+    # Ensure expected keys exist
+    result.setdefault("approved", True)
+    result.setdefault("issues", [])
+    result.setdefault("corrected_answer", None)
+    result.setdefault("confidence", 0.5)
+    return result
+
+
+async def _science_review(
+    query_fn,
+    question: str,
+    choices: list[tuple[str, str]],
+    evidence_summary: str,
+    proposed_answer: str,
+) -> dict:
+    """Review scientific methodology and reasoning.
+
+    Args:
+        query_fn: Async callable wrapping llm.query with token tracking.
+        question: The benchmark question text.
+        choices: Answer choices as (letter, text) tuples.
+        evidence_summary: Truncated summary of evidence collected.
+        proposed_answer: The current best answer letter.
+
+    Returns:
+        Dict with keys: approved (bool), scientific_issues (list[str]),
+        recommended_answer (str), confidence (float), reasoning (str).
+    """
+    choices_block = _format_choices_block(choices)
+
+    prompt = f"""You are a PhD-level biomedical scientist reviewing a research analysis.
+
+QUESTION: {question}
+CHOICES:
+{choices_block}
+PROPOSED ANSWER: {proposed_answer}
+EVIDENCE COLLECTED: {evidence_summary[:3000]}
+
+Scientific review checklist:
+1. Is the biological reasoning sound?
+2. Is the proposed answer consistent with known biology?
+3. Could any of the other answer choices be more correct?
+4. Are there any logical fallacies in the reasoning?
+5. Does the evidence actually support the proposed answer?
+6. Are there confounding factors not considered?
+
+Return JSON only (no other text):
+{{"approved": true, "scientific_issues": [], "recommended_answer": "{proposed_answer}", "confidence": 0.9, "reasoning": "brief explanation"}}
+
+If problems found:
+{{"approved": false, "scientific_issues": ["issue 1"], "recommended_answer": "X", "confidence": 0.6, "reasoning": "why the answer should change"}}"""
+
+    resp = await query_fn(prompt, max_tokens=500)
+    result = parse_json_safe(resp.text)
+    # Ensure expected keys exist
+    result.setdefault("approved", True)
+    result.setdefault("scientific_issues", [])
+    result.setdefault("recommended_answer", proposed_answer)
+    result.setdefault("confidence", 0.5)
+    result.setdefault("reasoning", "")
+    return result
+
+
+async def _code_review_with_retry(
+    query_fn,
+    question: str,
+    agent_output: str,
+    code_blocks: list[str],
+    code_outputs: list[str],
+    max_attempts: int = 3,
+) -> dict:
+    """Run code review with iterative correction on failure.
+
+    If the code review finds issues, asks the LLM to fix them and re-reviews
+    up to *max_attempts* times.
+
+    Returns the final review dict (approved may still be False if all retries fail).
+    """
+    current_blocks = list(code_blocks)
+    current_outputs = list(code_outputs)
+    current_output_text = agent_output
+
+    for attempt in range(max_attempts):
+        review = await _code_review(
+            query_fn, question, current_output_text, current_blocks, current_outputs,
+        )
+        if review.get("approved"):
+            review["_attempts"] = attempt + 1
+            return review
+
+        # Ask LLM to fix the identified issues
+        issues_text = "; ".join(review.get("issues", ["unknown issue"]))
+        fix_prompt = (
+            f"Your code analysis had these issues: {issues_text}\n\n"
+            f"Original question: {question}\n\n"
+            f"Fix the problems and provide corrected code and conclusions. "
+            f"Be specific about what changed."
+        )
+        fix_resp = await query_fn(fix_prompt, max_tokens=1500)
+        fixed_text = fix_resp.text
+
+        # Extract corrected code blocks and outputs for the next review round
+        new_blocks = _extract_code_blocks(fixed_text)
+        if new_blocks:
+            current_blocks = new_blocks
+            current_outputs = _extract_code_outputs(fixed_text) or ["(re-executed)"] * len(new_blocks)
+        current_output_text = fixed_text
+
+    # All retries exhausted — return last review
+    review["_attempts"] = max_attempts
+    return review
+
+
+# ---------------------------------------------------------------------------
 # Core evaluation function
 # ---------------------------------------------------------------------------
 
@@ -376,8 +573,10 @@ async def evaluate_with_yohas(
     Phases:
       1. HYPOTHESIZE — each answer choice becomes a hypothesis
       2. INVESTIGATE — parallel agents collect evidence for/against + verify independently
-      3. SYNTHESIZE — weigh evidence, rank hypotheses, pick top answer
-      4. FALSIFY — actively try to disprove the top answer; switch if counter-evidence is strong
+      3. CODE REVIEW — technical validation of any code executed during investigation
+      4. SCIENCE REVIEW — scientific methodology validation of proposed answer
+      5. SYNTHESIZE — weigh all evidence + review feedback, pick top answer
+      6. FALSIFY — actively try to disprove the top answer; switch if counter-evidence is strong
 
     Args:
         question: The question text.
@@ -530,7 +729,106 @@ async def evaluate_with_yohas(
         phases.append("investigate")
 
         # ================================================================
-        # Phase 3: SYNTHESIZE
+        # Phase 3: CODE REVIEW
+        # ================================================================
+        # Collect any code blocks and outputs from the investigation phase
+        investigation_text = ""
+        if not isinstance(evidence_resp, Exception):
+            investigation_text = evidence_resp.text
+        all_code_blocks = _extract_code_blocks(investigation_text)
+        all_code_outputs = _extract_code_outputs(investigation_text)
+
+        code_review_result: dict = {"approved": True, "issues": [], "corrected_answer": None, "confidence": 1.0}
+        if all_code_blocks:
+            try:
+                code_review_result = await _code_review_with_retry(
+                    _query, question, investigation_text, all_code_blocks, all_code_outputs,
+                    max_attempts=3,
+                )
+                all_reasoning.append(
+                    f"[Phase 3 - Code Review] approved={code_review_result.get('approved')}, "
+                    f"issues={code_review_result.get('issues', [])}, "
+                    f"attempts={code_review_result.get('_attempts', 1)}"
+                )
+                # If code review suggests a corrected answer, apply it
+                corrected = code_review_result.get("corrected_answer")
+                if corrected and _get_hypothesis(hypotheses, str(corrected).upper()):
+                    ch = _get_hypothesis(hypotheses, str(corrected).upper())
+                    if ch is not None:
+                        ch.supporting_evidence.append("Code review corrected answer to this choice")
+                        ch.confidence = min(1.0, ch.confidence + 0.1)
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning("Code review failed: %s", exc)
+                all_reasoning.append(f"[Phase 3 - Code Review] FAILED: {exc}")
+        else:
+            all_reasoning.append("[Phase 3 - Code Review] No code blocks found — skipped")
+
+        phases.append("code_review")
+
+        # ================================================================
+        # Phase 4: SCIENCE REVIEW
+        # ================================================================
+        # Determine the current best answer before science review
+        pre_review_ranked = sorted(
+            [h for h in hypotheses if not _is_refuse_choice(h.answer_text)],
+            key=lambda h: h.confidence,
+            reverse=True,
+        )
+        pre_review_answer = pre_review_ranked[0].answer if pre_review_ranked else ""
+
+        # Build a compact evidence summary for the science reviewer
+        evidence_summary_parts = []
+        for h in hypotheses:
+            sup = "; ".join(h.supporting_evidence) if h.supporting_evidence else "None"
+            ctr = "; ".join(h.counter_evidence) if h.counter_evidence else "None"
+            evidence_summary_parts.append(
+                f"({h.answer}) {h.answer_text}: FOR=[{sup}] AGAINST=[{ctr}] conf={h.confidence:.2f}"
+            )
+        evidence_summary_text = "\n".join(evidence_summary_parts)
+
+        science_review_result: dict = {"approved": True, "scientific_issues": [], "recommended_answer": pre_review_answer, "confidence": 0.5, "reasoning": ""}
+        if pre_review_answer:
+            try:
+                science_review_result = await _science_review(
+                    _query, question, choices, evidence_summary_text, pre_review_answer,
+                )
+                all_reasoning.append(
+                    f"[Phase 4 - Science Review] approved={science_review_result.get('approved')}, "
+                    f"recommended={science_review_result.get('recommended_answer')}, "
+                    f"issues={science_review_result.get('scientific_issues', [])}"
+                )
+                # If science review recommends a different answer, boost that hypothesis
+                rec_answer = str(science_review_result.get("recommended_answer", "")).upper()
+                if not science_review_result.get("approved") and rec_answer and rec_answer != pre_review_answer:
+                    rh = _get_hypothesis(hypotheses, rec_answer)
+                    if rh is not None:
+                        rh.supporting_evidence.append(
+                            f"Science review recommended this answer: {science_review_result.get('reasoning', '')[:200]}"
+                        )
+                        rh.confidence = min(1.0, rh.confidence + 0.2)
+                        # Reduce confidence in the originally proposed answer
+                        orig_h = _get_hypothesis(hypotheses, pre_review_answer)
+                        if orig_h is not None:
+                            orig_h.counter_evidence.append(
+                                f"Science review rejected: {'; '.join(science_review_result.get('scientific_issues', []))}"
+                            )
+                            orig_h.confidence = max(0.0, orig_h.confidence - 0.15)
+                elif science_review_result.get("approved"):
+                    # Boost confidence for the approved answer
+                    ah = _get_hypothesis(hypotheses, pre_review_answer)
+                    if ah is not None:
+                        ah.supporting_evidence.append("Science review approved this answer")
+                        ah.confidence = min(1.0, ah.confidence + 0.1)
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning("Science review failed: %s", exc)
+                all_reasoning.append(f"[Phase 4 - Science Review] FAILED: {exc}")
+        else:
+            all_reasoning.append("[Phase 4 - Science Review] No proposed answer — skipped")
+
+        phases.append("science_review")
+
+        # ================================================================
+        # Phase 5: SYNTHESIZE
         # ================================================================
         synthesis_prompt = _build_synthesis_prompt(
             question, choices, hypotheses, verifier_answer, verifier_reasoning,
@@ -540,7 +838,7 @@ async def evaluate_with_yohas(
         )
         synthesis_text = synthesis_resp.text
         all_reasoning.append(
-            f"[Phase 3 - Synthesize] {synthesis_text[:500]}"
+            f"[Phase 5 - Synthesize] {synthesis_text[:500]}"
         )
 
         # Extract the synthesized answer
@@ -575,7 +873,7 @@ async def evaluate_with_yohas(
         phases.append("synthesize")
 
         # ================================================================
-        # Phase 4: FALSIFY
+        # Phase 6: FALSIFY
         # ================================================================
         if enable_falsification and top_answer:
             top_h = _get_hypothesis(hypotheses, top_answer)
@@ -591,7 +889,7 @@ async def evaluate_with_yohas(
                 )
                 falsify_text = falsify_resp.text
                 all_reasoning.append(
-                    f"[Phase 4 - Falsify] {falsify_text[:500]}"
+                    f"[Phase 6 - Falsify] {falsify_text[:500]}"
                 )
 
                 revised_answer = _extract_answer_letter(falsify_text)
@@ -602,13 +900,13 @@ async def evaluate_with_yohas(
                         top_answer, revised_answer,
                     )
                     all_reasoning.append(
-                        f"[Phase 4 - Falsify] CHANGED answer from "
+                        f"[Phase 6 - Falsify] CHANGED answer from "
                         f"{top_answer} to {revised_answer}"
                     )
                     top_answer = revised_answer
                 else:
                     all_reasoning.append(
-                        f"[Phase 4 - Falsify] CONFIRMED answer {top_answer}"
+                        f"[Phase 6 - Falsify] CONFIRMED answer {top_answer}"
                     )
 
                 phases.append("falsify")
